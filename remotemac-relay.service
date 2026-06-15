@@ -1,0 +1,21 @@
+# Always-on RemoteMac relay (systemd). Install on your VPS:
+#   sudo mkdir -p /opt/remotemac && sudo cp relay.py /opt/remotemac/
+#   sudo cp remotemac-relay.service /etc/systemd/system/
+#   sudo systemctl enable --now remotemac-relay
+#   sudo ufw allow 21118/tcp     # (or your cloud firewall / security group)
+[Unit]
+Description=RemoteMac rendezvous relay
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/remotemac/relay.py 21118
+Restart=always
+RestartSec=2
+User=nobody
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
