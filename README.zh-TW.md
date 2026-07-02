@@ -365,26 +365,29 @@ ALL_PROXY=socks5h://127.0.0.1:1080 curl https://example.com
 
 ---
 
-## 四、Mesh overlay（實驗性 — Phase 1）
+## 四、Mesh overlay（實驗性 — Phase 2）
 
-除了 1:1 遠端桌面,`coordinator.py` + `mesh.py` 把系統擴充成 **mesh**(自架的簡化版 Tailscale):多個節點加入同一張網,各自拿到穩定的 overlay IP,節點之間端到端加密。需要 `cryptography`(`pip install cryptography`)。
+除了 1:1 遠端桌面,`coordinator.py` + `mesh.py` 把系統擴充成 **mesh**(自架的簡化版 Tailscale):多個節點加入同一張網,各自拿到穩定的 overlay IP,節點之間端到端加密,而且在網路允許時**走 UDP P2P 直連**而非繞經 coordinator。需要 `cryptography`(`pip install cryptography`)。
 
 ```bash
-# Coordinator(放在對外可達的主機 — 只是控制平面,只看得到密文)
+# Coordinator(放在對外可達的主機 — 控制平面 + STUN,只看得到密文)
 python3 coordinator.py 21200 --token "network-secret"
 
-# 每個節點加入網路
+# 每個節點加入網路(會開一個 UDP 資料面埠;要固定用 --udp-port)
 python3 mesh.py up coord.example.com:21200 --token "network-secret" --name laptop
 python3 mesh.py up coord.example.com:21200 --token "network-secret" --name mac
 
-# 驗證兩節點間的加密路徑
+# 驗證加密路徑 —— log 會顯示 [direct: …] 或 [derp …]
 python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 ```
 
 - 每個節點有持久的 X25519 身份(`~/.config/remotemac/mesh/key`,可用 `$REMOTEMAC_MESH_KEY` 覆寫);coordinator 從 `100.64.0.0/10` 配發 overlay IP。
-- 節點間握手是雙向認證 + 前向保密(X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305);coordinator 只轉發**密文**(DERP 後援)。
+- 節點間握手是雙向認證 + 前向保密(X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305)。
+- **P2P 直連(Phase 2)**:節點透過向 coordinator 做 STUN-lite 探測得知自己的公網端點,互換候選端點後**同時打洞建立 UDP 直連**(以 pubkey 定序避免握手 glare)。之後資料在兩節點間直送。若數秒內打不通(例如雙方對稱 NAT),流量會**透明回退到 coordinator relay(DERP)** —— relay 全程只看得到密文。keepalive 維持 NAT 映射;直連靜默會回退 DERP,並週期性重新打洞,連通恢復時再升級回直連。
 
-**狀態 / 藍圖**:Phase 1(本版)交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑 —— 免 root。後續:**Phase 2** — UDP NAT 打洞的 P2P 直連(對稱 NAT 配對仍以 relay 兜底);**Phase 3** — TUN overlay 裝置 + 自動路由 + 出口節點選擇(完整 VPN,需 root)。純 Python 資料面吞吐中等,一般用途足夠。
+**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。
+
+**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。**Phase 2(本版)** 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換 —— 免 root。後續:**Phase 3** — TUN overlay 裝置 + 自動路由 + 出口節點選擇(完整 VPN,需 root)。純 Python 資料面吞吐中等,一般用途足夠。
 
 ---
 
@@ -428,6 +431,6 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 |---|---|
 | `relay.py` | 中繼伺服器，Python 3.8+，無相依套件 |
 | `remote_desktop.py` | 加密傳輸層 + 遠端桌面 + SOCKS5 proxy（host / viewer / pipe / gateway / socks 五種模式）|
-| `coordinator.py` | Mesh 控制平面（Phase 1）— 節點註冊、overlay IP 配發、DERP 轉發。需 `cryptography` |
-| `mesh.py` | Mesh 節點 — X25519 身份、加入網路、節點間加密資料路徑。需 `cryptography` |
+| `coordinator.py` | Mesh 控制平面 — 節點註冊、overlay IP 配發、端點分發、STUN 回應器、DERP 轉發。需 `cryptography` |
+| `mesh.py` | Mesh 節點 — X25519 身份、UDP P2P 資料面 + NAT 打洞 + direct↔DERP 切換。需 `cryptography` |
 | `remotemac-relay.service` | systemd unit，讓 relay.py 開機自動啟動 |

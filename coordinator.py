@@ -34,7 +34,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from remote_desktop import SecureChannel, _auth  # noqa: E402
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 MAX_NODES = 1024
