@@ -178,6 +178,22 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertTrue(got.wait(5), "did not receive PONG over DERP fallback")
         self.assertEqual(a._conns[dst].transport, "derp")
 
+    def test_stun_responder_echoes_source(self):
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.bind(("127.0.0.1", 0))
+        myport = u.getsockname()[1]
+        u.sendto(b"MSTU" + b"\x00" * 32, ("127.0.0.1", self.port))
+        u.settimeout(3)
+        data, _ = u.recvfrom(2048)
+        u.close()
+        self.assertEqual(data, b"MSTR" + f"127.0.0.1:{myport}".encode())
+
+    def test_node_discovers_public_endpoint(self):
+        a = self._node("stun-node")
+        self.assertTrue(self._wait(lambda: a._stun_done.is_set(), 5))
+        port = a.udp.getsockname()[1]
+        self.assertIn(f"127.0.0.1:{port}", a.local_endpoints)
+
     def test_resolve_by_overlay_ip(self):
         a = self._node("alice2")
         b = self._node("bob2")

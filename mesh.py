@@ -62,6 +62,11 @@ _PKT_PUNCH = 0x01   # empty — opens/keeps a NAT mapping
 _PKT_HS    = 0x02   # [32B sender_static][hs body]
 _PKT_DATA  = 0x03   # [4B receiver_index][Session packet]
 
+# STUN-lite endpoint discovery (distinct 4-byte magics; never collide with the
+# 1-byte packet types above, whose first byte is 0x01–0x03).
+_STUN_REQ = b"MSTU"   # node → coordinator: [magic][32B static]
+_STUN_RES = b"MSTR"   # coordinator → node: [magic]["ip:port" of the observed source]
+
 
 def _local_ipv4s():
     """Best-effort list of this host's IPv4 addresses (for endpoint candidates)."""
@@ -247,6 +252,8 @@ class MeshNode:
         self._udp_port  = udp_port
         self.ch       = None
         self.udp      = None
+        self._coord_udp = None       # (host, port) for STUN probes
+        self._stun_done = threading.Event()
         self.local_endpoints = []
         self.overlay_ip = None
         self.peers    = {}         # pubkey_b64 -> {ip, hostname, exit, endpoints}
@@ -264,10 +271,43 @@ class MeshNode:
         sock.settimeout(30)
         self.ch = _auth(sock, token, is_host=False)
         sock.settimeout(None)
+        # Resolve to an IP so we can match the STUN reply's source address.
+        try:
+            coord_ip = socket.gethostbyname(host)
+        except Exception:
+            coord_ip = host
+        self._coord_udp = (coord_ip, int(port))
         self._start_udp()
         self._send({"t": "register", "pubkey": self.pubkey_b64,
                     "hostname": self.hostname, "exit": self.is_exit,
                     "endpoints": self.local_endpoints})
+        # Discover our public (post-NAT) endpoint via the coordinator's STUN
+        # responder, then re-advertise it so peers can hole-punch to us.
+        threading.Thread(target=self._discover_endpoint, daemon=True).start()
+
+    def _discover_endpoint(self):
+        if not self._coord_udp:
+            return
+        probe = _STUN_REQ + self._pub
+        for _ in range(6):
+            if self._stun_done.is_set() or self._done.is_set():
+                return
+            try:
+                self.udp.sendto(probe, self._coord_udp)
+            except Exception:
+                pass
+            self._stun_done.wait(0.5)
+
+    def _add_endpoint(self, ep: str):
+        with self._lock:
+            if ep in self.local_endpoints:
+                return
+            self.local_endpoints.append(ep)
+            eps = list(self.local_endpoints)
+        try:
+            self._send({"t": "endpoints", "endpoints": eps})
+        except Exception:
+            pass
 
     def _start_udp(self):
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -400,6 +440,16 @@ class MeshNode:
 
     def _on_udp(self, data: bytes, addr):
         if not data:
+            return
+        if data[:4] == _STUN_RES:
+            # Only trust a STUN reply that actually came from the coordinator —
+            # otherwise anyone could inject a bogus endpoint into the mesh.
+            if addr != self._coord_udp:
+                return
+            observed = data[4:].decode("ascii", "ignore").strip()
+            if observed:
+                self._stun_done.set()
+                self._add_endpoint(observed)
             return
         t = data[0]
         if t == _PKT_PUNCH:
