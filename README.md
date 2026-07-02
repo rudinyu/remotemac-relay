@@ -1,11 +1,13 @@
+**English** | [繁體中文](README.zh-TW.md)
+
 # RemoteMac self-hosted relay
 
-兩個 Python 腳本，組成一套完整的遠端控制系統，完全不需要在受控機上開任何 inbound port。
+Two Python scripts that together form a complete remote-control system — with no need to open any inbound port on the machine being controlled.
 
-| 檔案 | 角色 | 執行位置 |
+| File | Role | Where it runs |
 |---|---|---|
-| `relay.py` | 中繼伺服器（盲管道）| 你控制的 VPS / 家用主機 |
-| `remote_desktop.py` | 加密傳輸層 + 遠端桌面客戶端（三種模式）| Mac / Linux |
+| `relay.py` | Rendezvous server (blind pipe) | A VPS / home box you control |
+| `remote_desktop.py` | Encrypted transport + remote desktop + SOCKS5 proxy (five modes) | Mac / Linux |
 
 ```
  Machine A  ──outbound──►  YOUR RELAY  ◄──outbound──  Machine B
@@ -14,80 +16,80 @@
 
 ---
 
-## 架構說明
+## Architecture
 
-### relay.py — 盲管道
+### relay.py — the blind pipe
 
-Relay 只做一件事：把兩條 outbound TCP 連線配對，然後把位元組雙向轉發。它**永遠看不到明文**，因為加解密在兩端進行。
+The relay does exactly one thing: pair two outbound TCP connections and forward bytes in both directions. It **never sees plaintext**, because encryption and decryption happen at the two endpoints.
 
-- 不需要資料庫、不儲存任何資料
-- 以 `nobody` 身分執行（systemd unit 已設定）
-- 內建 DoS 防護：每 IP 最多 5 條同時連線、最多 10,000 組已登記主機
+- No database, stores nothing
+- Runs as `nobody` (the systemd unit is preconfigured)
+- Built-in DoS protection: max 5 concurrent connections per IP, max 10,000 registered hosts
 
-### remote_desktop.py — 加密通道 + 遠端桌面
+### remote_desktop.py — encrypted channel + remote desktop
 
-在 relay 建立橋接之後，`remote_desktop.py` 在上面跑一層**雙向認證 + 加密**協議：
+Once the relay has bridged the two connections, `remote_desktop.py` runs a **mutually authenticated + encrypted** protocol on top:
 
 ```
-[relay 橋接建立 → 'P']
+[relay bridge established → 'P']
         │
         ▼
-① 交換隨機 nonce（各 32 bytes）
+① Exchange random nonces (32 bytes each)
         │
         ▼
-② scrypt 密鑰推導
+② scrypt key derivation
    master = scrypt(PSK, salt=nonce_h‖nonce_c, N=16384, r=8, p=1)
-   → 5 組獨立子密鑰（enc_h2c、enc_c2h、mac_h2c、mac_c2h、auth）
+   → 5 independent subkeys (enc_h2c, enc_c2h, mac_h2c, mac_c2h, auth)
         │
         ▼
-③ 雙向 token 交換
+③ Mutual token exchange
    token = HMAC-SHA256(auth_key, role‖nonce_h‖nonce_c)
-   雙方以 compare_digest 驗證 → 任一方不知道 PSK 即中斷
+   Both sides verify with compare_digest → abort if either lacks the PSK
         │
         ▼
-④ 資料傳輸（每個 frame）
+④ Data transfer (per frame)
    ┌──────────┬──────────────────────┬────────────────────┐
    │ 4 B len  │ 32 B HMAC-SHA256 MAC │ N B ciphertext     │
    └──────────┴──────────────────────┴────────────────────┘
-   加密：SHAKE-256 XOF counter-mode（111 MB/s，一個 Keccak call/frame）
-   驗整：HMAC-SHA256(mac_key, seq_num‖ciphertext)，seq_num 防 replay
+   Encryption: SHAKE-256 XOF counter-mode (111 MB/s, one Keccak call/frame)
+   Integrity:  HMAC-SHA256(mac_key, seq_num‖ciphertext); seq_num prevents replay
 ```
 
 ---
 
-## 安全性摘要
+## Security summary
 
-| 威脅 | 對策 |
+| Threat | Mitigation |
 |---|---|
-| 竊聽 relay 流量 | SHAKE-256 加密，relay 只看到密文 |
-| 中間人偽裝 | 雙向 token 驗證，雙方都必須知道 PSK |
-| 弱 PSK 暴力破解 | scrypt(N=16384) 讓每次猜測耗時 ~50 ms + 16 MB RAM |
-| Frame 偽造/竄改 | HMAC-SHA256 per-frame MAC，constant-time 比對 |
-| Replay 攻擊 | 單調遞增 64-bit 序號，每個方向獨立 |
-| Frame flooding | 接收端每秒最多 5,000 frames 限制 |
-| 連線佔用 | Auth 30 秒逾時；閒置 120 秒斷線 |
-| 大 frame 炸記憶體 | 單一 frame 上限 4 MB |
+| Eavesdropping relay traffic | SHAKE-256 encryption; the relay only sees ciphertext |
+| Man-in-the-middle impersonation | Mutual token verification; both sides must know the PSK |
+| Weak-PSK brute force | scrypt(N=16384) makes each guess cost ~50 ms + 16 MB RAM |
+| Frame forgery / tampering | HMAC-SHA256 per-frame MAC, constant-time comparison |
+| Replay attacks | Monotonic 64-bit sequence number, independent per direction |
+| Frame flooding | Receiver caps at 5,000 frames/s |
+| Connection squatting | 30 s auth timeout; idle connections dropped after 120 s |
+| Giant frames exhausting memory | 4 MB per-frame limit |
 
-> **注意**：remote_desktop.py 的加密層與 RemoteMac app 的 TLS-PSK 無關，兩者是獨立的加密層。remote_desktop.py 是獨立的遠端桌面 / 加密管道工具，不是取代 app。
-
----
-
-## 需求
-
-- Python 3.8+ （不需要 pip 安裝任何套件）
-- Relay 伺服器必須從網際網路可以連到（VPS，或家用主機有做 port forwarding）
+> **Note**: the encryption layer in remote_desktop.py is unrelated to the RemoteMac app's TLS-PSK — they are independent encryption layers. remote_desktop.py is a standalone remote-desktop / encrypted-tunnel tool, not a replacement for the app.
 
 ---
 
-## 一、架設 relay.py（伺服器端）
+## Requirements
 
-### 0. 確認 Python 版本
+- Python 3.8+ (no pip packages required for the relay / pipe / gateway / socks modes)
+- The relay server must be reachable from the internet (a VPS, or a home box with port forwarding)
+
+---
+
+## 1. Set up relay.py (server side)
+
+### 0. Check the Python version
 
 ```bash
-python3 --version   # 需要 3.8 以上
+python3 --version   # needs 3.8+
 ```
 
-如果沒有：
+If it's missing:
 
 ```bash
 # Debian / Ubuntu / Raspberry Pi OS
@@ -103,29 +105,29 @@ sudo pacman -S --noconfirm python
 sudo apk add python3
 ```
 
-### 1. 把檔案複製到伺服器
+### 1. Copy the files to the server
 
 ```bash
 scp relay.py remotemac-relay.service you@YOUR_SERVER:~/
 ```
 
-### 2. 先測試（前景執行）
+### 2. Test first (foreground)
 
 ```bash
 ssh you@YOUR_SERVER
 python3 relay.py 21118
-# 應該看到：RemoteMac relay listening on 0.0.0.0:21118
+# you should see: RemoteMac relay listening on 0.0.0.0:21118
 ```
 
-確認 port 有在監聽：
+Confirm the port is listening:
 
 ```bash
 ss -tlnp | grep 21118
 ```
 
-按 **Ctrl-C** 停止。
+Press **Ctrl-C** to stop.
 
-### 3. 安裝成 systemd 服務（建議）
+### 3. Install as a systemd service (recommended)
 
 ```bash
 sudo mkdir -p /opt/remotemac
@@ -133,70 +135,70 @@ sudo cp relay.py /opt/remotemac/
 sudo cp remotemac-relay.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now remotemac-relay
-sudo systemctl status remotemac-relay        # 確認 active (running)
+sudo systemctl status remotemac-relay        # confirm active (running)
 ```
 
-看即時 log：
+Watch the live log:
 
 ```bash
 journalctl -u remotemac-relay -f
-# host registered → Mac 已連線
-# bridging        → 有 session 正在進行
+# host registered → Mac has connected
+# bridging        → a session is in progress
 ```
 
-沒有 systemd（Alpine / container / WSL）：
+Without systemd (Alpine / container / WSL):
 
 ```bash
 nohup python3 /opt/remotemac/relay.py 21118 > /var/log/remotemac-relay.log 2>&1 &
 ```
 
-換 port：編輯 `/etc/systemd/system/remotemac-relay.service` 的 `ExecStart=`，然後：
+To change the port: edit `ExecStart=` in `/etc/systemd/system/remotemac-relay.service`, then:
 
 ```bash
 sudo systemctl daemon-reload && sudo systemctl restart remotemac-relay
 ```
 
-### 4. 開防火牆
+### 4. Open the firewall
 
 ```bash
-# ufw（Debian/Ubuntu）
+# ufw (Debian/Ubuntu)
 sudo ufw allow 21118/tcp
 
-# firewalld（Fedora/RHEL）
+# firewalld (Fedora/RHEL)
 sudo firewall-cmd --add-port=21118/tcp --permanent && sudo firewall-cmd --reload
 
 # iptables
 sudo iptables -A INPUT -p tcp --dport 21118 -j ACCEPT
 ```
 
-雲端 VM（AWS / GCP / Azure / DigitalOcean）還需要在控制台的 Security Group / 防火牆規則開放 21118/tcp inbound。
+Cloud VMs (AWS / GCP / Azure / DigitalOcean) also need 21118/tcp opened for inbound traffic in the console's security-group / firewall rules.
 
-### 5. 確認可從外部連到
+### 5. Verify external reachability
 
 ```bash
-# 在伺服器上查公網 IP
+# find the public IP on the server
 curl -s https://api.ipify.org; echo
 
-# 從另一台機器測試（例如你的 Mac）
-nc -vz YOUR_RELAY_IP 21118     # 應該顯示 succeeded / open
+# test from another machine (e.g. your Mac)
+nc -vz YOUR_RELAY_IP 21118     # should print succeeded / open
 ```
 
-### 管理服務
+### Managing the service
 
 ```bash
 sudo systemctl restart remotemac-relay
 sudo systemctl stop remotemac-relay
 sudo systemctl disable --now remotemac-relay
-journalctl -u remotemac-relay -e          # 看最近的 log
+journalctl -u remotemac-relay -e          # view recent logs
 ```
 
-更新 relay：
+Update the relay:
 
 ```bash
 sudo cp relay.py /opt/remotemac/ && sudo systemctl restart remotemac-relay
 ```
 
-完全移除：
+Remove completely:
 
 ```bash
 sudo systemctl disable --now remotemac-relay
@@ -206,9 +208,9 @@ sudo systemctl daemon-reload
 
 ---
 
-## 二、設定 RemoteMac app（Mac + iPad）
+## 2. Configure the RemoteMac app (Mac + iPad)
 
-### Mac 端
+### On the Mac
 
 ```bash
 echo "YOUR_RELAY_IP:21118" > ~/.config/remotemac/relay
@@ -216,189 +218,191 @@ pkill -9 -f "RemoteMac Host.app"
 open -W "/Applications/RemoteMac Host.app"
 ```
 
-Relay log 應出現：`host registered id=...`
+The relay log should show: `host registered id=...`
 
-### iPad 端
+### On the iPad
 
-**Settings ▸ Relay server** → 輸入 `YOUR_RELAY_IP:21118`。
+**Settings ▸ Relay server** → enter `YOUR_RELAY_IP:21118`.
 
-### 連線流程
+### Connection flow
 
-1. iPad 輸入 Device Code。
-2. 同一個 Wi-Fi → 直接 LAN 連線（最快），relay 不會用到。
-3. 不同網路 / 行動網路 → 雙方連到 relay → 橋接 → 進入。
+1. Enter the Device Code on the iPad.
+2. Same Wi-Fi → direct LAN connection (fastest); the relay is not used.
+3. Different networks / cellular → both sides connect to the relay → bridged → connected.
 
 ---
 
-## 三、使用 remote_desktop.py
+## 3. Using remote_desktop.py
 
-`remote_desktop.py` 整合了加密傳輸層、遠端桌面與加密 proxy 功能，支援五種模式：
+`remote_desktop.py` bundles the encrypted transport, remote desktop, and encrypted proxy features, with five modes:
 
-| 模式 | 說明 | 相依套件 |
+| Mode | Description | Dependencies |
 |---|---|---|
-| `host` | 被控端：串流螢幕 + 接收注入鍵鼠 | `mss Pillow pynput` |
-| `viewer` | 控制端：顯示畫面 + 發送鍵鼠 | `Pillow`（含 tkinter）|
-| `pipe` | stdin/stdout 加密橋接，無 GUI | 無（Python stdlib 即可）|
-| `gateway` | 出口節點：代 client 對外建立 TCP/UDP 連線 | 無（Python stdlib 即可）|
-| `socks` | 本機 SOCKS5 proxy 入口，讓其它 app 走加密隧道出去 | 無（Python stdlib 即可）|
+| `host` | Controlled side: streams the screen + receives injected keyboard/mouse | `mss Pillow pynput` |
+| `viewer` | Controlling side: displays the screen + sends keyboard/mouse | `Pillow` (with tkinter) |
+| `pipe` | stdin/stdout encrypted bridge, no GUI | none (Python stdlib) |
+| `gateway` | Exit node: opens outbound TCP/UDP on behalf of the client | none (Python stdlib) |
+| `socks` | Local SOCKS5 proxy entry point; sends other apps' traffic through the encrypted tunnel | none (Python stdlib) |
 
-### 安裝相依套件（host / viewer 模式）
+### Install dependencies (host / viewer modes)
 
 ```bash
 pip install mss Pillow pynput
 ```
 
-### macOS 權限設定
+### macOS permissions
 
-| 端 | 需要的權限 |
+| Side | Permission needed |
 |---|---|
-| host | **螢幕錄製**（System Preferences > Privacy > Screen Recording）|
-| host | **輔助使用**（System Preferences > Privacy > Accessibility）— 鍵鼠注入 |
+| host | **Screen Recording** (System Preferences > Privacy > Screen Recording) |
+| host | **Accessibility** (System Preferences > Privacy > Accessibility) — for keyboard/mouse injection |
 
-### 啟動遠端控制
+### Starting remote control
 
 ```bash
-# 1. Host 端先執行（被控端，等待連入）
+# 1. Run the host side first (the controlled machine, waits for a peer)
 python3 remote_desktop.py host relay.example.com:21118 mydevice --psk "strong-passphrase"
 
-# 2. Viewer 端執行（控制端）
+# 2. Run the viewer side (the controlling machine)
 python3 remote_desktop.py viewer relay.example.com:21118 mydevice --psk "strong-passphrase"
 ```
 
-Host 模式預設**常駐**：viewer 斷線後會自動重新向 relay 註冊、等待下一次連入；連不上 relay 時以指數退避（2s → 30s）重試。加 `--once` 可恢復「單次 session 後結束」的行為。
+Host mode is **persistent by default**: after a viewer disconnects it re-registers with the relay and waits for the next connection; if it can't reach the relay it retries with exponential backoff (2s → 30s). Add `--once` to restore the "exit after a single session" behavior.
 
-> **安全提醒**：`--psk` 傳入的值在 Linux 上可以被 `ps aux` 看到。更安全的方式：
-> - 省略 `--psk`，程式會互動式提示輸入（不顯示在螢幕）
-> - 或設定環境變數：`export REMOTEMAC_PSK="your-passphrase"`，然後省略 `--psk`
+> **Security note**: a value passed via `--psk` can be seen on Linux with `ps aux`. Safer options:
+> - Omit `--psk` — the program prompts interactively (not echoed to the screen)
+> - Or set an environment variable: `export REMOTEMAC_PSK="your-passphrase"`, then omit `--psk`
 
-成功後：
+On success:
 ```
-[remotemac] relay: registered — waiting for peer…    ← host 端
+[remotemac] relay: registered — waiting for peer…    ← host side
 [remotemac] auth: mutual authentication succeeded ✓
 
-[remotemac] relay: bridge established                 ← viewer 端
+[remotemac] relay: bridge established                 ← viewer side
 [remotemac] auth: mutual authentication succeeded ✓
 ```
 
-Viewer 端會開啟視窗顯示 host 的螢幕，你的滑鼠鍵盤操作即時傳到 host。
+The viewer opens a window showing the host's screen; your mouse and keyboard input are relayed to the host in real time.
 
-### 選項
+### Options
 
-| 參數 | 適用模式 | 說明 | 預設值 |
+| Option | Modes | Description | Default |
 |---|---|---|---|
-| `--fps N` | host | 擷取幀率 | 15 |
-| `--quality N` | host | JPEG 品質 20–95 | 75 |
-| `--once` | host | 單次 session 後結束（預設為常駐重新註冊）| 關 |
-| `--no-clip` | host / viewer | 停用雙向剪貼簿同步 | 關（同步開啟）|
+| `--fps N` | host | Capture frame rate | 15 |
+| `--quality N` | host | JPEG quality 20–95 | 75 |
+| `--once` | host | Exit after a single session (default: persistent re-registration) | off |
+| `--no-clip` | host / viewer | Disable bidirectional clipboard sync | off (sync on) |
 
 ```bash
-# 高畫質（需較好的網路）
+# High quality (needs a good network)
 python3 remote_desktop.py host relay.example.com:21118 myid "pw" --fps 30 --quality 85
 
-# 省頻寬
+# Save bandwidth
 python3 remote_desktop.py host relay.example.com:21118 myid "pw" --fps 10 --quality 60
 ```
 
-### 支援的輸入
+### Supported input
 
-| 類型 | 說明 |
+| Type | Notes |
 |---|---|
-| 滑鼠移動 | 全螢幕座標正規化，自動適配不同解析度 |
-| 左 / 右 / 中鍵 | 按下與放開 |
-| 滾輪 | macOS / Linux / Windows 皆支援 |
-| 鍵盤 | 一般字元 + F1–F12 + Ctrl / Alt / Shift / ⌘ / 方向鍵等 |
-| 剪貼簿 | 雙向自動同步（純文字，每秒偵測變更；`--no-clip` 停用）|
+| Mouse movement | Full-screen coordinates normalized; auto-adapts to different resolutions |
+| Left / right / middle button | Press and release |
+| Scroll wheel | Works on macOS / Linux / Windows |
+| Keyboard | Regular characters + F1–F12 + Ctrl / Alt / Shift / ⌘ / arrow keys, etc. |
+| Clipboard | Bidirectional auto-sync (plain text, polled every second; disable with `--no-clip`) |
 
-### Pipe 模式（CLI 工具 / 腳本整合）
+### Pipe mode (CLI tools / script integration)
 
-不需要 GUI，只用 stdin/stdout 橋接，適合傳檔、遠端執行指令等場合：
+No GUI — just a stdin/stdout bridge, ideal for file transfer, remote command execution, etc.:
 
 ```bash
-# 傳送檔案（host 端傳到 client 端）
+# Transfer a file (host side sends to client side)
 cat file.bin | python3 remote_desktop.py pipe relay.example.com:21118 myid host --psk "pw"
 python3 remote_desktop.py pipe relay.example.com:21118 myid client --psk "pw" > output.bin
 
-# 遠端執行 bash
+# Remote bash
 bash | python3 remote_desktop.py pipe relay.example.com:21118 myid host --psk "pw"
 python3 remote_desktop.py pipe relay.example.com:21118 myid client --psk "pw"
 ```
 
-### 加密 SOCKS5 Proxy（gateway / socks 模式）
+### Encrypted SOCKS5 proxy (gateway / socks modes)
 
-除了遠端桌面，也可以把 client 機器上的其它 app（瀏覽器、curl…）的流量**經加密隧道從 host 出去**，等同自架的加密 `ssh -D`。多條連線多工在同一條 relay 橋接上，全程沿用同一套加密（scrypt 認證 + SHAKE-256 + HMAC），relay 仍只看到密文。
+Beyond remote desktop, you can route other apps' traffic on the client machine (browser, curl, …) **out through the host over the encrypted tunnel** — a self-hosted, encrypted `ssh -D`. Many connections are multiplexed over a single relay bridge, all using the same crypto (scrypt auth + SHAKE-256 + HMAC); the relay still only sees ciphertext.
 
 ```bash
-# 1. gateway（出口機，例如家裡的 Mac；預設常駐，斷線自動重連）
+# 1. gateway (the exit machine, e.g. your Mac at home; persistent, auto-reconnects)
 python3 remote_desktop.py gateway relay.example.com:21118 myproxy --psk "pw"
 
-# 2. socks（本機，開一個本機 SOCKS5 proxy）
+# 2. socks (your local machine, opens a local SOCKS5 proxy)
 python3 remote_desktop.py socks relay.example.com:21118 myproxy --psk "pw" --port 1080
 
-# 3. 讓 app 走 proxy（socks5h → 連 DNS 解析也走遠端）
-curl -x socks5h://127.0.0.1:1080 https://api.ipify.org        # 顯示的是 gateway 端的公網 IP
+# 3. Send apps through the proxy (socks5h → DNS resolution also goes remote)
+curl -x socks5h://127.0.0.1:1080 https://api.ipify.org        # shows the gateway's public IP
 ALL_PROXY=socks5h://127.0.0.1:1080 curl https://example.com
 ```
 
-瀏覽器直接設 SOCKS5 host `127.0.0.1`、port `1080` 即可全域走隧道。
+Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything through the tunnel.
 
-- **支援**：TCP（SOCKS5 CONNECT）+ UDP（SOCKS5 UDP associate，如 DNS/QUIC）；網域名稱在 gateway 端解析。
-- **安全**：任何連進 gateway 的一方都必須通過 PSK 雙向認證，未通過即斷線，所以不會變成開放 proxy。
+- **Supported**: TCP (SOCKS5 CONNECT) + UDP (SOCKS5 UDP associate, e.g. DNS/QUIC); domain names are resolved on the gateway side.
+- **Security**: anyone connecting into the gateway must pass mutual PSK authentication or the connection is dropped, so it won't become an open proxy.
 
-| 參數 | 適用模式 | 說明 | 預設值 |
+| Option | Modes | Description | Default |
 |---|---|---|---|
-| `--port N` | socks | 本機 SOCKS5 監聽埠 | 1080 |
-| `--bind ADDR` | socks | 本機監聽位址 | 127.0.0.1 |
-| `--allow HOST/CIDR` | gateway | 白名單（網域字尾或 IP/CIDR），可重複；不給則全通 | 無（全通）|
-| `--once` | gateway | 單次 session 後結束（預設常駐重連）| 關 |
+| `--port N` | socks | Local SOCKS5 listen port | 1080 |
+| `--bind ADDR` | socks | Local bind address | 127.0.0.1 |
+| `--allow HOST/CIDR` | gateway | Allowlist (domain suffix or IP/CIDR), repeatable; omit to allow all | none (allow all) |
+| `--once` | gateway | Exit after a single session (default: persistent reconnect) | off |
 
-> **防護縱深**：`socks` 預設只監聽 `127.0.0.1`，別台機器無法白嫖你的 proxy；改 `--bind 0.0.0.0` 對外開放前請三思。`gateway` 想再收斂可用 `--allow`（例如 `--allow example.com --allow 10.0.0.0/8`）限定可連目標，未列的一律拒絕。
+> **Defense in depth**: `socks` binds only to `127.0.0.1` by default, so other machines can't piggyback on your proxy; think twice before exposing it with `--bind 0.0.0.0`. To tighten the `gateway` further, use `--allow` (e.g. `--allow example.com --allow 10.0.0.0/8`) to restrict reachable targets — anything not listed is rejected.
 
-### PSK 選擇建議
+### Choosing a PSK
 
-| 強度 | 範例 |
+| Strength | Example |
 |---|---|
-| 弱（不建議）| `1234`、`password` |
-| 可接受 | `correct-horse-battery-staple` |
-| 強（建議）| `python3 -c "import secrets; print(secrets.token_hex(24))"` |
+| Weak (not recommended) | `1234`, `password` |
+| Acceptable | `correct-horse-battery-staple` |
+| Strong (recommended) | `python3 -c "import secrets; print(secrets.token_hex(24))"` |
 
 ---
 
-## 效能
+## Performance
 
-在一般開發機上測得的加密吞吐量（4 MB frame）：
+Encryption throughput measured on a typical dev machine (4 MB frame):
 
-| 項目 | 速度 |
+| Item | Speed |
 |---|---|
-| XOR（big-integer）| ~140 MB/s |
-| SHAKE-256 加密 | ~111 MB/s |
-| Auth 握手（scrypt） | ~50 ms（一次性）|
-| 遠端桌面典型頻寬 | 1–8 MB/s（JPEG @75, 1080p, 15fps）|
+| XOR (big-integer) | ~140 MB/s |
+| SHAKE-256 encryption | ~111 MB/s |
+| Auth handshake (scrypt) | ~50 ms (one-time) |
+| Typical remote-desktop bandwidth | 1–8 MB/s (JPEG @75, 1080p, 15fps) |
 
-加密開銷遠低於實際串流頻寬，瓶頸在網路而非 CPU。
+Encryption overhead is far below the actual streaming bandwidth — the bottleneck is the network, not the CPU.
 
 ---
 
-## 疑難排解
+## Troubleshooting
 
-| 症狀 | 檢查 |
+| Symptom | What to check |
 |---|---|
-| iPad 顯示「Mac … is offline」 | Relay log 沒有 `host registered` → Mac 的 `~/.config/remotemac/relay` 設錯，或 Mac 連不到 relay |
-| `nc -vz` 從外部超時 | 防火牆 / Security Group / 路由器 port forwarding 沒開 |
-| Wi-Fi 可連、行動網路不行 | Relay 沒有真正的公網路徑（家用主機沒做 port forwarding）|
-| 服務啟動失敗 | `journalctl -u remotemac-relay -e` → 通常是 Python 路徑錯誤或 port 被佔用 |
-| auth failed: peer does not know the PSK | 兩端 PSK 不一致，或 device_id 不同 |
-| relay: host slot occupied | 已有同 device_id 從不同 IP 登記；換 device_id 或等舊連線逾時 |
-| MAC verification failed | 網路中間有人篡改封包，或版本不相容 |
-| remote_desktop 螢幕全黑 | Host 沒有 Screen Recording 權限 |
-| remote_desktop 鍵鼠無反應 | Host 沒有 Accessibility 權限 |
-| remote_desktop 連線後立即斷開 | 檢查 PSK 是否兩端一致；查看 stderr 輸出 |
+| iPad shows "Mac … is offline" | No `host registered` in the relay log → the Mac's `~/.config/remotemac/relay` is wrong, or the Mac can't reach the relay |
+| `nc -vz` times out from outside | Firewall / security group / router port forwarding not open |
+| Works on Wi-Fi but not cellular | The relay has no real public path (home box without port forwarding) |
+| Service fails to start | `journalctl -u remotemac-relay -e` → usually a wrong Python path or the port is in use |
+| auth failed: peer does not know the PSK | PSKs differ between the two sides, or the device_id is different |
+| relay: host slot occupied | Same device_id already registered from a different IP; use another device_id or wait for the old connection to time out |
+| MAC verification failed | Someone tampered with packets in transit, or version mismatch |
+| remote_desktop screen is black | Host lacks Screen Recording permission |
+| remote_desktop keyboard/mouse unresponsive | Host lacks Accessibility permission |
+| remote_desktop disconnects right after connecting | Check the PSK matches on both sides; look at stderr output |
+| socks / gateway can't connect | device_id and PSK must match on both sides; the gateway must start and register with the relay first |
+| curl through the proxy fails to resolve | Use `socks5h://` (the h means remote DNS), not `socks5://` |
 
 ---
 
-## 檔案列表
+## File list
 
-| 檔案 | 說明 |
+| File | Description |
 |---|---|
-| `relay.py` | 中繼伺服器，Python 3.8+，無相依套件 |
-| `remote_desktop.py` | 加密傳輸層 + 遠端桌面（host / viewer / pipe 三種模式）|
-| `remotemac-relay.service` | systemd unit，讓 relay.py 開機自動啟動 |
+| `relay.py` | Rendezvous server, Python 3.8+, no dependencies |
+| `remote_desktop.py` | Encrypted transport + remote desktop + SOCKS5 proxy (host / viewer / pipe / gateway / socks — five modes) |
+| `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |
