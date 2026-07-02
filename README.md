@@ -365,6 +365,41 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
+## 4. Mesh overlay (experimental — Phase 1)
+
+Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
+into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
+network, each gets a stable overlay IP, and node↔node traffic is end-to-end
+encrypted. Requires `cryptography` (`pip install cryptography`).
+
+```bash
+# Coordinator (on your reachable host — control plane only, sees ciphertext)
+python3 coordinator.py 21200 --token "network-secret"
+
+# Each node joins the network
+python3 mesh.py up coord.example.com:21200 --token "network-secret" --name laptop
+python3 mesh.py up coord.example.com:21200 --token "network-secret" --name mac
+
+# Prove the encrypted path between two nodes
+python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
+```
+
+- Each node has a persistent X25519 identity (`~/.config/remotemac/mesh/key`,
+  overridable with `$REMOTEMAC_MESH_KEY`); the coordinator assigns overlay IPs
+  from `100.64.0.0/10`.
+- Node↔node handshake is mutually authenticated and forward-secret (X25519
+  triple-DH → HKDF-SHA256 → ChaCha20-Poly1305); the coordinator only relays
+  **ciphertext** (DERP fallback).
+
+**Status / roadmap.** Phase 1 (this release) delivers the control plane, per-node
+identity, the host pool + selection, and an encrypted data path relayed through
+the coordinator — no root needed. Still to come: **Phase 2** — direct P2P via UDP
+NAT hole punching (relay stays as fallback for symmetric-NAT pairs); **Phase 3** —
+a TUN overlay device with automatic routing and exit-node selection (full VPN;
+needs root). Data-plane throughput is modest (pure-Python), fine for typical use.
+
+---
+
 ## Performance
 
 Encryption throughput measured on a typical dev machine (4 MB frame):
@@ -405,4 +440,6 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 |---|---|
 | `relay.py` | Rendezvous server, Python 3.8+, no dependencies |
 | `remote_desktop.py` | Encrypted transport + remote desktop + SOCKS5 proxy (host / viewer / pipe / gateway / socks — five modes) |
+| `coordinator.py` | Mesh control plane (Phase 1) — node registry, overlay-IP assignment, DERP relay. Needs `cryptography` |
+| `mesh.py` | Mesh node — X25519 identity, joins a network, encrypted node↔node data path. Needs `cryptography` |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |

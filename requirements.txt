@@ -1,0 +1,11 @@
+# relay.py and remote_desktop.py (pipe / gateway / socks modes) need no packages.
+#
+# remote_desktop.py host mode:
+#   mss
+#   Pillow
+#   pynput
+# remote_desktop.py viewer mode:
+#   Pillow            # (tkinter ships with Python)
+#
+# Mesh (coordinator.py / mesh.py) — the only hard dependency:
+cryptography>=41
