@@ -48,7 +48,14 @@ class RelayTest(unittest.IsolatedAsyncioTestCase):
         return await asyncio.wait_for(reader.readexactly(n), timeout=5)
 
     async def _read_eof(self, reader):
-        return await asyncio.wait_for(reader.read(1), timeout=5)
+        # A refused connection may close cleanly (EOF → b"") or, when the server
+        # closes with the client's bytes still unread, reset (RST). Linux surfaces
+        # the RST as ConnectionResetError where macOS gives a clean EOF; treat both
+        # as "the peer closed".
+        try:
+            return await asyncio.wait_for(reader.read(1), timeout=5)
+        except (ConnectionResetError, BrokenPipeError):
+            return b""
 
     async def _register_host(self, ip="10.0.0.1", rid=DEVICE_ID):
         r, w = await self._connect(ip)
