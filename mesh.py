@@ -52,6 +52,9 @@ _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
 MESH_PING = 0x01
 MESH_PONG = 0x02
 MESH_IP   = 0x03   # reserved for Phase 3 (TUN packets)
+# internal liveness probe over an established direct path (not surfaced to apps)
+MESH_KEEPALIVE     = 0x04
+MESH_KEEPALIVE_ACK = 0x05
 
 # handshake stages (first byte of an "hs" body — transport-agnostic)
 _HS_INIT  = 0x01
@@ -225,6 +228,9 @@ class PeerConn:
         self.resp_eph_pub = None           # my ephemeral pub as responder (resend on upgrade)
         self.initiated    = False
         self.queued       = []             # payloads awaiting a session
+        self.last_rx      = time.monotonic()  # last authenticated packet from peer
+        self.last_ka      = 0.0            # last keepalive we sent (monotonic)
+        self.last_retry   = 0.0           # last direct re-punch attempt (monotonic)
         self.lock         = threading.Lock()
 
     def bind_transport(self, via, addr):
@@ -263,6 +269,11 @@ class MeshNode:
         self._lock     = threading.Lock()
         self._send_lock = threading.Lock()   # serialize control-channel writes
         self._done     = threading.Event()
+        # keepalive / direct-path liveness (seconds; tests override for speed)
+        self._ka_tick          = 1.0     # how often the keepalive loop wakes
+        self.keepalive_interval = 15.0   # send a keepalive on an idle direct path
+        self.direct_timeout     = 45.0   # silence before a direct path is failed
+        self.direct_retry_interval = 30.0  # re-punch cadence for a relayed path
         self.on_message = None     # optional callback(peer_pk_b64, msg_type, body)
 
     # -- control channel --------------------------------------------------------
@@ -286,6 +297,8 @@ class MeshNode:
         # Discover our public (post-NAT) endpoint via the coordinator's STUN
         # responder, then re-advertise it so peers can hole-punch to us.
         threading.Thread(target=self._discover_endpoint, daemon=True).start()
+        # Keep NAT mappings warm on direct paths and fail silent ones over to DERP.
+        threading.Thread(target=self._keepalive_loop, daemon=True).start()
 
     def _discover_endpoint(self):
         if not self._coord_udp:
@@ -530,6 +543,7 @@ class MeshNode:
         if via == "udp" and addr is not None:
             pc.endpoint = addr
             pc.transport = "direct"
+            pc.last_rx = time.monotonic()   # fresh direct path — don't instantly re-fail
 
     def _recv_data(self, pc, body):
         try:
@@ -537,9 +551,15 @@ class MeshNode:
         except Exception as exc:
             _log(f"data decrypt from {pc.peer_pk[:12]}…: {exc}")
             return
+        pc.last_rx = time.monotonic()   # authenticated traffic ⇒ path is alive
         if not pt:
             return
         mtype, payload = pt[0], pt[1:]
+        if mtype == MESH_KEEPALIVE:
+            self.send(pc.peer_pk, MESH_KEEPALIVE_ACK, b"")
+            return
+        if mtype == MESH_KEEPALIVE_ACK:
+            return   # internal liveness only — not surfaced to the app
         if mtype == MESH_PING:
             self.send(pc.peer_pk, MESH_PONG, payload)
         if self.on_message:
@@ -634,12 +654,51 @@ class MeshNode:
                 break
             self._done.wait(0.25)
 
-        # Gave up on a fresh direct path; allow a later send() to retry with a
-        # fresh ephemeral (don't reuse the stale one across attempt cycles).
-        if pc.session is None:
+        # Gave up on establishing/restoring a direct path. Re-arm so a later
+        # _ensure_connecting() (fresh send, or a keepalive-loop retry) can try
+        # again. This must NOT be gated on session state: after a failover the
+        # session is deliberately reused (non-None), yet the direct path still
+        # needs to be retryable. Only a brand-new handshake needs a fresh
+        # ephemeral, so clear eph only when there is no session.
+        if pc.transport != "direct":
             with pc.lock:
                 pc.initiated = False
-                pc.eph = None
+                if pc.session is None:
+                    pc.eph = None
+
+    def _keepalive_loop(self):
+        """Keep established direct paths warm, and fail silent ones over to DERP.
+
+        On a direct path we send a keepalive when it goes idle (holds the NAT
+        mapping open and probes liveness). If nothing authenticated arrives for
+        `direct_timeout`, the path is presumed dead: we drop back to the DERP
+        relay (reusing the same session) and re-arm hole punching to try direct
+        again."""
+        while not self._done.wait(self._ka_tick):
+            now = time.monotonic()
+            with self._lock:
+                conns = list(self._conns.values())
+            for pc in conns:
+                if pc.session is None:
+                    continue
+                if pc.transport == "direct":
+                    if now - pc.last_rx > self.direct_timeout:
+                        _log(f"direct path to {pc.peer_pk[:12]}… went silent — failing over to DERP")
+                        with pc.lock:
+                            pc.transport = "derp"
+                            pc.initiated = False
+                            pc.eph = None
+                        pc.last_retry = now
+                        self._ensure_connecting(pc)   # immediately try to restore direct
+                    elif now - pc.last_ka >= self.keepalive_interval:
+                        pc.last_ka = now
+                        self.send(pc.peer_pk, MESH_KEEPALIVE, b"")
+                elif pc.transport == "derp":
+                    # Periodically re-attempt hole punching so a relayed path can
+                    # upgrade to direct once connectivity allows (NAT reopens, etc).
+                    if now - pc.last_retry >= self.direct_retry_interval:
+                        pc.last_retry = now
+                        self._ensure_connecting(pc)
 
 # ─── CLI ────────────────────────────────────────────────────────────────────────
 

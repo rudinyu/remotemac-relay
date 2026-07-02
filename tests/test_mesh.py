@@ -215,6 +215,74 @@ class TestMeshEndToEnd(unittest.TestCase):
         _upgrade(a, da, mesh._HS_RESP if a_is_init else mesh._HS_INIT)
         _upgrade(b, db, mesh._HS_INIT if a_is_init else mesh._HS_RESP)
 
+    def test_direct_failover_to_derp_on_silence(self):
+        # A direct path that goes silent must fail over to the DERP relay so
+        # traffic keeps flowing (reusing the same session).
+        a = self._node("fo-a")
+        b = self._node("fo-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+
+        got = threading.Event()
+        a.on_message = lambda s, mt, pl: got.set() if mt == mesh.MESH_PONG else None
+        da = a.resolve("fo-b")
+        a.send(da, mesh.MESH_PING, b"x")
+        self.assertTrue(got.wait(6), "direct path did not form")
+        self.assertEqual(a._conns[da].transport, "direct")
+
+        # No reachable endpoints to re-punch → failover must stick on DERP;
+        # mark the path silent and speed up the liveness loop.
+        a._peer_endpoints = lambda pk: []
+        b._peer_endpoints = lambda pk: []
+        a._ka_tick = 0.05
+        a.direct_timeout = 0.2
+        a.keepalive_interval = 0.1
+        a._conns[da].last_rx = time.monotonic() - 100
+
+        self.assertTrue(self._wait(lambda: a._conns[da].transport == "derp", 5),
+                        "did not fail over to DERP on silence")
+
+        # Traffic still flows, now over the relay.
+        got.clear()
+        a.send(da, mesh.MESH_PING, b"again")
+        self.assertTrue(got.wait(6), "no PONG after DERP failover")
+        self.assertEqual(a._conns[da].transport, "derp")
+
+    def test_direct_recovery_after_failover(self):
+        # After failing over to DERP, a node must keep retrying hole punching and
+        # transparently upgrade back to a direct path once it becomes reachable.
+        a = self._node("rc-a")
+        b = self._node("rc-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+
+        got = threading.Event()
+        a.on_message = lambda s, mt, pl: got.set() if mt == mesh.MESH_PONG else None
+        da = a.resolve("rc-b")
+        a.send(da, mesh.MESH_PING, b"x")
+        self.assertTrue(got.wait(6), "direct path did not form")
+        self.assertEqual(a._conns[da].transport, "direct")
+
+        # A real deployment runs identical keepalive config on every node, so
+        # both ends detect the silence. Drive both fast so recovery is role-
+        # independent (the designated initiator re-punches once it can reach us).
+        db = b.resolve("rc-a")
+        real_a_eps, real_b_eps = a._peer_endpoints, b._peer_endpoints
+        a._peer_endpoints = lambda pk: []
+        b._peer_endpoints = lambda pk: []
+        for n in (a, b):
+            n._ka_tick = 0.05
+            n.direct_timeout = 0.2
+            n.keepalive_interval = 0.1
+            n.direct_retry_interval = 0.2
+        a._conns[da].last_rx = time.monotonic() - 100
+        b._conns[db].last_rx = time.monotonic() - 100
+        self.assertTrue(self._wait(lambda: a._conns[da].transport == "derp", 5),
+                        "did not fail over to DERP")
+
+        # Reachability returns → the periodic re-punch must restore a direct path.
+        a._peer_endpoints, b._peer_endpoints = real_a_eps, real_b_eps
+        self.assertTrue(self._wait(lambda: a._conns[da].transport == "direct", 8),
+                        "did not recover a direct path after reachability returned")
+
     def test_handshake_glare_both_initiate(self):
         # Both nodes try to open a session at the same instant. The deterministic
         # initiator tie-break must stop this from producing two mismatched
