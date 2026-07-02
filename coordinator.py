@@ -105,7 +105,7 @@ class Coordinator:
             me = self._nodes.get(pubkey)
             peers = [
                 {"pubkey": pk, "ip": n["ip"], "hostname": n["hostname"],
-                 "exit": n["exit"], "online": True}
+                 "exit": n["exit"], "endpoints": n.get("endpoints", []), "online": True}
                 for pk, n in self._nodes.items() if pk != pubkey
             ]
         self_info = {"pubkey": pubkey, "ip": me["ip"]} if me else {}
@@ -144,8 +144,9 @@ class Coordinator:
                     pk = None   # not admitted; nothing to clean up
                     return
             ip = self._alloc.get(pk)
+            endpoints = [str(e)[:64] for e in (reg.get("endpoints") or [])][:16]
             record = {"ch": ch, "hostname": reg.get("hostname", "node")[:64],
-                      "exit": bool(reg.get("exit")), "ip": ip}
+                      "exit": bool(reg.get("exit")), "ip": ip, "endpoints": endpoints}
             with self._lock:
                 old = self._nodes.get(pk)
                 if old:

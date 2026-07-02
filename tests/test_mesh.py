@@ -154,13 +154,29 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
         self.assertNotEqual(a.overlay_ip, b.overlay_ip)
 
-        # alice pings bob over the encrypted DERP path; bob auto-replies PONG.
+        # alice pings bob; on localhost this establishes a DIRECT UDP path.
         got = threading.Event()
         a.on_message = lambda src, mt, pl: got.set() if mt == mesh.MESH_PONG else None
         dst = a.resolve("bob")
         self.assertIsNotNone(dst)
         a.send(dst, mesh.MESH_PING, b"hello")
         self.assertTrue(got.wait(5), "did not receive encrypted PONG")
+        self.assertEqual(a._conns[dst].transport, "direct")
+        self.assertIsNotNone(a._conns[dst].endpoint)
+
+    def test_derp_fallback_when_no_direct_path(self):
+        a = self._node("alice3")
+        b = self._node("bob3")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        # Force DERP: pretend we know no UDP endpoints for the peer.
+        a._peer_endpoints = lambda pk: []
+
+        got = threading.Event()
+        a.on_message = lambda src, mt, pl: got.set() if mt == mesh.MESH_PONG else None
+        dst = a.resolve("bob3")
+        a.send(dst, mesh.MESH_PING, b"hi")
+        self.assertTrue(got.wait(5), "did not receive PONG over DERP fallback")
+        self.assertEqual(a._conns[dst].transport, "derp")
 
     def test_resolve_by_overlay_ip(self):
         a = self._node("alice2")
