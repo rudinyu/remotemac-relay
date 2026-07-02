@@ -67,6 +67,8 @@ import sys
 import threading
 import time
 
+__version__ = "1.0.0"
+
 # ─── tunables ────────────────────────────────────────────────────────────────
 
 _SCRYPT_N     = 16_384
@@ -996,7 +998,13 @@ class _SocksMux(_MuxBase):
             with self.lock:
                 st = self.streams.get(sid)
             if st:
-                st.ready.wait()   # ensure the SOCKS reply was sent first
+                # Wait (bounded) for the SOCKS reply to be written before we
+                # forward data. A bare wait() here would let a misbehaving peer
+                # stall the single reader thread — and thus every stream.
+                if not st.ready.wait(_CONNECT_TIMEOUT + 5):
+                    self._remove(sid)
+                    self.send(MUX_CLOSE, sid)
+                    return
                 try:
                     st.sock.sendall(payload)
                 except Exception:
@@ -1194,8 +1202,21 @@ class _GatewayMux(_MuxBase):
         if not self.allow(host, port):
             _log(f"gateway: DENY udp {host}:{port}")
             return
+        data = payload[off:]
         try:
-            a.usock.sendto(payload[off:], (host, port))
+            ipaddress.ip_address(host)   # already a literal IP → send inline
+            a.usock.sendto(data, (host, port))
+        except ValueError:
+            # Domain target: resolve+send off the reader thread so a DNS lookup
+            # cannot stall the single mux reader (and thus every stream).
+            threading.Thread(target=self._udp_send_domain,
+                             args=(a, host, port, data), daemon=True).start()
+        except Exception:
+            pass
+
+    def _udp_send_domain(self, a, host, port, data):
+        try:
+            a.usock.sendto(data, (host, port))
         except Exception:
             pass
 
@@ -1335,6 +1356,7 @@ def main():
             "  curl -x socks5h://127.0.0.1:1080 https://api.ipify.org"
         ),
     )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("mode", choices=["host", "viewer", "pipe", "gateway", "socks"])
     p.add_argument("relay_addr", metavar="relay:port")
     p.add_argument("device_id")

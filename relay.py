@@ -27,6 +27,8 @@ import socket
 import sys
 from collections import defaultdict
 
+__version__ = "1.0.0"
+
 HOST = "0.0.0.0"
 DEFAULT_PORT = 21118
 
@@ -188,6 +190,9 @@ async def main(port: int):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+        print(f"relay.py {__version__}")
+        sys.exit(0)
     try:
         port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
         if not (1 <= port <= 65535):
