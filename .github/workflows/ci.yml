@@ -22,7 +22,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install mss Pillow pynput pytest
+        run: pip install mss Pillow pynput pytest cryptography
 
       - name: Run tests
         run: python -m pytest tests/ -v

@@ -67,7 +67,7 @@ import sys
 import threading
 import time
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ─── tunables ────────────────────────────────────────────────────────────────
 

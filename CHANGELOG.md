@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-07-02
+
+### Added
+- **Mesh overlay (Phase 1)** — a Tailscale-lite control plane, evolving the
+  1:1 host↔client model toward a peer group.
+  - `coordinator.py`: nodes connect over a token-authenticated encrypted control
+    channel; assigns stable overlay IPs from `100.64.0.0/10` (persisted),
+    distributes the peer map, and relays end-to-end-encrypted node↔node traffic
+    (DERP fallback — the coordinator only sees ciphertext).
+  - `mesh.py`: per-node X25519 identity (persisted, `$REMOTEMAC_MESH_KEY`
+    overridable), joins a network, learns peers, and has an encrypted data path
+    with a mutually authenticated, forward-secret handshake (X25519 triple-DH →
+    HKDF-SHA256 → ChaCha20-Poly1305) plus a built-in `--ping`.
+  - New dependency `cryptography` (mesh only; relay / pipe / gateway / socks stay
+    pure stdlib). See `requirements.txt`.
+  - Tests: `tests/test_mesh.py` (handshake roundtrip, wrong-key/replay rejection,
+    overlay-IP allocator persistence, end-to-end encrypted ping) — all root-free.
+- Deferred to later phases: UDP P2P + NAT hole punching (Phase 2), TUN overlay +
+  exit-node NAT (Phase 3).
+
 ## [1.0.0] - 2026-07-02
 
 ### Added
