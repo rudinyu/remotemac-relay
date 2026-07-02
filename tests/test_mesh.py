@@ -168,15 +168,82 @@ class TestMeshEndToEnd(unittest.TestCase):
         a = self._node("alice3")
         b = self._node("bob3")
         self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
-        # Force DERP: pretend we know no UDP endpoints for the peer.
+        # Force DERP on BOTH sides: whichever node ends up the designated
+        # initiator must also see no reachable UDP endpoints, so neither can
+        # punch a direct path and both fall back to the coordinator relay.
         a._peer_endpoints = lambda pk: []
+        b._peer_endpoints = lambda pk: []
 
         got = threading.Event()
         a.on_message = lambda src, mt, pl: got.set() if mt == mesh.MESH_PONG else None
         dst = a.resolve("bob3")
         a.send(dst, mesh.MESH_PING, b"hi")
-        self.assertTrue(got.wait(5), "did not receive PONG over DERP fallback")
+        self.assertTrue(got.wait(6), "did not receive PONG over DERP fallback")
         self.assertEqual(a._conns[dst].transport, "derp")
+
+    def test_derp_to_direct_upgrade(self):
+        # A session that first forms over DERP must transparently upgrade to a
+        # direct UDP endpoint when a handshake later arrives over UDP — reusing
+        # the SAME session (not rebuilding it) and flipping transport to direct.
+        a = self._node("up-a")
+        b = self._node("up-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        a._peer_endpoints = lambda pk: []
+        b._peer_endpoints = lambda pk: []
+
+        got = threading.Event()
+        a.on_message = lambda s, mt, pl: got.set() if mt == mesh.MESH_PONG else None
+        da = a.resolve("up-b")
+        a.send(da, mesh.MESH_PING, b"x")
+        self.assertTrue(got.wait(6), "DERP session did not form")
+        self.assertEqual(a._conns[da].transport, "derp")
+        db = b.resolve("up-a")
+        self.assertTrue(self._wait(lambda: b._conns.get(db) and b._conns[db].session))
+
+        def _upgrade(node, peer, stage):
+            pc = node._conns[peer]
+            sess = pc.session
+            fake = ("127.0.0.1", 40000)
+            node._handle_hs(peer, node._peer_static(peer), stage,
+                            b"\x11" * 32, 4242, "udp", fake)
+            self.assertIs(pc.session, sess, "session was rebuilt, not upgraded")
+            self.assertEqual(pc.transport, "direct")
+            self.assertEqual(pc.endpoint, fake)
+
+        # The initiator would receive a RESP over UDP; the responder, an INIT.
+        a_is_init = a._am_initiator(a._peer_static(da))
+        _upgrade(a, da, mesh._HS_RESP if a_is_init else mesh._HS_INIT)
+        _upgrade(b, db, mesh._HS_INIT if a_is_init else mesh._HS_RESP)
+
+    def test_handshake_glare_both_initiate(self):
+        # Both nodes try to open a session at the same instant. The deterministic
+        # initiator tie-break must stop this from producing two mismatched
+        # sessions — pings must succeed in BOTH directions.
+        a = self._node("glare-a")
+        b = self._node("glare-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+
+        a_pong = threading.Event()
+        b_pong = threading.Event()
+        a.on_message = lambda s, mt, pl: a_pong.set() if mt == mesh.MESH_PONG else None
+        b.on_message = lambda s, mt, pl: b_pong.set() if mt == mesh.MESH_PONG else None
+
+        da, db = a.resolve("glare-b"), b.resolve("glare-a")
+        # Fire simultaneously to provoke glare.
+        threading.Thread(target=lambda: a.send(da, mesh.MESH_PING, b"a"), daemon=True).start()
+        threading.Thread(target=lambda: b.send(db, mesh.MESH_PING, b"b"), daemon=True).start()
+
+        self.assertTrue(a_pong.wait(6), "a did not get a PONG (glare broke keys?)")
+        self.assertTrue(b_pong.wait(6), "b did not get a PONG (glare broke keys?)")
+
+    def test_initiator_tie_break_is_symmetric(self):
+        a = self._node("tb-a")
+        b = self._node("tb-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        # Exactly one of the pair considers itself the initiator, and both agree.
+        a_init = a._am_initiator(a._peer_static(b.pubkey_b64))
+        b_init = b._am_initiator(b._peer_static(a.pubkey_b64))
+        self.assertNotEqual(a_init, b_init)
 
     def test_stun_responder_echoes_source(self):
         u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
