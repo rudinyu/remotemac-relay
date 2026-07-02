@@ -68,7 +68,7 @@ Relay 只做一件事：把兩條 outbound TCP 連線配對，然後把位元組
 | 連線佔用 | Auth 30 秒逾時；閒置 120 秒斷線 |
 | 大 frame 炸記憶體 | 單一 frame 上限 4 MB |
 
-> **注意**：relay_client.py 的安全性與 RemoteMac app 的 TLS-PSK 無關，兩者是獨立的加密層。relay_client.py 是用來串接其他 Python 程式或 CLI 工具，不是取代 app。
+> **注意**：remote_desktop.py 的加密層與 RemoteMac app 的 TLS-PSK 無關，兩者是獨立的加密層。remote_desktop.py 是獨立的遠端桌面 / 加密管道工具，不是取代 app。
 
 ---
 
@@ -232,13 +232,15 @@ Relay log 應出現：`host registered id=...`
 
 ## 三、使用 remote_desktop.py
 
-`remote_desktop.py` 整合了加密傳輸層與遠端桌面功能，支援三種模式：
+`remote_desktop.py` 整合了加密傳輸層、遠端桌面與加密 proxy 功能，支援五種模式：
 
 | 模式 | 說明 | 相依套件 |
 |---|---|---|
 | `host` | 被控端：串流螢幕 + 接收注入鍵鼠 | `mss Pillow pynput` |
 | `viewer` | 控制端：顯示畫面 + 發送鍵鼠 | `Pillow`（含 tkinter）|
 | `pipe` | stdin/stdout 加密橋接，無 GUI | 無（Python stdlib 即可）|
+| `gateway` | 出口節點：代 client 對外建立 TCP/UDP 連線 | 無（Python stdlib 即可）|
+| `socks` | 本機 SOCKS5 proxy 入口，讓其它 app 走加密隧道出去 | 無（Python stdlib 即可）|
 
 ### 安裝相依套件（host / viewer 模式）
 
@@ -263,6 +265,8 @@ python3 remote_desktop.py host relay.example.com:21118 mydevice --psk "strong-pa
 python3 remote_desktop.py viewer relay.example.com:21118 mydevice --psk "strong-passphrase"
 ```
 
+Host 模式預設**常駐**：viewer 斷線後會自動重新向 relay 註冊、等待下一次連入；連不上 relay 時以指數退避（2s → 30s）重試。加 `--once` 可恢復「單次 session 後結束」的行為。
+
 > **安全提醒**：`--psk` 傳入的值在 Linux 上可以被 `ps aux` 看到。更安全的方式：
 > - 省略 `--psk`，程式會互動式提示輸入（不顯示在螢幕）
 > - 或設定環境變數：`export REMOTEMAC_PSK="your-passphrase"`，然後省略 `--psk`
@@ -278,12 +282,14 @@ python3 remote_desktop.py viewer relay.example.com:21118 mydevice --psk "strong-
 
 Viewer 端會開啟視窗顯示 host 的螢幕，你的滑鼠鍵盤操作即時傳到 host。
 
-### 選項（host 模式）
+### 選項
 
-| 參數 | 說明 | 預設值 |
-|---|---|---|
-| `--fps N` | 擷取幀率 | 15 |
-| `--quality N` | JPEG 品質 20–95 | 75 |
+| 參數 | 適用模式 | 說明 | 預設值 |
+|---|---|---|---|
+| `--fps N` | host | 擷取幀率 | 15 |
+| `--quality N` | host | JPEG 品質 20–95 | 75 |
+| `--once` | host | 單次 session 後結束（預設為常駐重新註冊）| 關 |
+| `--no-clip` | host / viewer | 停用雙向剪貼簿同步 | 關（同步開啟）|
 
 ```bash
 # 高畫質（需較好的網路）
@@ -299,8 +305,9 @@ python3 remote_desktop.py host relay.example.com:21118 myid "pw" --fps 10 --qual
 |---|---|
 | 滑鼠移動 | 全螢幕座標正規化，自動適配不同解析度 |
 | 左 / 右 / 中鍵 | 按下與放開 |
-| 滾輪 | macOS / Linux 皆支援 |
+| 滾輪 | macOS / Linux / Windows 皆支援 |
 | 鍵盤 | 一般字元 + F1–F12 + Ctrl / Alt / Shift / ⌘ / 方向鍵等 |
+| 剪貼簿 | 雙向自動同步（純文字，每秒偵測變更；`--no-clip` 停用）|
 
 ### Pipe 模式（CLI 工具 / 腳本整合）
 
@@ -315,6 +322,36 @@ python3 remote_desktop.py pipe relay.example.com:21118 myid client --psk "pw" > 
 bash | python3 remote_desktop.py pipe relay.example.com:21118 myid host --psk "pw"
 python3 remote_desktop.py pipe relay.example.com:21118 myid client --psk "pw"
 ```
+
+### 加密 SOCKS5 Proxy（gateway / socks 模式）
+
+除了遠端桌面，也可以把 client 機器上的其它 app（瀏覽器、curl…）的流量**經加密隧道從 host 出去**，等同自架的加密 `ssh -D`。多條連線多工在同一條 relay 橋接上，全程沿用同一套加密（scrypt 認證 + SHAKE-256 + HMAC），relay 仍只看到密文。
+
+```bash
+# 1. gateway（出口機，例如家裡的 Mac；預設常駐，斷線自動重連）
+python3 remote_desktop.py gateway relay.example.com:21118 myproxy --psk "pw"
+
+# 2. socks（本機，開一個本機 SOCKS5 proxy）
+python3 remote_desktop.py socks relay.example.com:21118 myproxy --psk "pw" --port 1080
+
+# 3. 讓 app 走 proxy（socks5h → 連 DNS 解析也走遠端）
+curl -x socks5h://127.0.0.1:1080 https://api.ipify.org        # 顯示的是 gateway 端的公網 IP
+ALL_PROXY=socks5h://127.0.0.1:1080 curl https://example.com
+```
+
+瀏覽器直接設 SOCKS5 host `127.0.0.1`、port `1080` 即可全域走隧道。
+
+- **支援**：TCP（SOCKS5 CONNECT）+ UDP（SOCKS5 UDP associate，如 DNS/QUIC）；網域名稱在 gateway 端解析。
+- **安全**：任何連進 gateway 的一方都必須通過 PSK 雙向認證，未通過即斷線，所以不會變成開放 proxy。
+
+| 參數 | 適用模式 | 說明 | 預設值 |
+|---|---|---|---|
+| `--port N` | socks | 本機 SOCKS5 監聽埠 | 1080 |
+| `--bind ADDR` | socks | 本機監聽位址 | 127.0.0.1 |
+| `--allow HOST/CIDR` | gateway | 白名單（網域字尾或 IP/CIDR），可重複；不給則全通 | 無（全通）|
+| `--once` | gateway | 單次 session 後結束（預設常駐重連）| 關 |
+
+> **防護縱深**：`socks` 預設只監聽 `127.0.0.1`，別台機器無法白嫖你的 proxy；改 `--bind 0.0.0.0` 對外開放前請三思。`gateway` 想再收斂可用 `--allow`（例如 `--allow example.com --allow 10.0.0.0/8`）限定可連目標，未列的一律拒絕。
 
 ### PSK 選擇建議
 

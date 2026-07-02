@@ -28,12 +28,7 @@ import sys
 from collections import defaultdict
 
 HOST = "0.0.0.0"
-try:
-    PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 21118
-    if not (1 <= PORT <= 65535):
-        raise ValueError
-except ValueError:
-    sys.exit("usage: relay.py [port]   (port must be 1–65535)")
+DEFAULT_PORT = 21118
 
 # Safety limits — prevent resource exhaustion from abusive clients.
 MAX_CONNS_PER_IP = 5   # simultaneous connections from one IP
@@ -185,15 +180,21 @@ async def handle(reader, writer):
             del conns_per_ip[ip]
 
 
-async def main():
-    server = await asyncio.start_server(handle, HOST, PORT)
-    print(f"RemoteMac relay listening on {HOST}:{PORT}", flush=True)
+async def main(port: int):
+    server = await asyncio.start_server(handle, HOST, port)
+    print(f"RemoteMac relay listening on {HOST}:{port}", flush=True)
     async with server:
         await server.serve_forever()
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except ValueError:
+        sys.exit("usage: relay.py [port]   (port must be 1–65535)")
+    try:
+        asyncio.run(main(port))
     except KeyboardInterrupt:
         pass
