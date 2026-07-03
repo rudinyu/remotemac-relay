@@ -27,7 +27,7 @@ import socket
 import sys
 from collections import defaultdict
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 HOST = "0.0.0.0"
 DEFAULT_PORT = 21118
