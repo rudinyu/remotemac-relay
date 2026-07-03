@@ -329,6 +329,28 @@ class TestMeshEndToEnd(unittest.TestCase):
         port = a.udp.getsockname()[1]
         self.assertIn(f"127.0.0.1:{port}", a.local_endpoints)
 
+    def test_mesh_ip_dispatches_to_on_ip_packet(self):
+        # A MESH_IP payload (a tunnelled IP packet) must be delivered to
+        # on_ip_packet with the raw bytes intact, and must NOT leak to the
+        # generic on_message path.
+        a = self._node("ip-a")
+        b = self._node("ip-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+
+        got = threading.Event()
+        seen = {}
+        leaked = []
+        b.on_ip_packet = lambda src, pkt: (seen.update(src=src, pkt=pkt), got.set())
+        b.on_message = lambda src, mt, pl: leaked.append(mt)
+
+        dst = a.resolve("ip-b")
+        packet = b"\x45\x00\x00\x14rawining-packet"   # arbitrary raw bytes
+        a.send(dst, mesh.MESH_IP, packet)
+        self.assertTrue(got.wait(6), "MESH_IP was not delivered to on_ip_packet")
+        self.assertEqual(seen["pkt"], packet)
+        self.assertEqual(seen["src"], a.pubkey_b64)
+        self.assertNotIn(mesh.MESH_IP, leaked, "MESH_IP leaked to on_message")
+
     def test_resolve_by_overlay_ip(self):
         a = self._node("alice2")
         b = self._node("bob2")

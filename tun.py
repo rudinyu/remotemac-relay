@@ -22,6 +22,7 @@ This module only handles the device + its addressing/route; the TUN↔mesh pump 
 CLI live in `mesh.py`.
 """
 import os
+import select
 import socket
 import struct
 import subprocess
@@ -44,17 +45,41 @@ class TunError(RuntimeError):
     pass
 
 
-def parse_ipv4_dst(pkt: bytes):
-    """Destination address (dotted-quad) of a raw IPv4 packet, or None if the
-    buffer is not a well-formed IPv4 header (wrong version or too short).
-
-    IPv6 and truncated packets return None so the caller can safely drop them.
-    """
+def _ipv4_addr(pkt: bytes, offset: int):
+    """Dotted-quad address at `offset` of a raw IPv4 packet, or None if the buffer
+    is not a well-formed IPv4 header (wrong version or too short)."""
     if pkt is None or len(pkt) < 20:
         return None
     if (pkt[0] >> 4) != 4:          # IP version nibble
         return None
-    return ".".join(str(b) for b in pkt[16:20])
+    return ".".join(str(b) for b in pkt[offset:offset + 4])
+
+
+def parse_ipv4_dst(pkt: bytes):
+    """Destination address of a raw IPv4 packet (or None). IPv6/truncated → None
+    so the caller can safely drop them."""
+    return _ipv4_addr(pkt, 16)
+
+
+def parse_ipv4_src(pkt: bytes):
+    """Source address of a raw IPv4 packet (or None), for anti-spoofing checks."""
+    return _ipv4_addr(pkt, 12)
+
+
+def src_allowed(pkt: bytes, expected_ip: str) -> bool:
+    """Anti-spoof gate for a packet a peer injected into our TUN: a peer may only
+    send packets whose IPv4 source is its own assigned overlay IP.
+
+    If we don't know the peer's overlay IP (expected_ip falsy) or the source can't
+    be parsed, we don't block — the check only rejects a *parseable* source that
+    disagrees with the sender's identity.
+    """
+    if not expected_ip:
+        return True
+    src = parse_ipv4_src(pkt)
+    if src is None:
+        return True
+    return src == expected_ip
 
 
 def mac_encap(pkt: bytes) -> bytes:
@@ -143,7 +168,23 @@ class TunDevice:
 
     # -- I/O (raw IPv4) ---------------------------------------------------------
 
-    def read(self) -> bytes:
+    def read(self, timeout: float = 0.5) -> bytes:
+        """Return one raw IPv4 packet, or b"" if none arrives within `timeout`.
+
+        The bounded wait lets a pump loop poll a shutdown flag instead of blocking
+        forever in the kernel — so the fd/socket is never closed out from under a
+        thread still parked in read(). The buffer is intentionally MTU-independent
+        (the kernel hands us at most one interface-MTU frame per read for a TUN).
+        """
+        handle = self._sock if self._is_mac else self._fd
+        if handle is None:
+            return b""
+        try:
+            ready, _, _ = select.select([handle], [], [], timeout)
+        except (OSError, ValueError):
+            return b""
+        if not ready:
+            return b""
         if self._is_mac:
             return mac_decap(self._sock.recv(65535 + 4))
         return os.read(self._fd, 65535)

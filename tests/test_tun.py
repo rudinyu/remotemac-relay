@@ -50,6 +50,31 @@ class TestParseIPv4Dst(unittest.TestCase):
         self.assertEqual(tun.parse_ipv4_dst(bytearray(_ipv4(dst="100.64.9.9"))), "100.64.9.9")
 
 
+class TestParseIPv4Src(unittest.TestCase):
+    def test_extracts_source(self):
+        self.assertEqual(tun.parse_ipv4_src(_ipv4(src="100.64.0.2")), "100.64.0.2")
+
+    def test_rejects_non_ipv4(self):
+        self.assertIsNone(tun.parse_ipv4_src(b"\x60" + b"\x00" * 39))
+        self.assertIsNone(tun.parse_ipv4_src(b""))
+
+
+class TestSrcAllowed(unittest.TestCase):
+    def test_matching_source_allowed(self):
+        self.assertTrue(tun.src_allowed(_ipv4(src="100.64.0.5"), "100.64.0.5"))
+
+    def test_spoofed_source_rejected(self):
+        # Peer whose overlay IP is .5 tries to forge traffic as .9 → blocked.
+        self.assertFalse(tun.src_allowed(_ipv4(src="100.64.0.9"), "100.64.0.5"))
+
+    def test_unknown_expected_ip_not_blocked(self):
+        self.assertTrue(tun.src_allowed(_ipv4(src="100.64.0.9"), None))
+        self.assertTrue(tun.src_allowed(_ipv4(src="100.64.0.9"), ""))
+
+    def test_unparseable_source_not_blocked(self):
+        self.assertTrue(tun.src_allowed(b"\x60" + b"\x00" * 39, "100.64.0.5"))
+
+
 class TestMacFraming(unittest.TestCase):
     def test_encap_prepends_af_inet_header(self):
         pkt = _ipv4()
