@@ -365,7 +365,7 @@ ALL_PROXY=socks5h://127.0.0.1:1080 curl https://example.com
 
 ---
 
-## 四、Mesh overlay（實驗性 — Phase 7）
+## 四、Mesh overlay（實驗性 — Phase 8）
 
 除了 1:1 遠端桌面,`coordinator.py` + `mesh.py` 把系統擴充成 **mesh**(自架的簡化版 Tailscale):多個節點加入同一張網,各自拿到穩定的 overlay IP,節點之間端到端加密,而且在網路允許時**走 UDP P2P 直連**而非繞經 coordinator。需要 `cryptography`(`pip install cryptography`)。
 
@@ -387,6 +387,7 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 - **TUN overlay(Phase 3)**:加上 `--tun`(需 root)後,節點會開一個虛擬網卡、綁上自己的 overlay IP、並把 `100.64.0.0/10` 路由過去 —— 讓**真實 app 直接用 overlay IP 連 peer**(`ping 100.64.0.x`、`ssh`、http),不再只有內建 `--ping`。核心的 IP 封包走同一條加密 P2P/DERP 資料路徑。macOS 用 `utun`(免 kext),Linux 用 `/dev/net/tun`。peer 只能送出「來源是自己 overlay IP」的封包(anti-spoof)。
 - **子網路由(Phase 4)**:節點可當 **subnet router**:用 `--advertise-routes 192.168.1.0/24` 宣告它能連到的 LAN 網段,並(在 Linux)開 IP forwarding + nftables masquerade,讓其他節點連到它「背後」的主機。client 用 `--accept-routes` 選擇接受,把那些 CIDR 的路由指到 TUN,匹配的封包就送給該 peer。**只有被宣告的網段走 mesh,預設路由不動**。與 overlay 重疊、或包含 coordinator / peer endpoint 的宣告 CIDR 會被拒絕(避免 mesh 傳輸迴圈);subnet router 可送出「來源在你接受的路由內」的回包(其餘 anti-spoof 照舊)。
 - **Full-tunnel 出口節點(Phase 5,opt-in)**:client 用 `--exit-node NAME` 把**所有**對外流量繞經指定的出口節點,對外看到的來源 IP 變成出口的(像商用 VPN 選節點)。出口是用 `--exit` 啟動的 Linux 節點(沿用同一套 IP forwarding + masquerade)。client 會先把 mesh 傳輸(coordinator + peer 端點)釘選到實體閘道,再把 `0.0.0.0/1`+`128.0.0.0/1` 指到 TUN —— 覆蓋預設路由但不破壞 mesh 自身傳輸。**預設關閉**;沒有 `--exit-node` 就不動預設路由。
+- **split-DNS(Phase 8,opt-in)**:加上 `--dns`,節點會跑一個小解析器,把 `<name>.mesh` 解成該 peer 的 overlay IP,其餘查詢轉發給原本的上游 —— 於是可以 `ssh laptop.mesh`,不用記 overlay IP。它綁 `127.0.0.1:53`(只限本機),並把系統 resolver 指向自己:macOS 用 per-domain 的 `/etc/resolver/mesh`(全域 DNS 不動);Linux 改寫 `/etc/resolv.conf`(我們在前、真上游當 fallback),結束時還原。
 
 ```bash
 # 只做 overlay:兩台機器開完整資料面(root),直接用 overlay IP:
@@ -403,13 +404,17 @@ ping 192.168.1.1     # laptop 透過 gw 連到它背後的 LAN
 sudo python3 mesh.py up coord…:21200 --token … --name exit   --tun --exit
 sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --exit-node exit
 curl https://ifconfig.me      # 顯示出口節點的公網 IP,而非 client 本機的
+
+# split-DNS:用名字連 peer
+sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --dns
+ssh user@gw.mesh              # 解析成 gw 的 overlay IP;example.com 照常
 ```
 
-**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。`--tun` 啟用 VPN 介面;`--tun-mtu`(預設 1280)、`--tun-name`(Linux 介面名,預設 `remotemac0`)可微調。`--advertise-routes CIDR,…` / `--accept-routes` 啟用子網路由;`--exit` 宣告 full-tunnel 出口、`--exit-node NAME` 把全流量走某出口(皆需 `--tun`);`--lan-routes CIDR,…` 讓額外的本地網段不走隧道(見下);`--egress IFACE` 覆寫 NAT 出口介面。(若主機 FORWARD 防火牆政策較嚴,需手動為 overlay 網段加放行規則。)
+**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。`--tun` 啟用 VPN 介面;`--tun-mtu`(預設 1280)、`--tun-name`(Linux 介面名,預設 `remotemac0`)可微調。`--advertise-routes CIDR,…` / `--accept-routes` 啟用子網路由;`--exit` 宣告 full-tunnel 出口、`--exit-node NAME` 把全流量走某出口(皆需 `--tun`);`--lan-routes CIDR,…` 讓額外的本地網段不走隧道(見下);`--dns` 啟用 split-DNS(可用 `--dns-suffix`、`--dns-upstream` 微調);`--egress IFACE` 覆寫 NAT 出口介面。(若主機 FORWARD 防火牆政策較嚴,需手動為 overlay 網段加放行規則。)
 
 > **Full-tunnel 注意事項**:它會改寫預設路由 —— 請在有 console/SSH 備援下測試。程序崩潰時兩條 `/1` 會隨 TUN 消失,預設路由自動恢復。DNS 走出口(公用 resolver 可用;LAN resolver 不行)。**直接連接的本地區網仍可達**(其 connected 路由比 `0.0.0.0/1`+`128.0.0.0/1` 更明確);只有原本要走預設閘道的流量才走隧道。若要讓**其他**經由 LAN 路由器才到的本地網段也保持可達,用 `--lan-routes 10.0.0.0/8,172.16.0.0/12` 列出。
 
-**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。Phase 3 加上 TUN overlay。Phase 4 加上子網路由。Phase 5 加上 opt-in full-tunnel 出口節點。Phase 6 加上 `--lan-routes` 並修正 LAN 可達性文件。**Phase 7(本版)** 在無 nftables 時加上 iptables 後援做 NAT egress。後續:split-DNS、IPv6、macOS exit(pf)。純 Python 資料面吞吐中等,一般用途足夠。
+**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。Phase 3 加上 TUN overlay。Phase 4 加上子網路由。Phase 5 加上 opt-in full-tunnel 出口節點。Phase 6 加上 `--lan-routes` 並修正 LAN 可達性文件。Phase 7 加上 iptables 後援做 NAT egress。**Phase 8(本版)** 加上 opt-in 的 split-DNS(`--dns`)。後續:IPv6、macOS exit(pf)。純 Python 資料面吞吐中等,一般用途足夠。
 
 ---
 
@@ -458,4 +463,5 @@ curl https://ifconfig.me      # 顯示出口節點的公網 IP,而非 client 本
 | `tun.py` | overlay 的 TUN 虛擬網卡(macOS `utun` / Linux `/dev/net/tun`)—— 供 `mesh.py --tun` 使用。需 root |
 | `nat.py` | subnet router / 出口節點的 Linux NAT egress(`--advertise-routes` / `--exit`)—— IP forwarding + masquerade(nftables,或 iptables 後援)。需 root |
 | `netroute.py` | full-tunnel 路由管理(`--exit-node`)—— 預設路由改寫 + 傳輸釘選,macOS + Linux。需 root |
+| `meshdns.py` | split-DNS 解析器(`--dns`)—— 回答 `<name>.mesh`、其餘轉發;自動設定系統 resolver(macOS `/etc/resolver`、Linux `resolv.conf`)。需 root |
 | `remotemac-relay.service` | systemd unit，讓 relay.py 開機自動啟動 |

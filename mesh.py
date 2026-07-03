@@ -9,14 +9,15 @@ is end-to-end encrypted with a mutually authenticated, forward-secret handshake
 (X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305); the coordinator only ever
 relays ciphertext.
 
-Phases 1–5: identity + token-authenticated control channel + peer map; an
+Phases 1–8: identity + token-authenticated control channel + peer map; an
 encrypted data path that is **UDP peer-to-peer** where the network allows (NAT
 hole punching, Phase 2) and transparently falls back to a coordinator relay
 (DERP); a **TUN overlay** (Phase 3, `--tun`) so real apps reach peers by overlay
 IP; **subnet routing** (Phase 4, `--advertise-routes`/`--accept-routes`) to reach
-LANs behind a peer; and an opt-in **full-tunnel exit node** (Phase 5, `--exit` /
-`--exit-node`, with `--lan-routes` to keep extra local subnets off the tunnel).
-Only `--tun` and the routing features need root; everything else runs unprivileged.
+LANs behind a peer; an opt-in **full-tunnel exit node** (Phase 5, `--exit` /
+`--exit-node`, with `--lan-routes`); and opt-in **split-DNS** (Phase 8, `--dns`)
+resolving `<name>.mesh` to overlay IPs. Only `--tun` and the routing/DNS features
+need root; everything else runs unprivileged.
 
 Requires: pip install cryptography
 
@@ -27,6 +28,7 @@ Usage
     sudo python3 mesh.py up <coord:port> --token <token> --tun   # VPN data plane
     sudo python3 mesh.py up <coord:port> --token <token> --tun --advertise-routes 192.168.1.0/24
     sudo python3 mesh.py up <coord:port> --token <token> --tun --exit-node <peer>   # full-tunnel
+    sudo python3 mesh.py up <coord:port> --token <token> --tun --dns   # resolve <name>.mesh
 """
 import argparse
 import base64
@@ -52,7 +54,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
