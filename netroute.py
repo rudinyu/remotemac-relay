@@ -83,6 +83,7 @@ class FullTunnelRoutes:
         self.phys_iface = phys_iface
         self._is_mac = (sys.platform == "darwin")
         self._pinned = set()          # transport IPs currently pinned to the phys gw
+        self._lan = set()             # extra LAN CIDRs kept on the physical gateway
         self._split = False
         self._lock = threading.Lock()
 
@@ -111,6 +112,23 @@ class FullTunnelRoutes:
                 self._unpin(ip)
                 self._pinned.discard(ip)
 
+    # -- extra LAN routes (kept on the physical gateway) ------------------------
+
+    def install_lan_routes(self, cidrs):
+        """Keep `cidrs` (local subnets reached via the LAN router) on the physical
+        gateway during full-tunnel. They are more specific than the /1 split, so
+        they win. The directly-connected subnet already stays local via its own
+        connected route and needs no entry here."""
+        with self._lock:
+            for cidr in cidrs:
+                if cidr in self._lan:
+                    continue
+                if self._is_mac:
+                    _run(["route", "-n", "add", "-net", cidr, self.gateway])
+                else:
+                    _run(["ip", "route", "add", cidr, "via", self.gateway, "dev", self.phys_iface])
+                self._lan.add(cidr)
+
     # -- split default via the TUN ----------------------------------------------
 
     def install_split_default(self):
@@ -135,3 +153,9 @@ class FullTunnelRoutes:
             for ip in list(self._pinned):
                 self._unpin(ip)
             self._pinned.clear()
+            for cidr in list(self._lan):
+                if self._is_mac:
+                    _run(["route", "-n", "delete", "-net", cidr, self.gateway])
+                else:
+                    _run(["ip", "route", "del", cidr])
+            self._lan.clear()

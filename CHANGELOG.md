@@ -3,6 +3,23 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-07-03
+
+### Added
+- **Mesh overlay (Phase 6) — `--lan-routes` for full-tunnel.** Keep extra local
+  subnets (ones reached via your LAN router, not directly connected) on the
+  physical gateway while full-tunneling: `--exit-node exit --lan-routes
+  10.0.0.0/8,172.16.0.0/12`. `netroute.FullTunnelRoutes` installs them via the
+  physical gateway (more specific than the `0.0.0.0/1`+`128.0.0.0/1` split, so
+  they win) and removes them on teardown.
+
+### Fixed
+- **Docs: full-tunnel LAN reachability.** The Phase 5 note that the local LAN is
+  unreachable under full-tunnel was inaccurate. The directly-connected subnet's
+  route is more specific than the `/1` split, so it stays on the physical
+  interface and remains reachable; only traffic that would have used the default
+  gateway is tunneled. README (en/zh) corrected.
+
 ## [1.5.0] - 2026-07-03
 
 ### Added

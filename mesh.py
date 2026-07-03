@@ -15,8 +15,8 @@ hole punching, Phase 2) and transparently falls back to a coordinator relay
 (DERP); a **TUN overlay** (Phase 3, `--tun`) so real apps reach peers by overlay
 IP; **subnet routing** (Phase 4, `--advertise-routes`/`--accept-routes`) to reach
 LANs behind a peer; and an opt-in **full-tunnel exit node** (Phase 5, `--exit` /
-`--exit-node`). Only `--tun` and the routing features need root; everything else
-runs unprivileged.
+`--exit-node`, with `--lan-routes` to keep extra local subnets off the tunnel).
+Only `--tun` and the routing features need root; everything else runs unprivileged.
 
 Requires: pip install cryptography
 
@@ -52,7 +52,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
@@ -347,6 +347,7 @@ class MeshNode:
         self._route_table = []            # [(ip_network, pubkey)], longest-prefix first
         self.exit_node_name = None        # peer name/IP to full-tunnel through (CLI)
         self.exit_node_pk = None          # resolved once the peer is in the map
+        self.lan_routes = []              # extra local subnets to keep off the tunnel
         self.ch       = None
         self.udp      = None
         self._coord_udp = None       # (host, port) for STUN probes
@@ -1024,6 +1025,8 @@ def _run_tun(node, mtu, name, egress=None):
             # a map-driven callback), THEN redirect the default route.
             ftr.sync_pins(node.transport_ips())
             node.on_transport_ips_changed = ftr.sync_pins   # re-pin as endpoints change
+            if node.lan_routes:                        # keep extra local subnets off the tunnel
+                ftr.install_lan_routes(node.lan_routes)
             ftr.install_split_default()                # default → TUN → exit
             _log(f"full-tunnel: default route → exit '{node.exit_node_name}' via {dev.name} "
                  f"(transport pinned to {gw} dev {iface})")
@@ -1054,8 +1057,11 @@ def _cmd_up(args):
     advertise = parse_cidrs(getattr(args, "advertise_routes", None))
     accept = getattr(args, "accept_routes", False)
     exit_node = getattr(args, "exit_node", None)
+    lan_routes = parse_cidrs(getattr(args, "lan_routes", None))
     if exit_node and advertise:
         sys.exit("error: --exit-node and --advertise-routes are mutually exclusive")
+    if lan_routes and not exit_node:
+        sys.exit("error: --lan-routes only applies with --exit-node (full-tunnel)")
     if getattr(args, "tun", False):
         if args.ping:
             sys.exit("error: --tun and --ping are mutually exclusive")
@@ -1077,6 +1083,7 @@ def _cmd_up(args):
                     advertise_routes=advertise)
     node.accept_routes = accept
     node.exit_node_name = exit_node
+    node.lan_routes = lan_routes
 
     pong_event = threading.Event()
     pong_at = {}
@@ -1162,6 +1169,8 @@ def main():
                     help="route peers' advertised subnet CIDRs through the mesh (needs --tun)")
     up.add_argument("--exit-node", metavar="PEER",
                     help="full-tunnel: route ALL traffic through this exit peer (name or overlay IP; needs --tun)")
+    up.add_argument("--lan-routes", metavar="CIDR[,CIDR…]",
+                    help="full-tunnel: keep these extra local subnets on the physical gateway (needs --exit-node)")
     up.add_argument("--egress", metavar="IFACE",
                     help="egress interface for subnet NAT (default: the system default route's device)")
     up.set_defaults(func=_cmd_up)
