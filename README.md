@@ -365,7 +365,7 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
-## 4. Mesh overlay (experimental — Phase 2)
+## 4. Mesh overlay (experimental — Phase 3)
 
 Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
 into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
@@ -398,18 +398,34 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   the coordinator relay (DERP)** — which only ever sees ciphertext. A keepalive
   holds the NAT mapping open; a silent direct path fails over to DERP and is
   periodically re-punched so it can upgrade back to direct once reachable.
+- **TUN overlay (Phase 3).** With `--tun` (needs root), the node brings up a
+  virtual interface, assigns its overlay IP, and routes `100.64.0.0/10` to it —
+  so **real apps reach peers by overlay IP** (`ping 100.64.0.x`, `ssh`, http),
+  not just the built-in `--ping`. Kernel IP packets are carried over the same
+  encrypted P2P/DERP data path. macOS uses `utun` (no kext); Linux uses
+  `/dev/net/tun`. A peer may only inject packets sourced from its own overlay IP
+  (anti-spoof).
+
+```bash
+# Full VPN data plane on two machines (root); then use overlay IPs directly:
+sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name a --tun
+sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name b --tun
+ping 100.64.0.3      # a → b over the overlay; the mesh log shows [direct] or [derp]
+```
 
 **Flags.** `--bind` sets the UDP data-plane bind address (default `0.0.0.0`);
 `--udp-port` pins the data-plane port (default: random) — handy behind a manually
 forwarded port. The coordinator's STUN responder shares its TCP control port
-(UDP), so no extra port to open.
+(UDP), so no extra port to open. `--tun` enables the VPN interface; `--tun-mtu`
+(default 1280) and `--tun-name` (Linux interface name, default `remotemac0`) tune it.
 
 **Status / roadmap.** Phase 1 delivered the control plane, per-node identity, host
-pool + selection, and a relayed encrypted data path. **Phase 2 (this release)**
-adds UDP P2P with NAT hole punching and transparent direct↔DERP failover — no root
-needed. Still to come: **Phase 3** — a TUN overlay device with automatic routing
-and exit-node selection (full VPN; needs root). Data-plane throughput is modest
-(pure-Python), fine for typical use.
+pool + selection, and a relayed encrypted data path. Phase 2 added UDP P2P with NAT
+hole punching and transparent direct↔DERP failover. **Phase 3 (this release)** adds
+the **TUN overlay** so real apps use the mesh as a network (macOS + Linux; needs
+root). Still to come: **exit-node NAT** (route all internet traffic through an
+`--exit` node — pf/nftables + IP forwarding), IPv6, and split-DNS. Data-plane
+throughput is modest (pure-Python), fine for typical use.
 
 ---
 
@@ -454,5 +470,6 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 | `relay.py` | Rendezvous server, Python 3.8+, no dependencies |
 | `remote_desktop.py` | Encrypted transport + remote desktop + SOCKS5 proxy (host / viewer / pipe / gateway / socks — five modes) |
 | `coordinator.py` | Mesh control plane — node registry, overlay-IP assignment, endpoint distribution, STUN responder, DERP relay. Needs `cryptography` |
-| `mesh.py` | Mesh node — X25519 identity, UDP P2P data plane with NAT hole punching + direct↔DERP failover. Needs `cryptography` |
+| `mesh.py` | Mesh node — X25519 identity, UDP P2P data plane with NAT hole punching + direct↔DERP failover, TUN overlay (`--tun`). Needs `cryptography` |
+| `tun.py` | TUN virtual interface for the overlay (macOS `utun` / Linux `/dev/net/tun`) — used by `mesh.py --tun`. Needs root |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |

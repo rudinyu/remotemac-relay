@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-07-03
+
+### Added
+- **Mesh overlay (Phase 3) — TUN overlay device.** Real apps can now use the mesh
+  as a network: with `--tun` (needs root), a node brings up a virtual interface,
+  assigns its overlay IP, and routes `100.64.0.0/10` to it, so `ping 100.64.0.x`,
+  `ssh`, http, etc. reach peers by overlay IP — not just the built-in `--ping`.
+  - New `tun.py`: a `TunDevice` presenting raw IPv4 over read()/write(). macOS
+    `utun` via the stdlib `AF_SYSTEM`/`SYSPROTO_CONTROL` socket (no kext); Linux
+    `/dev/net/tun` with `TUNSETIFF`. `configure()` assigns the IP and installs the
+    overlay route; MTU defaults to 1280.
+  - `mesh.py`: `MeshNode.on_ip_packet` + `MESH_IP` dispatch in `_recv_data`; the
+    `--tun` / `--tun-mtu` / `--tun-name` CLI opens the device and pumps packets
+    both ways, reusing the Phase 2 P2P/DERP data path (first packet lazily
+    handshakes). Root is checked up front; `--tun` and `--ping` are exclusive.
+  - Anti-spoof: a peer may only inject packets whose IPv4 source is its own
+    assigned overlay IP; mismatches are dropped.
+  - Tests: `MESH_IP`→`on_ip_packet` dispatch (non-leak to `on_message`), IPv4
+    src/dst parsing, `src_allowed` matrix, macOS AF-header framing. Device I/O and
+    OS routing need root → manual-verified.
+- Deferred to a later phase: exit-node NAT + default route (route all internet
+  traffic through an `--exit` node), IPv6 overlay, split-DNS, Windows.
+
 ## [1.2.0] - 2026-07-03
 
 ### Added
