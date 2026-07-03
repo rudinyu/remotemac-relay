@@ -1022,6 +1022,7 @@ def _run_tun(node, mtu, name, egress=None):
     # full-tunnel setup errors) still tears down NAT / routes / the device.
     ftr = None
     dns_server = None
+    resolver_cfg = None
     try:
         # Full-tunnel: pin mesh transport to the physical gateway, then redirect
         # the default route through the exit. Opt-in (only with --exit-node).
@@ -1055,16 +1056,25 @@ def _run_tun(node, mtu, name, egress=None):
             threading.Thread(target=_resync, daemon=True).start()
 
         # split-DNS: resolve <name>.<suffix> to overlay IPs, forward the rest.
+        # Bind loopback (not the overlay IP) so it's local-only — a peer can't use
+        # us as an open DNS forwarder through the TUN.
         if node.dns_enabled:
             import meshdns
+            dns_ip = "127.0.0.1"
             upstream = node.dns_upstream or meshdns.detect_upstream()
             try:
-                dns_server = meshdns.MeshDNSServer(node.overlay_ip, 53, node.dns_suffix,
+                dns_server = meshdns.MeshDNSServer(dns_ip, 53, node.dns_suffix,
                                                    node.dns_lookup, upstream).start()
             except OSError as exc:                 # opt-in — keep the tunnel up on failure
-                _log(f"warning: could not start split-DNS on {node.overlay_ip}:53: {exc}")
+                _log(f"warning: could not start split-DNS on {dns_ip}:53: {exc}")
             else:
-                _log(f"split-DNS: resolving *.{node.dns_suffix} on {node.overlay_ip}:53 "
+                # Point the OS resolver at us only once the server is listening.
+                try:
+                    resolver_cfg = meshdns.ResolverConfig(node.dns_suffix, dns_ip, upstream).apply()
+                except (meshdns.ResolverError, OSError) as exc:
+                    _log(f"warning: split-DNS running but could not configure the OS resolver: {exc} "
+                         f"(query it directly with dig @{dns_ip})")
+                _log(f"split-DNS: resolving *.{node.dns_suffix} on {dns_ip}:53 "
                      f"(upstream {upstream or 'none'})")
 
         _log("running — Ctrl-C to leave the mesh")
@@ -1076,6 +1086,8 @@ def _run_tun(node, mtu, name, egress=None):
         node.on_transport_ips_changed = None       # stop re-pinning during teardown
         node.close()                               # sets _done → reader unblocks
         reader.join(timeout=2)                     # let it exit before we close the fd
+        if resolver_cfg:
+            resolver_cfg.restore()                 # stop pointing the OS resolver at us
         if dns_server:
             dns_server.stop()
         if ftr:

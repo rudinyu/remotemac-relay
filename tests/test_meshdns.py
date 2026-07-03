@@ -82,6 +82,24 @@ class TestUpstreamParsers(unittest.TestCase):
         self.assertEqual(meshdns._first_nameserver_scutil(text), "192.168.1.1")
 
 
+class TestResolverConfigHelpers(unittest.TestCase):
+    def test_linux_resolvconf_keeps_upstream_as_fallback(self):
+        body = meshdns.linux_resolvconf("100.64.0.2", "192.168.0.1")
+        self.assertEqual(body, "nameserver 100.64.0.2\nnameserver 192.168.0.1\n")
+
+    def test_linux_resolvconf_dedupes_and_handles_missing_upstream(self):
+        self.assertEqual(meshdns.linux_resolvconf("100.64.0.2", None), "nameserver 100.64.0.2\n")
+        # upstream == our IP would be a pointless (and looping) fallback → dropped
+        self.assertEqual(meshdns.linux_resolvconf("100.64.0.2", "100.64.0.2"),
+                         "nameserver 100.64.0.2\n")
+
+    def test_macos_resolver_path(self):
+        self.assertEqual(meshdns.macos_resolver_file("mesh"), "/etc/resolver/mesh")
+
+    def test_restore_is_a_noop_when_never_applied(self):
+        meshdns.ResolverConfig("mesh", "100.64.0.2", "1.1.1.1").restore()   # must not raise
+
+
 class TestServerIntegration(unittest.TestCase):
     def setUp(self):
         # Stub upstream: reply to any query with a fixed A (9.9.9.9) so we can tell

@@ -12,6 +12,7 @@ later step); for a quick manual check you can query it directly:
 
     dig @<overlay-ip> gw.mesh
 """
+import os
 import socket
 import struct
 import subprocess
@@ -24,6 +25,10 @@ _QCLASS_IN = 1
 
 
 class DNSError(ValueError):
+    pass
+
+
+class ResolverError(RuntimeError):
     pass
 
 
@@ -123,6 +128,76 @@ def _first_nameserver_scutil(text: str):
         if line.startswith("nameserver[") and ":" in line:
             return line.split(":", 1)[1].strip()
     return None
+
+
+def linux_resolvconf(dns_ip: str, upstream: str) -> str:
+    """The /etc/resolv.conf body: our resolver first, the real upstream kept as a
+    fallback so a crash degrades (timeout → upstream) rather than breaking DNS."""
+    lines = [f"nameserver {dns_ip}\n"]
+    if upstream and upstream != dns_ip:
+        lines.append(f"nameserver {upstream}\n")
+    return "".join(lines)
+
+
+def macos_resolver_file(suffix: str) -> str:
+    """Path of the macOS per-domain resolver file for `suffix`."""
+    return f"/etc/resolver/{suffix}"
+
+
+class ResolverConfig:
+    """Point the OS resolver at our split-DNS server and restore it on exit.
+
+    macOS uses a per-domain `/etc/resolver/<suffix>` file, so ONLY `.<suffix>`
+    queries go to us and the global resolver is untouched. Linux rewrites
+    `/etc/resolv.conf` (our server first, the real upstream as a fallback),
+    backing up the original. (On a systemd-resolved / NetworkManager host,
+    `/etc/resolv.conf` may be re-managed; the original bytes are restored on a
+    clean exit.) Needs root."""
+
+    def __init__(self, suffix: str, dns_ip: str, upstream: str = None):
+        self.suffix = suffix.strip(".").lower()
+        self.dns_ip = dns_ip
+        self.upstream = upstream
+        self._is_mac = (sys.platform == "darwin")
+        self._applied = False
+        self._backup = None            # Linux: original resolv.conf bytes
+        self._path = None
+
+    def apply(self):
+        if self._is_mac:
+            os.makedirs("/etc/resolver", exist_ok=True)
+            self._path = macos_resolver_file(self.suffix)
+            with open(self._path, "w") as f:
+                f.write(f"nameserver {self.dns_ip}\n")
+        elif sys.platform.startswith("linux"):
+            self._path = "/etc/resolv.conf"
+            try:
+                with open(self._path, "rb") as f:
+                    self._backup = f.read()
+            except OSError:
+                self._backup = None
+            with open(self._path, "w") as f:
+                f.write(linux_resolvconf(self.dns_ip, self.upstream))
+        else:
+            raise ResolverError(f"resolver auto-config is unsupported on {sys.platform}")
+        self._applied = True
+        return self
+
+    def restore(self):
+        if not self._applied:
+            return
+        if self._is_mac:
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+        elif self._backup is not None:
+            try:
+                with open(self._path, "wb") as f:
+                    f.write(self._backup)
+            except OSError:
+                pass
+        self._applied = False
 
 
 def detect_upstream():
