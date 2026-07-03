@@ -12,6 +12,11 @@ All notable changes to this project are documented here. This project follows
   command. The mesh token comes from `REMOTEMAC_MESH_TOKEN` (see
   `docker/.env.example`); coordinator overlay-IP state persists in a named volume.
   Deployment packaging only — no change to the modules or their `__version__`.
+- **One-shot Linux installer** `scripts/install-linux.sh`: installs the relay
+  and/or mesh coordinator as hardened systemd services (relay as `nobody`;
+  coordinator with a `StateDirectory` + token in a root-only `EnvironmentFile`),
+  idempotent, with `--relay-only`/`--coord-only`, port flags, and `--open-firewall`.
+  Generates a mesh token if none is given. `INSTALL.md` documents it.
 
 ## [1.8.0] - 2026-07-03
 

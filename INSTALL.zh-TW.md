@@ -55,7 +55,19 @@ docker compose logs -f               # 看兩個服務的 log
 
 只要 relay 的話,只跑那個服務:`docker compose up -d --build relay`。
 
-### 方式 B —— systemd / 手動
+### 方式 B —— 一鍵腳本(systemd,Linux)
+
+一行指令把 relay + coordinator 裝成 systemd 服務:
+
+```bash
+sudo ./scripts/install-linux.sh                        # 兩個都裝;會提示或自動產生 token
+sudo ./scripts/install-linux.sh --relay-only           # 只裝 relay
+sudo ./scripts/install-linux.sh --coord-only --open-firewall
+```
+
+它會把程式碼複製到 `/opt/remotemac`、寫入 systemd unit(relay 以 `nobody` 執行;coordinator 用 `StateDirectory` 存 overlay-IP 狀態、token 放在只有 root 讀得到的 `EnvironmentFile`)、啟用並啟動,並在加 `--open-firewall` 時用 ufw/firewalld 開埠。重跑即可更新。`--help` 列出所有參數(`--relay-port`、`--coord-port`、`--token`、`--prefix`)。若不給 token,它會自動產生並印出來 —— 把那個值給每個節點用。
+
+### 方式 C —— 手動
 
 **Relay**(systemd 服務):
 
