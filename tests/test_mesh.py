@@ -154,13 +154,180 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
         self.assertNotEqual(a.overlay_ip, b.overlay_ip)
 
-        # alice pings bob over the encrypted DERP path; bob auto-replies PONG.
+        # alice pings bob; on localhost this establishes a DIRECT UDP path.
         got = threading.Event()
         a.on_message = lambda src, mt, pl: got.set() if mt == mesh.MESH_PONG else None
         dst = a.resolve("bob")
         self.assertIsNotNone(dst)
         a.send(dst, mesh.MESH_PING, b"hello")
         self.assertTrue(got.wait(5), "did not receive encrypted PONG")
+        self.assertEqual(a._conns[dst].transport, "direct")
+        self.assertIsNotNone(a._conns[dst].endpoint)
+
+    def test_derp_fallback_when_no_direct_path(self):
+        a = self._node("alice3")
+        b = self._node("bob3")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        # Force DERP on BOTH sides: whichever node ends up the designated
+        # initiator must also see no reachable UDP endpoints, so neither can
+        # punch a direct path and both fall back to the coordinator relay.
+        a._peer_endpoints = lambda pk: []
+        b._peer_endpoints = lambda pk: []
+
+        got = threading.Event()
+        a.on_message = lambda src, mt, pl: got.set() if mt == mesh.MESH_PONG else None
+        dst = a.resolve("bob3")
+        a.send(dst, mesh.MESH_PING, b"hi")
+        self.assertTrue(got.wait(6), "did not receive PONG over DERP fallback")
+        self.assertEqual(a._conns[dst].transport, "derp")
+
+    def test_derp_to_direct_upgrade(self):
+        # A session that first forms over DERP must transparently upgrade to a
+        # direct UDP endpoint when a handshake later arrives over UDP — reusing
+        # the SAME session (not rebuilding it) and flipping transport to direct.
+        a = self._node("up-a")
+        b = self._node("up-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        a._peer_endpoints = lambda pk: []
+        b._peer_endpoints = lambda pk: []
+
+        got = threading.Event()
+        a.on_message = lambda s, mt, pl: got.set() if mt == mesh.MESH_PONG else None
+        da = a.resolve("up-b")
+        a.send(da, mesh.MESH_PING, b"x")
+        self.assertTrue(got.wait(6), "DERP session did not form")
+        self.assertEqual(a._conns[da].transport, "derp")
+        db = b.resolve("up-a")
+        self.assertTrue(self._wait(lambda: b._conns.get(db) and b._conns[db].session))
+
+        def _upgrade(node, peer, stage):
+            pc = node._conns[peer]
+            sess = pc.session
+            fake = ("127.0.0.1", 40000)
+            node._handle_hs(peer, node._peer_static(peer), stage,
+                            b"\x11" * 32, 4242, "udp", fake)
+            self.assertIs(pc.session, sess, "session was rebuilt, not upgraded")
+            self.assertEqual(pc.transport, "direct")
+            self.assertEqual(pc.endpoint, fake)
+
+        # The initiator would receive a RESP over UDP; the responder, an INIT.
+        a_is_init = a._am_initiator(a._peer_static(da))
+        _upgrade(a, da, mesh._HS_RESP if a_is_init else mesh._HS_INIT)
+        _upgrade(b, db, mesh._HS_INIT if a_is_init else mesh._HS_RESP)
+
+    def test_direct_failover_to_derp_on_silence(self):
+        # A direct path that goes silent must fail over to the DERP relay so
+        # traffic keeps flowing (reusing the same session).
+        a = self._node("fo-a")
+        b = self._node("fo-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+
+        got = threading.Event()
+        a.on_message = lambda s, mt, pl: got.set() if mt == mesh.MESH_PONG else None
+        da = a.resolve("fo-b")
+        a.send(da, mesh.MESH_PING, b"x")
+        self.assertTrue(got.wait(6), "direct path did not form")
+        self.assertEqual(a._conns[da].transport, "direct")
+
+        # No reachable endpoints to re-punch → failover must stick on DERP;
+        # mark the path silent and speed up the liveness loop.
+        a._peer_endpoints = lambda pk: []
+        b._peer_endpoints = lambda pk: []
+        a._ka_tick = 0.05
+        a.direct_timeout = 0.2
+        a.keepalive_interval = 0.1
+        a._conns[da].last_rx = time.monotonic() - 100
+
+        self.assertTrue(self._wait(lambda: a._conns[da].transport == "derp", 5),
+                        "did not fail over to DERP on silence")
+
+        # Traffic still flows, now over the relay.
+        got.clear()
+        a.send(da, mesh.MESH_PING, b"again")
+        self.assertTrue(got.wait(6), "no PONG after DERP failover")
+        self.assertEqual(a._conns[da].transport, "derp")
+
+    def test_direct_recovery_after_failover(self):
+        # After failing over to DERP, a node must keep retrying hole punching and
+        # transparently upgrade back to a direct path once it becomes reachable.
+        a = self._node("rc-a")
+        b = self._node("rc-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+
+        got = threading.Event()
+        a.on_message = lambda s, mt, pl: got.set() if mt == mesh.MESH_PONG else None
+        da = a.resolve("rc-b")
+        a.send(da, mesh.MESH_PING, b"x")
+        self.assertTrue(got.wait(6), "direct path did not form")
+        self.assertEqual(a._conns[da].transport, "direct")
+
+        # A real deployment runs identical keepalive config on every node, so
+        # both ends detect the silence. Drive both fast so recovery is role-
+        # independent (the designated initiator re-punches once it can reach us).
+        db = b.resolve("rc-a")
+        real_a_eps, real_b_eps = a._peer_endpoints, b._peer_endpoints
+        a._peer_endpoints = lambda pk: []
+        b._peer_endpoints = lambda pk: []
+        for n in (a, b):
+            n._ka_tick = 0.05
+            n.direct_timeout = 0.2
+            n.keepalive_interval = 0.1
+            n.direct_retry_interval = 0.2
+        a._conns[da].last_rx = time.monotonic() - 100
+        b._conns[db].last_rx = time.monotonic() - 100
+        self.assertTrue(self._wait(lambda: a._conns[da].transport == "derp", 5),
+                        "did not fail over to DERP")
+
+        # Reachability returns → the periodic re-punch must restore a direct path.
+        a._peer_endpoints, b._peer_endpoints = real_a_eps, real_b_eps
+        self.assertTrue(self._wait(lambda: a._conns[da].transport == "direct", 8),
+                        "did not recover a direct path after reachability returned")
+
+    def test_handshake_glare_both_initiate(self):
+        # Both nodes try to open a session at the same instant. The deterministic
+        # initiator tie-break must stop this from producing two mismatched
+        # sessions — pings must succeed in BOTH directions.
+        a = self._node("glare-a")
+        b = self._node("glare-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+
+        a_pong = threading.Event()
+        b_pong = threading.Event()
+        a.on_message = lambda s, mt, pl: a_pong.set() if mt == mesh.MESH_PONG else None
+        b.on_message = lambda s, mt, pl: b_pong.set() if mt == mesh.MESH_PONG else None
+
+        da, db = a.resolve("glare-b"), b.resolve("glare-a")
+        # Fire simultaneously to provoke glare.
+        threading.Thread(target=lambda: a.send(da, mesh.MESH_PING, b"a"), daemon=True).start()
+        threading.Thread(target=lambda: b.send(db, mesh.MESH_PING, b"b"), daemon=True).start()
+
+        self.assertTrue(a_pong.wait(6), "a did not get a PONG (glare broke keys?)")
+        self.assertTrue(b_pong.wait(6), "b did not get a PONG (glare broke keys?)")
+
+    def test_initiator_tie_break_is_symmetric(self):
+        a = self._node("tb-a")
+        b = self._node("tb-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        # Exactly one of the pair considers itself the initiator, and both agree.
+        a_init = a._am_initiator(a._peer_static(b.pubkey_b64))
+        b_init = b._am_initiator(b._peer_static(a.pubkey_b64))
+        self.assertNotEqual(a_init, b_init)
+
+    def test_stun_responder_echoes_source(self):
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.bind(("127.0.0.1", 0))
+        myport = u.getsockname()[1]
+        u.sendto(b"MSTU" + b"\x00" * 32, ("127.0.0.1", self.port))
+        u.settimeout(3)
+        data, _ = u.recvfrom(2048)
+        u.close()
+        self.assertEqual(data, b"MSTR" + f"127.0.0.1:{myport}".encode())
+
+    def test_node_discovers_public_endpoint(self):
+        a = self._node("stun-node")
+        self.assertTrue(self._wait(lambda: a._stun_done.is_set(), 5))
+        port = a.udp.getsockname()[1]
+        self.assertIn(f"127.0.0.1:{port}", a.local_endpoints)
 
     def test_resolve_by_overlay_ip(self):
         a = self._node("alice2")

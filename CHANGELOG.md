@@ -3,6 +3,31 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-07-03
+
+### Added
+- **Mesh overlay (Phase 2) — UDP P2P + NAT hole punching.** Node↔node traffic now
+  goes **peer-to-peer over UDP** wherever the network allows, instead of always
+  relaying through the coordinator.
+  - UDP data plane in `mesh.py`: one data-plane socket per node with a WireGuard-
+    style index (SPI) to demux many peers; the existing forward-secret handshake
+    and ChaCha20-Poly1305 session are carried over UDP (`--bind`, `--udp-port`).
+  - **STUN-lite endpoint discovery**: `coordinator.py` runs a UDP responder on its
+    control port; each node learns its public (post-NAT) endpoint and advertises
+    its candidates, which the coordinator distributes in the peer map.
+  - **Hole punching + signaling**: a `connect` nudge relayed through the
+    coordinator makes both peers punch simultaneously; a deterministic pubkey
+    tie-break picks the initiator so glare can't derive two mismatched sessions.
+  - **Transparent path selection**: direct-first, with automatic **DERP fallback**
+    when no direct path forms (e.g. symmetric NAT). A keepalive holds the NAT
+    mapping open; a silent direct path fails over to the relay (reusing the
+    session) and is periodically re-punched to upgrade back to direct.
+  - The coordinator still only ever sees **ciphertext** on the data path.
+  - Tests: hole-punch handshake glare tie-break, localhost direct-session
+    end-to-end, DERP fallback, DERP→direct upgrade, direct→DERP failover on
+    silence, and recovery once reachability returns — all root-free.
+- Deferred to a later phase: TUN overlay device + exit-node NAT (Phase 3).
+
 ## [1.1.0] - 2026-07-02
 
 ### Added

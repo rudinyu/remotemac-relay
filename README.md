@@ -365,22 +365,23 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
-## 4. Mesh overlay (experimental — Phase 1)
+## 4. Mesh overlay (experimental — Phase 2)
 
 Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
 into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
 network, each gets a stable overlay IP, and node↔node traffic is end-to-end
-encrypted. Requires `cryptography` (`pip install cryptography`).
+encrypted and, wherever the network allows, sent **peer-to-peer over UDP** rather
+than through the coordinator. Requires `cryptography` (`pip install cryptography`).
 
 ```bash
-# Coordinator (on your reachable host — control plane only, sees ciphertext)
+# Coordinator (on your reachable host — control plane + STUN, sees only ciphertext)
 python3 coordinator.py 21200 --token "network-secret"
 
-# Each node joins the network
+# Each node joins the network (opens a UDP data-plane port; --udp-port to pin it)
 python3 mesh.py up coord.example.com:21200 --token "network-secret" --name laptop
 python3 mesh.py up coord.example.com:21200 --token "network-secret" --name mac
 
-# Prove the encrypted path between two nodes
+# Prove the encrypted path — the log shows [direct: …] or [derp …]
 python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 ```
 
@@ -388,15 +389,27 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   overridable with `$REMOTEMAC_MESH_KEY`); the coordinator assigns overlay IPs
   from `100.64.0.0/10`.
 - Node↔node handshake is mutually authenticated and forward-secret (X25519
-  triple-DH → HKDF-SHA256 → ChaCha20-Poly1305); the coordinator only relays
-  **ciphertext** (DERP fallback).
+  triple-DH → HKDF-SHA256 → ChaCha20-Poly1305).
+- **Direct P2P (Phase 2).** Nodes discover their public endpoint via a STUN-lite
+  probe to the coordinator, exchange candidates, and **hole-punch a direct UDP
+  path** (simultaneous punching; a deterministic pubkey tie-break avoids handshake
+  glare). Data then flows straight between peers. If no direct path forms within a
+  few seconds (e.g. a symmetric-NAT pair), traffic transparently **falls back to
+  the coordinator relay (DERP)** — which only ever sees ciphertext. A keepalive
+  holds the NAT mapping open; a silent direct path fails over to DERP and is
+  periodically re-punched so it can upgrade back to direct once reachable.
 
-**Status / roadmap.** Phase 1 (this release) delivers the control plane, per-node
-identity, the host pool + selection, and an encrypted data path relayed through
-the coordinator — no root needed. Still to come: **Phase 2** — direct P2P via UDP
-NAT hole punching (relay stays as fallback for symmetric-NAT pairs); **Phase 3** —
-a TUN overlay device with automatic routing and exit-node selection (full VPN;
-needs root). Data-plane throughput is modest (pure-Python), fine for typical use.
+**Flags.** `--bind` sets the UDP data-plane bind address (default `0.0.0.0`);
+`--udp-port` pins the data-plane port (default: random) — handy behind a manually
+forwarded port. The coordinator's STUN responder shares its TCP control port
+(UDP), so no extra port to open.
+
+**Status / roadmap.** Phase 1 delivered the control plane, per-node identity, host
+pool + selection, and a relayed encrypted data path. **Phase 2 (this release)**
+adds UDP P2P with NAT hole punching and transparent direct↔DERP failover — no root
+needed. Still to come: **Phase 3** — a TUN overlay device with automatic routing
+and exit-node selection (full VPN; needs root). Data-plane throughput is modest
+(pure-Python), fine for typical use.
 
 ---
 
@@ -440,6 +453,6 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 |---|---|
 | `relay.py` | Rendezvous server, Python 3.8+, no dependencies |
 | `remote_desktop.py` | Encrypted transport + remote desktop + SOCKS5 proxy (host / viewer / pipe / gateway / socks — five modes) |
-| `coordinator.py` | Mesh control plane (Phase 1) — node registry, overlay-IP assignment, DERP relay. Needs `cryptography` |
-| `mesh.py` | Mesh node — X25519 identity, joins a network, encrypted node↔node data path. Needs `cryptography` |
+| `coordinator.py` | Mesh control plane — node registry, overlay-IP assignment, endpoint distribution, STUN responder, DERP relay. Needs `cryptography` |
+| `mesh.py` | Mesh node — X25519 identity, UDP P2P data plane with NAT hole punching + direct↔DERP failover. Needs `cryptography` |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |

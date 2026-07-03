@@ -34,7 +34,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from remote_desktop import SecureChannel, _auth  # noqa: E402
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 MAX_NODES = 1024
@@ -105,7 +105,7 @@ class Coordinator:
             me = self._nodes.get(pubkey)
             peers = [
                 {"pubkey": pk, "ip": n["ip"], "hostname": n["hostname"],
-                 "exit": n["exit"], "online": True}
+                 "exit": n["exit"], "endpoints": n.get("endpoints", []), "online": True}
                 for pk, n in self._nodes.items() if pk != pubkey
             ]
         self_info = {"pubkey": pubkey, "ip": me["ip"]} if me else {}
@@ -144,8 +144,9 @@ class Coordinator:
                     pk = None   # not admitted; nothing to clean up
                     return
             ip = self._alloc.get(pk)
+            endpoints = [str(e)[:64] for e in (reg.get("endpoints") or [])][:16]
             record = {"ch": ch, "hostname": reg.get("hostname", "node")[:64],
-                      "exit": bool(reg.get("exit")), "ip": ip}
+                      "exit": bool(reg.get("exit")), "ip": ip, "endpoints": endpoints}
             with self._lock:
                 old = self._nodes.get(pk)
                 if old:
@@ -159,8 +160,15 @@ class Coordinator:
 
             while True:
                 msg = recv_json(ch)
-                if msg.get("t") == "to":
+                mt = msg.get("t")
+                if mt == "to":
                     self._relay(pk, msg)
+                elif mt == "endpoints":
+                    eps = [str(e)[:64] for e in (msg.get("endpoints") or [])][:16]
+                    with self._lock:
+                        if self._nodes.get(pk) is record:
+                            record["endpoints"] = eps
+                    self._push_all()
                 # unknown control types are ignored
         except Exception:
             pass
@@ -189,13 +197,41 @@ class Coordinator:
             pass
 
 
+_STUN_REQ = b"MSTU"
+_STUN_RES = b"MSTR"
+
+
+def _stun_responder(host: str, port: int):
+    """Stateless STUN-lite: reply to each probe with the source's observed ip:port,
+    so a node behind NAT learns its public endpoint. Shares the TCP control port."""
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        u.bind((host, port))
+    except OSError as exc:
+        print(f"[coord] warning: STUN UDP bind failed on {port}: {exc}", flush=True)
+        u.close()
+        return
+    while True:
+        try:
+            data, addr = u.recvfrom(2048)
+        except OSError:
+            return
+        if data[:4] == _STUN_REQ:
+            try:
+                u.sendto(_STUN_RES + f"{addr[0]}:{addr[1]}".encode(), addr)
+            except OSError:
+                pass
+
+
 def serve(host: str, port: int, token: bytes, state_path: str):
     coord = Coordinator(token, IPAllocator(state_path))
+    threading.Thread(target=_stun_responder, args=(host, port), daemon=True).start()
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(128)
-    print(f"RemoteMac mesh coordinator listening on {host}:{port}", flush=True)
+    print(f"RemoteMac mesh coordinator listening on {host}:{port} (TCP control + UDP STUN)", flush=True)
     try:
         while True:
             conn, addr = srv.accept()
