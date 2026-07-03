@@ -71,5 +71,36 @@ class TestPinDiff(unittest.TestCase):
         self.assertEqual(self.ftr._pinned, set())
 
 
+class TestLanRoutes(unittest.TestCase):
+    def setUp(self):
+        self.ftr = netroute.FullTunnelRoutes("remotemac0", "10.0.0.1", "eth0")
+        self.cmds = []
+        # Capture the raw route commands without running them (no privilege).
+        netroute._run = lambda cmd: self.cmds.append(cmd)
+
+    def tearDown(self):
+        import importlib
+        importlib.reload(netroute)   # restore the real _run for other tests
+
+    def test_install_is_idempotent_and_tracked(self):
+        self.ftr.install_lan_routes(["10.0.0.0/8", "172.16.0.0/12"])
+        n_after_first = len(self.cmds)
+        self.ftr.install_lan_routes(["10.0.0.0/8"])          # already present → no-op
+        self.assertEqual(len(self.cmds), n_after_first, "re-install issued a duplicate route")
+        self.assertEqual(self.ftr._lan, {"10.0.0.0/8", "172.16.0.0/12"})
+        # Each CIDR appears in exactly one "add" command, routed via the gateway.
+        adds = [c for c in self.cmds if "add" in c]
+        self.assertEqual(len(adds), 2)
+        for cidr in ("10.0.0.0/8", "172.16.0.0/12"):
+            self.assertTrue(any(cidr in c and "10.0.0.1" in c for c in adds))
+
+    def test_teardown_removes_lan_routes(self):
+        self.ftr.install_lan_routes(["10.0.0.0/8"])
+        self.cmds.clear()
+        self.ftr.teardown()
+        self.assertEqual(self.ftr._lan, set())
+        self.assertTrue(any("delete" in c or "del" in c for c in self.cmds))
+
+
 if __name__ == "__main__":
     unittest.main()

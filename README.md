@@ -365,7 +365,7 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
-## 4. Mesh overlay (experimental — Phase 5)
+## 4. Mesh overlay (experimental — Phase 6)
 
 Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
 into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
@@ -447,23 +447,25 @@ forwarded port. The coordinator's STUN responder shares its TCP control port
 (default 1280) and `--tun-name` (Linux interface name, default `remotemac0`) tune it.
 `--advertise-routes CIDR,…` / `--accept-routes` enable subnet routing; `--exit`
 advertises a full-tunnel exit node and `--exit-node NAME` routes all traffic through
-one (all need `--tun`); `--egress IFACE` overrides the NAT egress interface. (A host
-with a restrictive FORWARD firewall policy needs a manual allow rule for the overlay
-net.)
+one (all need `--tun`); `--lan-routes CIDR,…` keeps extra local subnets off the tunnel
+(see below); `--egress IFACE` overrides the NAT egress interface. (A host with a
+restrictive FORWARD firewall policy needs a manual allow rule for the overlay net.)
 
 > **Full-tunnel caveats.** It rewrites your default route — test with out-of-band
 > console/SSH access. On a crash the `/1` routes vanish with the TUN so the default
 > route self-heals. DNS goes through the exit (public resolvers work; a LAN resolver
-> won't), and your **local LAN is not reachable** while connected (LAN exception is
-> a later phase).
+> won't). Your **directly-connected LAN stays reachable** (its connected route is more
+> specific than the `0.0.0.0/1`+`128.0.0.0/1` split); only traffic that would have used
+> the default gateway is tunneled. To also keep *other* local subnets reachable via
+> your LAN router, list them with `--lan-routes 10.0.0.0/8,172.16.0.0/12`.
 
 **Status / roadmap.** Phase 1 delivered the control plane, per-node identity, host
 pool + selection, and a relayed encrypted data path. Phase 2 added UDP P2P with NAT
 hole punching and transparent direct↔DERP failover. Phase 3 added the TUN overlay.
-Phase 4 added subnet routing. **Phase 5 (this release)** adds the opt-in **full-tunnel
-exit node** (Linux exit; macOS + Linux client). Still to come: a LAN exception,
-macOS exit (pf), IPv6, and split-DNS. Data-plane throughput is modest (pure-Python),
-fine for typical use.
+Phase 4 added subnet routing. Phase 5 added the opt-in full-tunnel exit node.
+**Phase 6 (this release)** adds `--lan-routes` and corrects the LAN-reachability docs.
+Still to come: split-DNS, IPv6, macOS exit (pf), an iptables fallback. Data-plane
+throughput is modest (pure-Python), fine for typical use.
 
 ---
 

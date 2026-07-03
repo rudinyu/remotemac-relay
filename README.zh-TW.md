@@ -365,7 +365,7 @@ ALL_PROXY=socks5h://127.0.0.1:1080 curl https://example.com
 
 ---
 
-## 四、Mesh overlay（實驗性 — Phase 5）
+## 四、Mesh overlay（實驗性 — Phase 6）
 
 除了 1:1 遠端桌面,`coordinator.py` + `mesh.py` 把系統擴充成 **mesh**(自架的簡化版 Tailscale):多個節點加入同一張網,各自拿到穩定的 overlay IP,節點之間端到端加密,而且在網路允許時**走 UDP P2P 直連**而非繞經 coordinator。需要 `cryptography`(`pip install cryptography`)。
 
@@ -405,11 +405,11 @@ sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --exit-no
 curl https://ifconfig.me      # 顯示出口節點的公網 IP,而非 client 本機的
 ```
 
-**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。`--tun` 啟用 VPN 介面;`--tun-mtu`(預設 1280)、`--tun-name`(Linux 介面名,預設 `remotemac0`)可微調。`--advertise-routes CIDR,…` / `--accept-routes` 啟用子網路由;`--exit` 宣告 full-tunnel 出口、`--exit-node NAME` 把全流量走某出口(皆需 `--tun`);`--egress IFACE` 覆寫 NAT 出口介面。(若主機 FORWARD 防火牆政策較嚴,需手動為 overlay 網段加放行規則。)
+**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。`--tun` 啟用 VPN 介面;`--tun-mtu`(預設 1280)、`--tun-name`(Linux 介面名,預設 `remotemac0`)可微調。`--advertise-routes CIDR,…` / `--accept-routes` 啟用子網路由;`--exit` 宣告 full-tunnel 出口、`--exit-node NAME` 把全流量走某出口(皆需 `--tun`);`--lan-routes CIDR,…` 讓額外的本地網段不走隧道(見下);`--egress IFACE` 覆寫 NAT 出口介面。(若主機 FORWARD 防火牆政策較嚴,需手動為 overlay 網段加放行規則。)
 
-> **Full-tunnel 注意事項**:它會改寫預設路由 —— 請在有 console/SSH 備援下測試。程序崩潰時兩條 `/1` 會隨 TUN 消失,預設路由自動恢復。DNS 走出口(公用 resolver 可用;LAN resolver 不行);連線期間**本地區網不可達**(LAN 例外留待之後)。
+> **Full-tunnel 注意事項**:它會改寫預設路由 —— 請在有 console/SSH 備援下測試。程序崩潰時兩條 `/1` 會隨 TUN 消失,預設路由自動恢復。DNS 走出口(公用 resolver 可用;LAN resolver 不行)。**直接連接的本地區網仍可達**(其 connected 路由比 `0.0.0.0/1`+`128.0.0.0/1` 更明確);只有原本要走預設閘道的流量才走隧道。若要讓**其他**經由 LAN 路由器才到的本地網段也保持可達,用 `--lan-routes 10.0.0.0/8,172.16.0.0/12` 列出。
 
-**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。Phase 3 加上 TUN overlay。Phase 4 加上子網路由。**Phase 5(本版)** 加上 opt-in 的 **full-tunnel 出口節點**(Linux 出口;macOS + Linux client)。後續:LAN 例外、macOS exit(pf)、IPv6、split-DNS。純 Python 資料面吞吐中等,一般用途足夠。
+**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。Phase 3 加上 TUN overlay。Phase 4 加上子網路由。Phase 5 加上 opt-in full-tunnel 出口節點。**Phase 6(本版)** 加上 `--lan-routes` 並修正 LAN 可達性文件。後續:split-DNS、IPv6、macOS exit(pf)、iptables 後援。純 Python 資料面吞吐中等,一般用途足夠。
 
 ---
 
