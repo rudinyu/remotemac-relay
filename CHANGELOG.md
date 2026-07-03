@@ -3,6 +3,32 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-07-03
+
+### Added
+- **Mesh overlay (Phase 5) — full-tunnel exit node (opt-in).** A client can route
+  **all** outbound traffic through a chosen exit node, so its public IP becomes the
+  exit's. Off by default; the default route is only touched with `--exit-node`.
+  - `mesh.py`: `--exit-node NAME` selects a full-tunnel exit (validated to be
+    advertising `exit=true`; re-validated on every map so routing pauses if it
+    leaves); `--exit` advertises a node as an exit (reuses the Phase 4 nftables
+    masquerade — its overlay-source rule already covers any destination).
+    `route_for()` falls back to the exit as an internet catch-all; `src_permitted()`
+    lets the exit source any address. Both require `--tun`; `--exit-node` is
+    mutually exclusive with `--advertise-routes`.
+  - `netroute.py` (new, **macOS + Linux**): detect the physical default route, pin
+    mesh transport (coordinator + peer UDP endpoints + the exit's live endpoint) as
+    /32 host routes via the physical gateway, then add `0.0.0.0/1`+`128.0.0.0/1` via
+    the TUN to override the default without deleting it. Pins are kept in sync as
+    endpoints change; teardown restores the default route and unpins.
+  - Resilience: transport is pinned before the redirect and torn down in reverse;
+    the `/1` routes vanish with the TUN so a crash self-heals the default route.
+  - Tests: default-route parsers, incremental pin diff, exit selection / catch-all
+    routing / widened anti-spoof / rejection of a non-exit peer. Real routing needs
+    root + two hosts → manual-verified.
+- Deferred to a later phase: a LAN exception (keep the local LAN reachable while
+  full-tunneling), split-DNS, macOS exit (pf), iptables fallback, IPv6.
+
 ## [1.4.0] - 2026-07-03
 
 ### Added

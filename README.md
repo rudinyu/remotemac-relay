@@ -365,7 +365,7 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
-## 4. Mesh overlay (experimental — Phase 4)
+## 4. Mesh overlay (experimental — Phase 5)
 
 Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
 into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
@@ -414,6 +414,14 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   CIDRs that overlap the overlay or contain the coordinator / a peer endpoint are
   refused (so mesh transport can't loop), and a subnet router may source replies
   from within the routes you accepted (anti-spoof stays enforced otherwise).
+- **Full-tunnel exit node (Phase 5, opt-in).** A client can route **all** its
+  outbound traffic through a chosen exit node with `--exit-node NAME`, so its
+  public IP becomes the exit's (like a commercial VPN's server picker). The exit
+  node is a Linux node started with `--exit` (reuses the same IP-forwarding +
+  masquerade). The client pins mesh transport (coordinator + peer endpoints) to
+  its physical gateway, then routes `0.0.0.0/1`+`128.0.0.0/1` through the TUN — so
+  the default route is overridden without breaking the mesh's own transport. This
+  is **off by default**; without `--exit-node` the default route is untouched.
 
 ```bash
 # Overlay only: full data plane on two machines (root); use overlay IPs directly:
@@ -425,6 +433,11 @@ ping 100.64.0.3      # a → b over the overlay; the mesh log shows [direct] or 
 sudo python3 mesh.py up coord…:21200 --token … --name gw     --tun --advertise-routes 192.168.1.0/24
 sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --accept-routes
 ping 192.168.1.1     # laptop reaches the LAN behind gw, through the mesh
+
+# Full-tunnel: a Linux exit node, and a client that sends all traffic through it:
+sudo python3 mesh.py up coord…:21200 --token … --name exit   --tun --exit
+sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --exit-node exit
+curl https://ifconfig.me      # shows the exit node's public IP, not the client's
 ```
 
 **Flags.** `--bind` sets the UDP data-plane bind address (default `0.0.0.0`);
@@ -432,17 +445,25 @@ ping 192.168.1.1     # laptop reaches the LAN behind gw, through the mesh
 forwarded port. The coordinator's STUN responder shares its TCP control port
 (UDP), so no extra port to open. `--tun` enables the VPN interface; `--tun-mtu`
 (default 1280) and `--tun-name` (Linux interface name, default `remotemac0`) tune it.
-`--advertise-routes CIDR,…` / `--accept-routes` enable subnet routing (need `--tun`);
-`--egress IFACE` overrides the NAT egress interface on a subnet router. (A host with
-a restrictive FORWARD firewall policy needs a manual allow rule for the overlay net.)
+`--advertise-routes CIDR,…` / `--accept-routes` enable subnet routing; `--exit`
+advertises a full-tunnel exit node and `--exit-node NAME` routes all traffic through
+one (all need `--tun`); `--egress IFACE` overrides the NAT egress interface. (A host
+with a restrictive FORWARD firewall policy needs a manual allow rule for the overlay
+net.)
+
+> **Full-tunnel caveats.** It rewrites your default route — test with out-of-band
+> console/SSH access. On a crash the `/1` routes vanish with the TUN so the default
+> route self-heals. DNS goes through the exit (public resolvers work; a LAN resolver
+> won't), and your **local LAN is not reachable** while connected (LAN exception is
+> a later phase).
 
 **Status / roadmap.** Phase 1 delivered the control plane, per-node identity, host
 pool + selection, and a relayed encrypted data path. Phase 2 added UDP P2P with NAT
 hole punching and transparent direct↔DERP failover. Phase 3 added the TUN overlay.
-**Phase 4 (this release)** adds **subnet routing** (Linux NAT egress) so nodes reach
-LANs behind a peer. Still to come: **full-tunnel** (route *all* internet traffic
-through an exit node), macOS exit (pf), IPv6, and split-DNS. Data-plane throughput
-is modest (pure-Python), fine for typical use.
+Phase 4 added subnet routing. **Phase 5 (this release)** adds the opt-in **full-tunnel
+exit node** (Linux exit; macOS + Linux client). Still to come: a LAN exception,
+macOS exit (pf), IPv6, and split-DNS. Data-plane throughput is modest (pure-Python),
+fine for typical use.
 
 ---
 
@@ -489,5 +510,6 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 | `coordinator.py` | Mesh control plane — node registry, overlay-IP assignment, endpoint distribution, STUN responder, DERP relay. Needs `cryptography` |
 | `mesh.py` | Mesh node — X25519 identity, UDP P2P data plane with NAT hole punching + direct↔DERP failover, TUN overlay (`--tun`). Needs `cryptography` |
 | `tun.py` | TUN virtual interface for the overlay (macOS `utun` / Linux `/dev/net/tun`) — used by `mesh.py --tun`. Needs root |
-| `nat.py` | Linux NAT egress for a subnet router (`--advertise-routes`) — IP forwarding + nftables masquerade. Needs root |
+| `nat.py` | Linux NAT egress for a subnet router / exit node (`--advertise-routes` / `--exit`) — IP forwarding + nftables masquerade. Needs root |
+| `netroute.py` | Full-tunnel route manager (`--exit-node`) — default-route redirect + transport pinning, macOS + Linux. Needs root |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |

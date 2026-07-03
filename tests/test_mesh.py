@@ -163,10 +163,12 @@ class TestMeshEndToEnd(unittest.TestCase):
         except OSError:
             pass
 
-    def _node(self, name, advertise_routes=None, accept_routes=False):
-        n = mesh.MeshNode(X25519PrivateKey.generate(), name,
+    def _node(self, name, advertise_routes=None, accept_routes=False,
+              is_exit=False, exit_node=None):
+        n = mesh.MeshNode(X25519PrivateKey.generate(), name, is_exit=is_exit,
                           advertise_routes=advertise_routes)
         n.accept_routes = accept_routes
+        n.exit_node_name = exit_node
         n.connect(f"127.0.0.1:{self.port}", self.token)
         threading.Thread(target=n.run, daemon=True).start()
         self.nodes.append(n)
@@ -414,6 +416,40 @@ class TestMeshEndToEnd(unittest.TestCase):
         # Learned in the map, but not installed as a route (no opt-in).
         self.assertEqual(client.peers[gw.pubkey_b64].get("routes"), ["192.168.9.0/24"])
         self.assertIsNone(client.route_for("192.168.9.5"))
+
+    def test_exit_node_full_tunnel_routing(self):
+        # A client with --exit-node routes all non-overlay/non-subnet traffic to
+        # the exit peer, and accepts replies from it sourced from any address.
+        ex = self._node("exit", is_exit=True)
+        client = self._node("laptop3", exit_node="exit")
+
+        self.assertTrue(self._wait(lambda: client.exit_node_pk == ex.pubkey_b64),
+                        "client did not resolve the exit node")
+        # Internet-bound traffic goes to the exit; overlay still resolves to peers.
+        self.assertEqual(client.route_for("8.8.8.8"), ex.pubkey_b64)
+        self.assertEqual(client.route_for("1.1.1.1"), ex.pubkey_b64)
+        self.assertEqual(client.route_for(ex.overlay_ip), ex.pubkey_b64)   # overlay wins
+        # Anti-spoof: the exit may source anything; a non-exit peer may not.
+        self.assertTrue(client.src_permitted(ex.pubkey_b64, "93.184.216.34"))
+        self.assertFalse(client.src_permitted("some-other-pk", "93.184.216.34"))
+
+    def test_no_exit_node_leaves_internet_unrouted(self):
+        # Without --exit-node, internet destinations stay unroutable (dropped).
+        a = self._node("plain-a")
+        b = self._node("plain-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers))
+        self.assertIsNone(a.route_for("8.8.8.8"))
+
+    def test_exit_node_ignored_if_peer_not_advertising_exit(self):
+        # Naming a peer that isn't an exit must not enable full-tunnel: exit_node_pk
+        # stays unresolved and internet traffic stays unrouted.
+        plain = self._node("not-an-exit")
+        client = self._node("laptop4", exit_node="not-an-exit")
+        self.assertTrue(self._wait(lambda: plain.pubkey_b64 in client.peers))
+        # Give the map a moment; the non-exit peer must never resolve as the exit.
+        time.sleep(0.3)
+        self.assertIsNone(client.exit_node_pk)
+        self.assertIsNone(client.route_for("8.8.8.8"))
 
     def test_resolve_by_overlay_ip(self):
         a = self._node("alice2")

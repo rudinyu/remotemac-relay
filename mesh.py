@@ -9,13 +9,14 @@ is end-to-end encrypted with a mutually authenticated, forward-secret handshake
 (X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305); the coordinator only ever
 relays ciphertext.
 
-Phases 1–4: identity + token-authenticated control channel + peer map; an
+Phases 1–5: identity + token-authenticated control channel + peer map; an
 encrypted data path that is **UDP peer-to-peer** where the network allows (NAT
 hole punching, Phase 2) and transparently falls back to a coordinator relay
 (DERP); a **TUN overlay** (Phase 3, `--tun`) so real apps reach peers by overlay
-IP; and **subnet routing** (Phase 4, `--advertise-routes`/`--accept-routes`) to
-reach LANs behind a peer. Only `--tun` (and subnet routing) needs root;
-everything else runs unprivileged.
+IP; **subnet routing** (Phase 4, `--advertise-routes`/`--accept-routes`) to reach
+LANs behind a peer; and an opt-in **full-tunnel exit node** (Phase 5, `--exit` /
+`--exit-node`). Only `--tun` and the routing features need root; everything else
+runs unprivileged.
 
 Requires: pip install cryptography
 
@@ -25,6 +26,7 @@ Usage
     python3 mesh.py up <coord:port> --token <token> --ping <peer-name-or-ip>
     sudo python3 mesh.py up <coord:port> --token <token> --tun   # VPN data plane
     sudo python3 mesh.py up <coord:port> --token <token> --tun --advertise-routes 192.168.1.0/24
+    sudo python3 mesh.py up <coord:port> --token <token> --tun --exit-node <peer>   # full-tunnel
 """
 import argparse
 import base64
@@ -50,7 +52,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
@@ -343,6 +345,8 @@ class MeshNode:
         self.advertise_routes = list(advertise_routes or [])   # CIDRs I route to
         self.accept_routes = False        # opt in to peers' advertised subnet routes
         self._route_table = []            # [(ip_network, pubkey)], longest-prefix first
+        self.exit_node_name = None        # peer name/IP to full-tunnel through (CLI)
+        self.exit_node_pk = None          # resolved once the peer is in the map
         self.ch       = None
         self.udp      = None
         self._coord_udp = None       # (host, port) for STUN probes
@@ -363,6 +367,7 @@ class MeshNode:
         self.on_message = None     # optional callback(peer_pk_b64, msg_type, body)
         self.on_ip_packet = None   # optional callback(peer_pk_b64, raw_ip_packet) for MESH_IP
         self.on_routes_changed = None  # optional callback(added_cidrs, removed_cidrs)
+        self.on_transport_ips_changed = None  # optional callback(set_of_transport_ips)
 
     # -- control channel --------------------------------------------------------
 
@@ -486,6 +491,45 @@ class MeshNode:
             self.peers = peers
         if self.accept_routes:
             self._refresh_routes()
+        if self.exit_node_name:
+            self._resolve_exit_node()
+        if self.on_transport_ips_changed:
+            self.on_transport_ips_changed(self.transport_ips())
+
+    def _resolve_exit_node(self):
+        """(Re)validate --exit-node NAME against the current map: set exit_node_pk
+        when the named peer is present AND advertises as an exit, and clear it if
+        the peer disappears or stops advertising (full-tunnel routing then pauses
+        rather than sending to a peer that can't forward)."""
+        pk = self.resolve(self.exit_node_name)
+        if not pk or not (self.peers.get(pk) or {}).get("exit"):
+            if self.exit_node_pk is not None:
+                _log(f"exit node '{self.exit_node_name}' is gone or no longer advertising as "
+                     f"an exit — full-tunnel routing paused")
+            self.exit_node_pk = None
+            return
+        if self.exit_node_pk != pk:
+            self.exit_node_pk = pk
+            _log(f"full-tunnel: routing all traffic through exit '{self.exit_node_name}' ({pk[:16]}…)")
+
+    def transport_ips(self):
+        """IPs that must keep bypassing the tunnel (coordinator + every peer's UDP
+        endpoints + a live direct exit endpoint), so full-tunnel doesn't loop the
+        mesh's own transport back into itself."""
+        ips = set()
+        if self._coord_udp:
+            ips.add(self._coord_udp[0])
+        with self._lock:
+            peers = dict(self.peers)
+            exit_pc = self._conns.get(self.exit_node_pk) if self.exit_node_pk else None
+        for info in peers.values():
+            for ep in info.get("endpoints", []):
+                host = ep.rpartition(":")[0]
+                if host:
+                    ips.add(host)
+        if exit_pc and exit_pc.transport == "direct" and exit_pc.endpoint:
+            ips.add(exit_pc.endpoint[0])
+        return ips
 
     def _refresh_routes(self):
         """Rebuild the accepted subnet-route table from the peer map and notify
@@ -516,19 +560,26 @@ class MeshNode:
 
     def route_for(self, dst_ip: str):
         """Peer that should carry a packet to dst_ip: an overlay peer (matches a
-        node's own overlay IP) or, failing that, a subnet router advertising a
-        matching route. None if unroutable."""
+        node's own overlay IP), else a subnet router advertising a matching route,
+        else — if a full-tunnel exit node is selected — the exit (catch-all for
+        the whole internet). None if unroutable."""
         pk = self.resolve(dst_ip)
         if pk:
             return pk
-        return match_route(self._route_table, dst_ip)
+        pk = match_route(self._route_table, dst_ip)
+        if pk:
+            return pk
+        return self.exit_node_pk        # None unless --exit-node is in effect
 
     def src_permitted(self, src_pk: str, src_ip: str) -> bool:
         """Anti-spoof for an inbound tunnelled packet: a peer may source its own
         overlay IP, or — if it is a subnet router whose route we accepted — any
-        IP within one of those accepted routes (so LAN-sourced replies pass).
+        IP within one of those accepted routes (so LAN-sourced replies pass). Our
+        selected exit node may source anything (it relays the whole internet).
         A non-IPv4/unparseable source isn't blocked here (handled elsewhere)."""
         if src_ip is None:
+            return True
+        if src_pk == self.exit_node_pk:
             return True
         info = self.peers.get(src_pk) or {}
         if src_ip == info.get("ip"):
@@ -672,6 +723,10 @@ class MeshNode:
                     queued = []
             for payload in queued:
                 self._transmit(pc, payload)
+        # If the exit peer's transport just changed (e.g. a newly punched direct
+        # endpoint), re-pin transport promptly instead of waiting for the resync.
+        if self.on_transport_ips_changed and peer_pk == self.exit_node_pk:
+            self.on_transport_ips_changed(self.transport_ips())
 
     @staticmethod
     def _upgrade_if_udp(pc, via, addr):
@@ -872,21 +927,26 @@ def _run_tun(node, mtu, name, egress=None):
         sys.exit(f"error: could not configure TUN {dev.name}: {exc}")
     _log(f"TUN up: {dev.name}  ip={node.overlay_ip}  mtu={mtu}  (overlay {tun.OVERLAY_CIDR})")
 
-    # Subnet router: enable IP forwarding + NAT masquerade so LAN traffic egresses.
+    # Subnet router OR exit node: enable IP forwarding + NAT masquerade so
+    # forwarded traffic egresses. The masquerade rule (overlay saddr → egress) is
+    # the same for both; an exit node just forwards to any destination, not only
+    # advertised subnets.
     snat = None
-    if node.advertise_routes:
+    if node.advertise_routes or node.is_exit:
+        role = "exit node" if node.is_exit else "subnet router"
         if sys.platform.startswith("linux"):
             import nat
             try:
                 snat = nat.SubnetNat(tun.OVERLAY_CIDR, egress).apply()
             except nat.NatError as exc:
                 dev.close()
-                sys.exit(f"error: subnet NAT setup failed: {exc}")
-            _log(f"subnet router: masquerading {tun.OVERLAY_CIDR} out {snat.egress} "
-                 f"for routes {','.join(node.advertise_routes)}")
+                sys.exit(f"error: {role} NAT setup failed: {exc}")
+            extra = (f" for routes {','.join(node.advertise_routes)}"
+                     if node.advertise_routes else " (full-tunnel)")
+            _log(f"{role}: masquerading {tun.OVERLAY_CIDR} out {snat.egress}{extra}")
         else:
-            _log(f"note: advertising routes {node.advertise_routes}, but NAT egress is "
-                 f"Linux-only — traffic won't be forwarded on {sys.platform}")
+            _log(f"note: running as {role}, but NAT egress is Linux-only — "
+                 f"traffic won't be forwarded on {sys.platform}")
 
     _last_warn = [0.0]
     def _warn(msg):
@@ -940,15 +1000,50 @@ def _run_tun(node, mtu, name, egress=None):
     reader = threading.Thread(target=_from_tun, daemon=True)
     reader.start()
 
-    _log("running — Ctrl-C to leave the mesh")
+    # Everything below runs under try/finally so any early exit (including the
+    # full-tunnel setup errors) still tears down NAT / routes / the device.
+    ftr = None
     try:
+        # Full-tunnel: pin mesh transport to the physical gateway, then redirect
+        # the default route through the exit. Opt-in (only with --exit-node).
+        if node.exit_node_name:
+            import netroute
+            gw, iface = netroute.default_route()
+            if not gw or not iface:
+                sys.exit("error: could not detect the physical default route for full-tunnel")
+            ftr = netroute.FullTunnelRoutes(dev.name, gw, iface)
+            # Wait for the exit peer to resolve before redirecting, so we never
+            # blackhole traffic to an exit that isn't routable yet.
+            for _ in range(100):
+                if node.exit_node_pk or node._done.is_set():
+                    break
+                time.sleep(0.1)
+            if not node.exit_node_pk:
+                sys.exit(f"error: exit node '{node.exit_node_name}' not found or not advertising as an exit")
+            # Pin transport, THEN wire the callback (so the first pin can't race
+            # a map-driven callback), THEN redirect the default route.
+            ftr.sync_pins(node.transport_ips())
+            node.on_transport_ips_changed = ftr.sync_pins   # re-pin as endpoints change
+            ftr.install_split_default()                # default → TUN → exit
+            _log(f"full-tunnel: default route → exit '{node.exit_node_name}' via {dev.name} "
+                 f"(transport pinned to {gw} dev {iface})")
+
+            def _resync():                             # backstop for endpoints punched between maps
+                while not node._done.wait(2.0):
+                    ftr.sync_pins(node.transport_ips())
+            threading.Thread(target=_resync, daemon=True).start()
+
+        _log("running — Ctrl-C to leave the mesh")
         while not node._done.is_set():
             time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
-        node.close()                           # sets _done → reader unblocks
-        reader.join(timeout=2)                 # let it exit before we close the fd
+        node.on_transport_ips_changed = None       # stop re-pinning during teardown
+        node.close()                               # sets _done → reader unblocks
+        reader.join(timeout=2)                     # let it exit before we close the fd
+        if ftr:
+            ftr.teardown()                         # restore default route + unpin transport
         if snat:
             snat.cleanup()
         dev.close()
@@ -958,14 +1053,17 @@ def _run_tun(node, mtu, name, egress=None):
 def _cmd_up(args):
     advertise = parse_cidrs(getattr(args, "advertise_routes", None))
     accept = getattr(args, "accept_routes", False)
+    exit_node = getattr(args, "exit_node", None)
+    if exit_node and advertise:
+        sys.exit("error: --exit-node and --advertise-routes are mutually exclusive")
     if getattr(args, "tun", False):
         if args.ping:
             sys.exit("error: --tun and --ping are mutually exclusive")
         # Fail fast, before any token prompt / coordinator join, if not root.
         if not hasattr(os, "geteuid") or os.geteuid() != 0:
             sys.exit("error: --tun needs root (creates a virtual interface + routes). Re-run with sudo.")
-    elif advertise or accept:
-        sys.exit("error: --advertise-routes / --accept-routes require --tun")
+    elif advertise or accept or exit_node:
+        sys.exit("error: --advertise-routes / --accept-routes / --exit-node require --tun")
 
     token = args.token or os.environ.get("REMOTEMAC_MESH_TOKEN")
     if not token:
@@ -978,6 +1076,7 @@ def _cmd_up(args):
                     bind_host=args.bind, udp_port=args.udp_port,
                     advertise_routes=advertise)
     node.accept_routes = accept
+    node.exit_node_name = exit_node
 
     pong_event = threading.Event()
     pong_at = {}
@@ -1047,7 +1146,8 @@ def main():
     up.add_argument("coord_addr", metavar="coord:port")
     up.add_argument("--token", help="network join token (or set REMOTEMAC_MESH_TOKEN)")
     up.add_argument("--name", help="hostname to advertise (default: system hostname)")
-    up.add_argument("--exit", action="store_true", help="advertise as an exit node (routing support lands in a later phase)")
+    up.add_argument("--exit", action="store_true",
+                    help="advertise as a full-tunnel exit node (with --tun on Linux: IP forwarding + NAT)")
     up.add_argument("--bind", default="0.0.0.0", help="UDP data-plane bind address (default 0.0.0.0)")
     up.add_argument("--udp-port", type=int, default=0, help="UDP data-plane port (default: random)")
     up.add_argument("--ping", metavar="PEER", help="ping a peer (name or overlay IP) then exit")
@@ -1060,6 +1160,8 @@ def main():
                     help="act as a subnet router for these CIDRs (needs --tun; NAT egress on Linux)")
     up.add_argument("--accept-routes", action="store_true",
                     help="route peers' advertised subnet CIDRs through the mesh (needs --tun)")
+    up.add_argument("--exit-node", metavar="PEER",
+                    help="full-tunnel: route ALL traffic through this exit peer (name or overlay IP; needs --tun)")
     up.add_argument("--egress", metavar="IFACE",
                     help="egress interface for subnet NAT (default: the system default route's device)")
     up.set_defaults(func=_cmd_up)
