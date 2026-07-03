@@ -348,6 +348,9 @@ class MeshNode:
         self.exit_node_name = None        # peer name/IP to full-tunnel through (CLI)
         self.exit_node_pk = None          # resolved once the peer is in the map
         self.lan_routes = []              # extra local subnets to keep off the tunnel
+        self.dns_enabled = False          # run the split-DNS resolver (--dns)
+        self.dns_suffix = "mesh"          # names under this suffix resolve to peers
+        self.dns_upstream = None          # forward non-mesh queries here (auto if None)
         self.ch       = None
         self.udp      = None
         self._coord_udp = None       # (host, port) for STUN probes
@@ -593,6 +596,20 @@ class MeshNode:
             if pk == src_pk and addr in net:
                 return True
         return False
+
+    def dns_lookup(self, name: str):
+        """Overlay IP for a mesh hostname (this node or a peer), or None. Used by
+        the split-DNS resolver to answer `<name>.<suffix>`."""
+        name = (name or "").lower()
+        if not name:
+            return None
+        if name == (self.hostname or "").lower():
+            return self.overlay_ip
+        with self._lock:
+            for info in self.peers.values():
+                if (info.get("hostname") or "").lower() == name:
+                    return info.get("ip")
+        return None
 
     def _peer_static(self, pk_b64: str) -> bytes:
         return _unb64(pk_b64)
@@ -1004,6 +1021,7 @@ def _run_tun(node, mtu, name, egress=None):
     # Everything below runs under try/finally so any early exit (including the
     # full-tunnel setup errors) still tears down NAT / routes / the device.
     ftr = None
+    dns_server = None
     try:
         # Full-tunnel: pin mesh transport to the physical gateway, then redirect
         # the default route through the exit. Opt-in (only with --exit-node).
@@ -1036,6 +1054,19 @@ def _run_tun(node, mtu, name, egress=None):
                     ftr.sync_pins(node.transport_ips())
             threading.Thread(target=_resync, daemon=True).start()
 
+        # split-DNS: resolve <name>.<suffix> to overlay IPs, forward the rest.
+        if node.dns_enabled:
+            import meshdns
+            upstream = node.dns_upstream or meshdns.detect_upstream()
+            try:
+                dns_server = meshdns.MeshDNSServer(node.overlay_ip, 53, node.dns_suffix,
+                                                   node.dns_lookup, upstream).start()
+            except OSError as exc:                 # opt-in — keep the tunnel up on failure
+                _log(f"warning: could not start split-DNS on {node.overlay_ip}:53: {exc}")
+            else:
+                _log(f"split-DNS: resolving *.{node.dns_suffix} on {node.overlay_ip}:53 "
+                     f"(upstream {upstream or 'none'})")
+
         _log("running — Ctrl-C to leave the mesh")
         while not node._done.is_set():
             time.sleep(1)
@@ -1045,6 +1076,8 @@ def _run_tun(node, mtu, name, egress=None):
         node.on_transport_ips_changed = None       # stop re-pinning during teardown
         node.close()                               # sets _done → reader unblocks
         reader.join(timeout=2)                     # let it exit before we close the fd
+        if dns_server:
+            dns_server.stop()
         if ftr:
             ftr.teardown()                         # restore default route + unpin transport
         if snat:
@@ -1062,6 +1095,9 @@ def _cmd_up(args):
         sys.exit("error: --exit-node and --advertise-routes are mutually exclusive")
     if lan_routes and not exit_node:
         sys.exit("error: --lan-routes only applies with --exit-node (full-tunnel)")
+    dns_enabled = getattr(args, "dns", False)
+    if dns_enabled and not getattr(args, "tun", False):
+        sys.exit("error: --dns requires --tun")
     if getattr(args, "tun", False):
         if args.ping:
             sys.exit("error: --tun and --ping are mutually exclusive")
@@ -1084,6 +1120,9 @@ def _cmd_up(args):
     node.accept_routes = accept
     node.exit_node_name = exit_node
     node.lan_routes = lan_routes
+    node.dns_enabled = dns_enabled
+    node.dns_suffix = (getattr(args, "dns_suffix", None) or "mesh").strip(".").lower()
+    node.dns_upstream = getattr(args, "dns_upstream", None)
 
     pong_event = threading.Event()
     pong_at = {}
@@ -1171,6 +1210,10 @@ def main():
                     help="full-tunnel: route ALL traffic through this exit peer (name or overlay IP; needs --tun)")
     up.add_argument("--lan-routes", metavar="CIDR[,CIDR…]",
                     help="full-tunnel: keep these extra local subnets on the physical gateway (needs --exit-node)")
+    up.add_argument("--dns", action="store_true",
+                    help="run split-DNS: resolve <name>.<suffix> to peers, forward the rest (needs --tun)")
+    up.add_argument("--dns-suffix", default="mesh", help="DNS suffix for mesh names (default: mesh)")
+    up.add_argument("--dns-upstream", metavar="IP", help="upstream resolver for non-mesh queries (auto-detected if omitted)")
     up.add_argument("--egress", metavar="IFACE",
                     help="egress interface for subnet NAT (default: the system default route's device)")
     up.set_defaults(func=_cmd_up)
