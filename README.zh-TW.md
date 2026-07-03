@@ -365,7 +365,7 @@ ALL_PROXY=socks5h://127.0.0.1:1080 curl https://example.com
 
 ---
 
-## 四、Mesh overlay（實驗性 — Phase 3）
+## 四、Mesh overlay（實驗性 — Phase 4）
 
 除了 1:1 遠端桌面,`coordinator.py` + `mesh.py` 把系統擴充成 **mesh**(自架的簡化版 Tailscale):多個節點加入同一張網,各自拿到穩定的 overlay IP,節點之間端到端加密,而且在網路允許時**走 UDP P2P 直連**而非繞經 coordinator。需要 `cryptography`(`pip install cryptography`)。
 
@@ -385,17 +385,23 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 - 節點間握手是雙向認證 + 前向保密(X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305)。
 - **P2P 直連(Phase 2)**:節點透過向 coordinator 做 STUN-lite 探測得知自己的公網端點,互換候選端點後**同時打洞建立 UDP 直連**(以 pubkey 定序避免握手 glare)。之後資料在兩節點間直送。若數秒內打不通(例如雙方對稱 NAT),流量會**透明回退到 coordinator relay(DERP)** —— relay 全程只看得到密文。keepalive 維持 NAT 映射;直連靜默會回退 DERP,並週期性重新打洞,連通恢復時再升級回直連。
 - **TUN overlay(Phase 3)**:加上 `--tun`(需 root)後,節點會開一個虛擬網卡、綁上自己的 overlay IP、並把 `100.64.0.0/10` 路由過去 —— 讓**真實 app 直接用 overlay IP 連 peer**(`ping 100.64.0.x`、`ssh`、http),不再只有內建 `--ping`。核心的 IP 封包走同一條加密 P2P/DERP 資料路徑。macOS 用 `utun`(免 kext),Linux 用 `/dev/net/tun`。peer 只能送出「來源是自己 overlay IP」的封包(anti-spoof)。
+- **子網路由(Phase 4)**:節點可當 **subnet router**:用 `--advertise-routes 192.168.1.0/24` 宣告它能連到的 LAN 網段,並(在 Linux)開 IP forwarding + nftables masquerade,讓其他節點連到它「背後」的主機。client 用 `--accept-routes` 選擇接受,把那些 CIDR 的路由指到 TUN,匹配的封包就送給該 peer。**只有被宣告的網段走 mesh,預設路由不動**。與 overlay 重疊、或包含 coordinator / peer endpoint 的宣告 CIDR 會被拒絕(避免 mesh 傳輸迴圈);subnet router 可送出「來源在你接受的路由內」的回包(其餘 anti-spoof 照舊)。
 
 ```bash
-# 兩台機器都開完整 VPN 資料面(root),之後直接用 overlay IP:
+# 只做 overlay:兩台機器開完整資料面(root),直接用 overlay IP:
 sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name a --tun
 sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name b --tun
 ping 100.64.0.3      # a → b 走 overlay;mesh log 顯示 [direct] 或 [derp]
+
+# 子網路由:一台 Linux 節點把它的 LAN 開放給 mesh;client 接受:
+sudo python3 mesh.py up coord…:21200 --token … --name gw     --tun --advertise-routes 192.168.1.0/24
+sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --accept-routes
+ping 192.168.1.1     # laptop 透過 gw 連到它背後的 LAN
 ```
 
-**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。`--tun` 啟用 VPN 介面;`--tun-mtu`(預設 1280)、`--tun-name`(Linux 介面名,預設 `remotemac0`)可微調。
+**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。`--tun` 啟用 VPN 介面;`--tun-mtu`(預設 1280)、`--tun-name`(Linux 介面名,預設 `remotemac0`)可微調。`--advertise-routes CIDR,…` / `--accept-routes` 啟用子網路由(需 `--tun`);`--egress IFACE` 覆寫 subnet router 的 NAT 出口介面。(若主機 FORWARD 防火牆政策較嚴,需手動為 overlay 網段加放行規則。)
 
-**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。**Phase 3(本版)** 加上 **TUN overlay**,讓真實 app 把 mesh 當成一張網用(macOS + Linux,需 root)。後續:**exit-node NAT**(把所有對外流量繞經 `--exit` 節點 —— pf/nftables + IP forwarding)、IPv6、split-DNS。純 Python 資料面吞吐中等,一般用途足夠。
+**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。Phase 3 加上 TUN overlay。**Phase 4(本版)** 加上 **子網路由**(Linux NAT egress),讓節點連到 peer 背後的 LAN。後續:**full-tunnel**(把**所有**對外流量繞經 exit 節點)、macOS exit(pf)、IPv6、split-DNS。純 Python 資料面吞吐中等,一般用途足夠。
 
 ---
 
@@ -442,4 +448,5 @@ ping 100.64.0.3      # a → b 走 overlay;mesh log 顯示 [direct] 或 [derp]
 | `coordinator.py` | Mesh 控制平面 — 節點註冊、overlay IP 配發、端點分發、STUN 回應器、DERP 轉發。需 `cryptography` |
 | `mesh.py` | Mesh 節點 — X25519 身份、UDP P2P 資料面 + NAT 打洞 + direct↔DERP 切換、TUN overlay(`--tun`)。需 `cryptography` |
 | `tun.py` | overlay 的 TUN 虛擬網卡(macOS `utun` / Linux `/dev/net/tun`)—— 供 `mesh.py --tun` 使用。需 root |
+| `nat.py` | subnet router 的 Linux NAT egress(`--advertise-routes`)—— IP forwarding + nftables masquerade。需 root |
 | `remotemac-relay.service` | systemd unit，讓 relay.py 開機自動啟動 |

@@ -3,6 +3,32 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-07-03
+
+### Added
+- **Mesh overlay (Phase 4) — subnet routing.** A node can act as a **subnet
+  router**: advertise LAN CIDRs it can reach and let other nodes route matching
+  traffic to it through the mesh (subnet-router style — the default route is
+  untouched).
+  - `mesh.py`: `--advertise-routes CIDR,…` announces routes (distributed by the
+    coordinator, mirroring `endpoints`); `--accept-routes` opts a client in.
+    Accepted CIDRs get OS routes into the TUN; `_from_tun` sends matching packets
+    to the advertising peer via a longest-prefix route table.
+  - Safety: advertised CIDRs that overlap `100.64.0.0/10` or contain the
+    coordinator / a peer endpoint IP are refused, so mesh transport can't loop.
+    Anti-spoof is widened just enough that a subnet router may source replies from
+    within the routes you accepted from it — otherwise unchanged.
+  - `nat.py` (new, **Linux**): a subnet router enables `net.ipv4.ip_forward` and
+    installs an nftables masquerade rule in a dedicated `remotemac` table (clean
+    teardown; forwarding/state restored on exit). `--egress` overrides the egress
+    interface. macOS exit (pf) and an iptables fallback are deferred.
+  - `coordinator.py`: carries a `routes` field on the node record + peer map.
+  - Tests: route parse/safety-guard/longest-prefix match, advertise→accept
+    redirect + widened anti-spoof, nftables ruleset + egress parsing. Real
+    NAT/forwarding needs root → manual-verified.
+- Deferred to a later phase: full-tunnel (route *all* internet traffic through an
+  exit node), macOS exit (pf), iptables fallback, IPv6 subnets, split-DNS.
+
 ## [1.3.0] - 2026-07-03
 
 ### Added

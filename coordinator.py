@@ -9,8 +9,9 @@ encrypted, token-authenticated control channel. The coordinator:
   • authenticates each node with a shared **network token** (via the same
     SecureChannel handshake used by remote_desktop.py),
   • assigns each node a stable overlay IP from 100.64.0.0/10 (persisted),
-  • distributes the network map (peers: pubkey, overlay IP, hostname, exit flag)
-    and pushes updates as nodes join/leave,
+  • distributes the network map (peers: pubkey, overlay IP, hostname, exit flag,
+    UDP endpoints, advertised subnet routes) and pushes updates as nodes join/leave,
+  • runs a UDP STUN responder on the same port for endpoint discovery,
   • relays handshake + data messages between nodes (DERP fallback). It only ever
     sees ciphertext for data — node↔node traffic is end-to-end encrypted.
 
@@ -18,10 +19,11 @@ Run
 ---
     python3 coordinator.py 21200 --token "network-secret"
     #   token may also come from REMOTEMAC_MESH_TOKEN
-Open that TCP port in the firewall / security group.
+Open that TCP port in the firewall / security group (UDP too, for STUN).
 
-This is Phase 1 of the mesh: no UDP / NAT hole punching (Phase 2) and no TUN
-overlay (Phase 3) yet. The data path here is relayed over the control channel.
+The coordinator is the mesh control plane; the data plane (P2P hole punching,
+TUN overlay, subnet routing) lives in mesh.py and, wherever possible, bypasses
+the coordinator entirely.
 """
 import argparse
 import ipaddress
@@ -34,7 +36,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from remote_desktop import SecureChannel, _auth  # noqa: E402
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 MAX_NODES = 1024
@@ -105,7 +107,8 @@ class Coordinator:
             me = self._nodes.get(pubkey)
             peers = [
                 {"pubkey": pk, "ip": n["ip"], "hostname": n["hostname"],
-                 "exit": n["exit"], "endpoints": n.get("endpoints", []), "online": True}
+                 "exit": n["exit"], "endpoints": n.get("endpoints", []),
+                 "routes": n.get("routes", []), "online": True}
                 for pk, n in self._nodes.items() if pk != pubkey
             ]
         self_info = {"pubkey": pubkey, "ip": me["ip"]} if me else {}
@@ -145,8 +148,10 @@ class Coordinator:
                     return
             ip = self._alloc.get(pk)
             endpoints = [str(e)[:64] for e in (reg.get("endpoints") or [])][:16]
+            routes = [str(r)[:64] for r in (reg.get("routes") or [])][:32]
             record = {"ch": ch, "hostname": reg.get("hostname", "node")[:64],
-                      "exit": bool(reg.get("exit")), "ip": ip, "endpoints": endpoints}
+                      "exit": bool(reg.get("exit")), "ip": ip,
+                      "endpoints": endpoints, "routes": routes}
             with self._lock:
                 old = self._nodes.get(pk)
                 if old:
