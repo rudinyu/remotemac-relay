@@ -486,7 +486,14 @@ class MeshNode:
 
     def _refresh_routes(self):
         """Rebuild the accepted subnet-route table from the peer map and notify
-        the TUN layer of any CIDRs to add/remove from the OS routing table."""
+        the TUN layer of any CIDRs to add/remove from the OS routing table.
+
+        The safety guard uses a snapshot: `coord_ip` was resolved once at connect
+        time, and endpoint IPs are whatever the map currently holds — so an
+        endpoint not yet learned isn't checked until the next map update reruns
+        this. Not live-tracked; don't assume otherwise. The new table is built
+        then swapped in atomically (single writer), so data-plane readers in
+        route_for/src_permitted always see a whole, consistent list without a lock."""
         coord_ip = self._coord_udp[0] if self._coord_udp else None
         old = {str(net) for net, _ in self._route_table}
         self._route_table = build_route_table(self.peers, coord_ip)
@@ -835,7 +842,7 @@ class MeshNode:
 
 # ─── CLI ────────────────────────────────────────────────────────────────────────
 
-def _run_tun(node, mtu, name):
+def _run_tun(node, mtu, name, egress=None):
     """Bring up a TUN overlay interface and pump packets between it and the mesh.
 
     Blocks until the node is torn down (Ctrl-C). Needs root — it creates a
@@ -861,6 +868,22 @@ def _run_tun(node, mtu, name):
         dev.close()                            # don't leak the interface/socket
         sys.exit(f"error: could not configure TUN {dev.name}: {exc}")
     _log(f"TUN up: {dev.name}  ip={node.overlay_ip}  mtu={mtu}  (overlay {tun.OVERLAY_CIDR})")
+
+    # Subnet router: enable IP forwarding + NAT masquerade so LAN traffic egresses.
+    snat = None
+    if node.advertise_routes:
+        if sys.platform.startswith("linux"):
+            import nat
+            try:
+                snat = nat.SubnetNat(tun.OVERLAY_CIDR, egress).apply()
+            except nat.NatError as exc:
+                dev.close()
+                sys.exit(f"error: subnet NAT setup failed: {exc}")
+            _log(f"subnet router: masquerading {tun.OVERLAY_CIDR} out {snat.egress} "
+                 f"for routes {','.join(node.advertise_routes)}")
+        else:
+            _log(f"note: advertising routes {node.advertise_routes}, but NAT egress is "
+                 f"Linux-only — traffic won't be forwarded on {sys.platform}")
 
     _last_warn = [0.0]
     def _warn(msg):
@@ -923,6 +946,8 @@ def _run_tun(node, mtu, name):
     finally:
         node.close()                           # sets _done → reader unblocks
         reader.join(timeout=2)                 # let it exit before we close the fd
+        if snat:
+            snat.cleanup()
         dev.close()
         _log("TUN down")
 
@@ -997,7 +1022,7 @@ def _cmd_up(args):
         return
 
     if getattr(args, "tun", False):
-        _run_tun(node, args.tun_mtu, args.tun_name)
+        _run_tun(node, args.tun_mtu, args.tun_name, egress=getattr(args, "egress", None))
         return
 
     _log("running — Ctrl-C to leave the mesh")
