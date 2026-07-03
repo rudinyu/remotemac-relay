@@ -146,6 +146,18 @@ class TestServerIntegration(unittest.TestCase):
     def test_other_name_forwarded_to_upstream(self):
         self.assertEqual(_answer_ip(self._ask("example.com")), "9.9.9.9")
 
+    def test_no_self_forward_loop(self):
+        # An upstream equal to our own address (host+port) must NOT be forwarded
+        # to (that would loop each query back in and leak a socket per hop).
+        class _FakeSock:
+            def __init__(self): self.sent = []
+            def sendto(self, *a): self.sent.append(a)
+        srv = meshdns.MeshDNSServer("127.0.0.1", 53, "mesh", _LOOKUP,
+                                    upstream="127.0.0.1", upstream_port=53)
+        srv.udp = _FakeSock()
+        srv._forward(_query("example.com"), ("127.0.0.1", 5555))
+        self.assertEqual(srv.udp.sent, [], "forwarded to self — loop guard failed")
+
 
 if __name__ == "__main__":
     unittest.main()

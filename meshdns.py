@@ -6,11 +6,11 @@ Answers `<name>.<suffix>` (default `<name>.mesh`) with the peer's overlay IP and
 forwards every other query to the real upstream resolver, so mesh hosts can be
 reached by name (`ssh laptop.mesh`) instead of overlay IP. Pure stdlib.
 
-The server binds the node's overlay IP on port 53 (so it needs the TUN up and
-root). The OS resolver is pointed at it separately (see the ResolverConfig in a
-later step); for a quick manual check you can query it directly:
+The server binds loopback (127.0.0.1) on port 53 — local-only, so a peer can't
+reach it through the TUN and use it as an open forwarder (needs root for :53).
+The OS resolver is pointed at it via ResolverConfig; for a quick manual check:
 
-    dig @<overlay-ip> gw.mesh
+    dig @127.0.0.1 gw.mesh
 """
 import os
 import socket
@@ -228,12 +228,14 @@ class MeshDNSServer:
         self.upstream_port = upstream_port
         self.udp = None
         self._done = threading.Event()
+        self._thread = None
 
     def start(self):
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.udp.bind((self.bind_ip, self.port))
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
         return self
 
     @property
@@ -265,15 +267,19 @@ class MeshDNSServer:
             self._forward(data, addr)
 
     def _forward(self, data, addr):
-        if not self.upstream:
+        # Skip if there's no upstream, or the upstream is our own address —
+        # forwarding to ourselves would loop each query back in (leaking a socket
+        # per hop). Compare host AND port (a different local port is a real resolver).
+        if not self.upstream or (self.upstream, self.upstream_port) == (self.bind_ip, self.port):
             return
         try:
-            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            u.settimeout(3)
-            u.sendto(data, (self.upstream, self.upstream_port))
-            resp, _ = u.recvfrom(65535)
-            u.close()
-            self.udp.sendto(resp, addr)
+            # Context manager closes the socket on every path, incl. timeouts
+            # (socket.timeout is an OSError → the old close() was being skipped).
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+                u.settimeout(3)
+                u.sendto(data, (self.upstream, self.upstream_port))
+                resp, _ = u.recvfrom(65535)
+                self.udp.sendto(resp, addr)
         except OSError:
             pass
 
@@ -284,3 +290,5 @@ class MeshDNSServer:
                 self.udp.close()
             except Exception:
                 pass
+        if self._thread:
+            self._thread.join(timeout=2)
