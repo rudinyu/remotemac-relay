@@ -16,10 +16,28 @@ import subprocess
 import sys
 
 _TABLE = "remotemac"
+_COMMENT = "remotemac"     # identifies our iptables rule for cleanup
 
 
 class NatError(RuntimeError):
     pass
+
+
+def iptables_rule_args(overlay_cidr: str, egress: str, action: str):
+    """iptables argv for the overlay masquerade rule. `action` is '-A' (append)
+    or '-D' (delete); the rule is tagged with a comment so cleanup can find it."""
+    return ["iptables", "-t", "nat", action, "POSTROUTING",
+            "-s", overlay_cidr, "-o", egress, "-j", "MASQUERADE",
+            "-m", "comment", "--comment", _COMMENT]
+
+
+def _nat_backend():
+    """Which NAT backend to use: 'nft' (preferred), else 'iptables', else None."""
+    if shutil.which("nft"):
+        return "nft"
+    if shutil.which("iptables"):
+        return "iptables"
+    return None
 
 
 def nft_ruleset(overlay_cidr: str, egress: str) -> str:
@@ -89,16 +107,19 @@ class SubnetNat:
         self.egress = egress
         self._prev_forward = None
         self._applied = False
+        self._backend = None       # 'nft' or 'iptables', chosen at apply()
 
     def apply(self):
         if not sys.platform.startswith("linux"):
             raise NatError("subnet NAT egress is currently Linux-only")
-        if shutil.which("nft") is None:
-            raise NatError("nftables (nft) not found — install it, or advertise routes on a host with nft")
+        backend = _nat_backend()
+        if backend is None:
+            raise NatError("no supported NAT backend found — install nftables (nft) or iptables")
         egress = self.egress or default_egress()
         if not egress:
             raise NatError("could not determine the egress interface — pass --egress")
         self.egress = egress
+        self._backend = backend
 
         self._prev_forward = _read_sysctl("net.ipv4.ip_forward")
         try:
@@ -106,6 +127,18 @@ class SubnetNat:
         except OSError as exc:
             raise NatError(f"could not enable IP forwarding: {exc}")
 
+        try:
+            if backend == "nft":
+                self._apply_nft(egress)
+            else:
+                self._apply_iptables(egress)
+        except NatError:
+            self.cleanup()             # restore ip_forward (nothing installed on failure)
+            raise
+        self._applied = True
+        return self
+
+    def _apply_nft(self, egress):
         # Replace any stale table from a previous crashed run, then install fresh.
         # Assumes a single subnet-router process per host (no PID lock); two
         # concurrent apply() calls against the same host would race on this table.
@@ -115,15 +148,29 @@ class SubnetNat:
             subprocess.run(["nft", "-f", "-"], input=nft_ruleset(self.overlay_cidr, egress),
                            text=True, check=True)
         except subprocess.CalledProcessError as exc:
-            self.cleanup()
             raise NatError(f"failed to install nftables rules: {exc}")
-        self._applied = True
-        return self
+
+    def _apply_iptables(self, egress):
+        # Drop any stale copies of our rule (best-effort), then add exactly one.
+        for _ in range(8):
+            r = subprocess.run(iptables_rule_args(self.overlay_cidr, egress, "-D"),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode != 0:
+                break
+        try:
+            subprocess.run(iptables_rule_args(self.overlay_cidr, egress, "-A"),
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError as exc:
+            raise NatError(f"failed to install iptables rule: {exc}")
 
     def cleanup(self):
         if self._applied:
-            subprocess.run(["nft", "delete", "table", "ip", _TABLE],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if self._backend == "iptables":
+                subprocess.run(iptables_rule_args(self.overlay_cidr, self.egress, "-D"),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(["nft", "delete", "table", "ip", _TABLE],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._applied = False
         if self._prev_forward is not None:
             try:

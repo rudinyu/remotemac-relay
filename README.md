@@ -365,7 +365,7 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
-## 4. Mesh overlay (experimental — Phase 6)
+## 4. Mesh overlay (experimental — Phase 7)
 
 Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
 into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
@@ -463,9 +463,10 @@ restrictive FORWARD firewall policy needs a manual allow rule for the overlay ne
 pool + selection, and a relayed encrypted data path. Phase 2 added UDP P2P with NAT
 hole punching and transparent direct↔DERP failover. Phase 3 added the TUN overlay.
 Phase 4 added subnet routing. Phase 5 added the opt-in full-tunnel exit node.
-**Phase 6 (this release)** adds `--lan-routes` and corrects the LAN-reachability docs.
-Still to come: split-DNS, IPv6, macOS exit (pf), an iptables fallback. Data-plane
-throughput is modest (pure-Python), fine for typical use.
+Phase 6 added `--lan-routes` and corrected the LAN-reachability docs. **Phase 7
+(this release)** adds an iptables fallback for NAT egress when nftables is absent.
+Still to come: split-DNS, IPv6, macOS exit (pf). Data-plane throughput is modest
+(pure-Python), fine for typical use.
 
 ---
 
@@ -512,6 +513,6 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 | `coordinator.py` | Mesh control plane — node registry, overlay-IP assignment, endpoint distribution, STUN responder, DERP relay. Needs `cryptography` |
 | `mesh.py` | Mesh node — X25519 identity, UDP P2P data plane with NAT hole punching + direct↔DERP failover, TUN overlay (`--tun`). Needs `cryptography` |
 | `tun.py` | TUN virtual interface for the overlay (macOS `utun` / Linux `/dev/net/tun`) — used by `mesh.py --tun`. Needs root |
-| `nat.py` | Linux NAT egress for a subnet router / exit node (`--advertise-routes` / `--exit`) — IP forwarding + nftables masquerade. Needs root |
+| `nat.py` | Linux NAT egress for a subnet router / exit node (`--advertise-routes` / `--exit`) — IP forwarding + masquerade (nftables, or iptables fallback). Needs root |
 | `netroute.py` | Full-tunnel route manager (`--exit-node`) — default-route redirect + transport pinning, macOS + Linux. Needs root |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |
