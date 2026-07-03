@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-07-03
+
+### Added
+- **Mesh overlay (Phase 7) — iptables fallback for NAT egress.** A subnet router /
+  exit node no longer requires nftables: `nat.py` now prefers `nft` but falls back
+  to `iptables` (masquerade rule in the `nat`/`POSTROUTING` chain, tagged with a
+  `remotemac` comment for clean teardown) when `nft` is absent, and errors clearly
+  only if neither is available. The chosen backend is tracked so cleanup uses the
+  matching tool; IP-forwarding save/restore is unchanged.
+  - Tests: iptables argv generation (add/delete), backend selection (nft →
+    iptables → none). Real NAT needs root → manual-verified.
+
 ## [1.6.0] - 2026-07-03
 
 ### Added

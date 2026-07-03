@@ -365,7 +365,7 @@ ALL_PROXY=socks5h://127.0.0.1:1080 curl https://example.com
 
 ---
 
-## 四、Mesh overlay（實驗性 — Phase 6）
+## 四、Mesh overlay（實驗性 — Phase 7）
 
 除了 1:1 遠端桌面,`coordinator.py` + `mesh.py` 把系統擴充成 **mesh**(自架的簡化版 Tailscale):多個節點加入同一張網,各自拿到穩定的 overlay IP,節點之間端到端加密,而且在網路允許時**走 UDP P2P 直連**而非繞經 coordinator。需要 `cryptography`(`pip install cryptography`)。
 
@@ -409,7 +409,7 @@ curl https://ifconfig.me      # 顯示出口節點的公網 IP,而非 client 本
 
 > **Full-tunnel 注意事項**:它會改寫預設路由 —— 請在有 console/SSH 備援下測試。程序崩潰時兩條 `/1` 會隨 TUN 消失,預設路由自動恢復。DNS 走出口(公用 resolver 可用;LAN resolver 不行)。**直接連接的本地區網仍可達**(其 connected 路由比 `0.0.0.0/1`+`128.0.0.0/1` 更明確);只有原本要走預設閘道的流量才走隧道。若要讓**其他**經由 LAN 路由器才到的本地網段也保持可達,用 `--lan-routes 10.0.0.0/8,172.16.0.0/12` 列出。
 
-**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。Phase 3 加上 TUN overlay。Phase 4 加上子網路由。Phase 5 加上 opt-in full-tunnel 出口節點。**Phase 6(本版)** 加上 `--lan-routes` 並修正 LAN 可達性文件。後續:split-DNS、IPv6、macOS exit(pf)、iptables 後援。純 Python 資料面吞吐中等,一般用途足夠。
+**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。Phase 3 加上 TUN overlay。Phase 4 加上子網路由。Phase 5 加上 opt-in full-tunnel 出口節點。Phase 6 加上 `--lan-routes` 並修正 LAN 可達性文件。**Phase 7(本版)** 在無 nftables 時加上 iptables 後援做 NAT egress。後續:split-DNS、IPv6、macOS exit(pf)。純 Python 資料面吞吐中等,一般用途足夠。
 
 ---
 
@@ -456,6 +456,6 @@ curl https://ifconfig.me      # 顯示出口節點的公網 IP,而非 client 本
 | `coordinator.py` | Mesh 控制平面 — 節點註冊、overlay IP 配發、端點分發、STUN 回應器、DERP 轉發。需 `cryptography` |
 | `mesh.py` | Mesh 節點 — X25519 身份、UDP P2P 資料面 + NAT 打洞 + direct↔DERP 切換、TUN overlay(`--tun`)。需 `cryptography` |
 | `tun.py` | overlay 的 TUN 虛擬網卡(macOS `utun` / Linux `/dev/net/tun`)—— 供 `mesh.py --tun` 使用。需 root |
-| `nat.py` | subnet router / 出口節點的 Linux NAT egress(`--advertise-routes` / `--exit`)—— IP forwarding + nftables masquerade。需 root |
+| `nat.py` | subnet router / 出口節點的 Linux NAT egress(`--advertise-routes` / `--exit`)—— IP forwarding + masquerade(nftables,或 iptables 後援)。需 root |
 | `netroute.py` | full-tunnel 路由管理(`--exit-node`)—— 預設路由改寫 + 傳輸釘選,macOS + Linux。需 root |
 | `remotemac-relay.service` | systemd unit，讓 relay.py 開機自動啟動 |
