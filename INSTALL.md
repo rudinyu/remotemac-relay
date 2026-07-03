@@ -65,7 +65,24 @@ docker compose logs -f               # watch both
 If you only want the relay, run just that service:
 `docker compose up -d --build relay`.
 
-### Option B — systemd / manual
+### Option B — one-shot script (systemd, Linux)
+
+Install the relay + coordinator as hardened systemd services in one command:
+
+```bash
+sudo ./scripts/install-linux.sh                        # both; prompts for / generates a token
+sudo ./scripts/install-linux.sh --relay-only           # just the relay
+sudo ./scripts/install-linux.sh --coord-only --open-firewall
+```
+
+It copies the code to `/opt/remotemac`, writes systemd units (relay as `nobody`;
+coordinator with a `StateDirectory` for its overlay-IP state and the token in a
+root-only `EnvironmentFile`), enables + starts them, and — with `--open-firewall`
+— opens the ports via ufw/firewalld. Re-run it to update. `--help` lists all flags
+(`--relay-port`, `--coord-port`, `--token`, `--prefix`). If you don't pass a token,
+it generates one and prints it — give that same value to every node.
+
+### Option C — manual
 
 **Relay** (as a systemd service):
 
