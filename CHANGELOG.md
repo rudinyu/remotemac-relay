@@ -3,6 +3,27 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] - 2026-07-03
+
+### Added
+- **Mesh overlay (Phase 8) — split-DNS (opt-in).** With `--dns`, a node runs a
+  tiny stdlib resolver that answers `<name>.mesh` with the peer's overlay IP and
+  forwards everything else to the existing upstream, so `ssh laptop.mesh` works.
+  - New `meshdns.py`: DNS query parse + answer/forward (`answer_for`: A hit →
+    overlay IP; host hit but non-A → NOERROR/NODATA; miss → NXDOMAIN; other
+    suffix → forward). Binds `127.0.0.1:53` (local-only, so a peer can't use it as
+    an open forwarder), with a self-forward loop guard.
+  - `ResolverConfig` auto-points the OS resolver at it and restores on exit:
+    macOS via a per-domain `/etc/resolver/<suffix>` (global DNS untouched); Linux
+    by rewriting `/etc/resolv.conf` (our server first, the real upstream kept as a
+    fallback), backing up + restoring the original.
+  - `mesh.py`: `--dns` / `--dns-suffix` (default `mesh`) / `--dns-upstream`, all
+    requiring `--tun`; names resolve from the peer map (hostname → overlay IP).
+  - Tests: query parse, answer_for branches, resolvconf body, self-forward guard,
+    localhost server integration (stub upstream). Real resolver config needs
+    root → manual-verified.
+- Deferred to a later phase: IPv6, macOS exit (pf), reverse (PTR) DNS.
+
 ## [1.7.0] - 2026-07-03
 
 ### Added

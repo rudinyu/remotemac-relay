@@ -365,7 +365,7 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
-## 4. Mesh overlay (experimental — Phase 7)
+## 4. Mesh overlay (experimental — Phase 8)
 
 Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
 into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
@@ -422,6 +422,13 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   its physical gateway, then routes `0.0.0.0/1`+`128.0.0.0/1` through the TUN — so
   the default route is overridden without breaking the mesh's own transport. This
   is **off by default**; without `--exit-node` the default route is untouched.
+- **split-DNS (Phase 8, opt-in).** With `--dns`, a node runs a tiny resolver that
+  answers `<name>.mesh` with the peer's overlay IP and forwards everything else to
+  your existing upstream — so `ssh laptop.mesh` works instead of memorizing overlay
+  IPs. It binds `127.0.0.1:53` (local-only) and points the OS resolver at itself:
+  macOS via a per-domain `/etc/resolver/mesh` file (global DNS untouched); Linux by
+  rewriting `/etc/resolv.conf` (our server first, the real upstream kept as a
+  fallback), restored on exit.
 
 ```bash
 # Overlay only: full data plane on two machines (root); use overlay IPs directly:
@@ -438,6 +445,10 @@ ping 192.168.1.1     # laptop reaches the LAN behind gw, through the mesh
 sudo python3 mesh.py up coord…:21200 --token … --name exit   --tun --exit
 sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --exit-node exit
 curl https://ifconfig.me      # shows the exit node's public IP, not the client's
+
+# split-DNS: reach peers by name
+sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --dns
+ssh user@gw.mesh              # resolves gw's overlay IP; example.com still works normally
 ```
 
 **Flags.** `--bind` sets the UDP data-plane bind address (default `0.0.0.0`);
@@ -448,8 +459,9 @@ forwarded port. The coordinator's STUN responder shares its TCP control port
 `--advertise-routes CIDR,…` / `--accept-routes` enable subnet routing; `--exit`
 advertises a full-tunnel exit node and `--exit-node NAME` routes all traffic through
 one (all need `--tun`); `--lan-routes CIDR,…` keeps extra local subnets off the tunnel
-(see below); `--egress IFACE` overrides the NAT egress interface. (A host with a
-restrictive FORWARD firewall policy needs a manual allow rule for the overlay net.)
+(see below); `--dns` runs split-DNS (`--dns-suffix`, `--dns-upstream` to tune);
+`--egress IFACE` overrides the NAT egress interface. (A host with a restrictive
+FORWARD firewall policy needs a manual allow rule for the overlay net.)
 
 > **Full-tunnel caveats.** It rewrites your default route — test with out-of-band
 > console/SSH access. On a crash the `/1` routes vanish with the TUN so the default
@@ -463,9 +475,9 @@ restrictive FORWARD firewall policy needs a manual allow rule for the overlay ne
 pool + selection, and a relayed encrypted data path. Phase 2 added UDP P2P with NAT
 hole punching and transparent direct↔DERP failover. Phase 3 added the TUN overlay.
 Phase 4 added subnet routing. Phase 5 added the opt-in full-tunnel exit node.
-Phase 6 added `--lan-routes` and corrected the LAN-reachability docs. **Phase 7
-(this release)** adds an iptables fallback for NAT egress when nftables is absent.
-Still to come: split-DNS, IPv6, macOS exit (pf). Data-plane throughput is modest
+Phase 6 added `--lan-routes` and corrected the LAN-reachability docs. Phase 7 added
+an iptables fallback for NAT egress. **Phase 8 (this release)** adds opt-in split-DNS
+(`--dns`). Still to come: IPv6, macOS exit (pf). Data-plane throughput is modest
 (pure-Python), fine for typical use.
 
 ---
@@ -515,4 +527,5 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 | `tun.py` | TUN virtual interface for the overlay (macOS `utun` / Linux `/dev/net/tun`) — used by `mesh.py --tun`. Needs root |
 | `nat.py` | Linux NAT egress for a subnet router / exit node (`--advertise-routes` / `--exit`) — IP forwarding + masquerade (nftables, or iptables fallback). Needs root |
 | `netroute.py` | Full-tunnel route manager (`--exit-node`) — default-route redirect + transport pinning, macOS + Linux. Needs root |
+| `meshdns.py` | split-DNS resolver (`--dns`) — answers `<name>.mesh`, forwards the rest; auto-configures the OS resolver (macOS `/etc/resolver`, Linux `resolv.conf`). Needs root |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |
