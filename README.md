@@ -4,6 +4,8 @@
 
 Two Python scripts that together form a complete remote-control system — with no need to open any inbound port on the machine being controlled.
 
+> **Just want to get it running?** See **[INSTALL.md](INSTALL.md)** — a step-by-step install & deploy guide (Docker or manual).
+
 | File | Role | Where it runs |
 |---|---|---|
 | `relay.py` | Rendezvous server (blind pipe) | A VPS / home box you control |
