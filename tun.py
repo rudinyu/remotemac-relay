@@ -66,22 +66,6 @@ def parse_ipv4_src(pkt: bytes):
     return _ipv4_addr(pkt, 12)
 
 
-def src_allowed(pkt: bytes, expected_ip: str) -> bool:
-    """Anti-spoof gate for a packet a peer injected into our TUN: a peer may only
-    send packets whose IPv4 source is its own assigned overlay IP.
-
-    If we don't know the peer's overlay IP (expected_ip falsy) or the source can't
-    be parsed, we don't block — the check only rejects a *parseable* source that
-    disagrees with the sender's identity.
-    """
-    if not expected_ip:
-        return True
-    src = parse_ipv4_src(pkt)
-    if src is None:
-        return True
-    return src == expected_ip
-
-
 def mac_encap(pkt: bytes) -> bytes:
     """Prepend the macOS utun 4-byte address-family header (AF_INET, big-endian)."""
     return struct.pack(">I", socket.AF_INET) + pkt
@@ -165,6 +149,22 @@ class TunDevice:
         if self.name and self._is_mac:
             subprocess.run(["route", "-n", "delete", "-net", cidr, "-interface", self.name],
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def add_route(self, cidr: str):
+        """Route an extra CIDR into this interface (accepted subnet routes).
+        Tolerant of an already-present route so re-syncs don't fail."""
+        if self._is_mac:
+            cmd = ["route", "-n", "add", "-net", cidr, "-interface", self.name]
+        else:
+            cmd = ["ip", "route", "add", cidr, "dev", self.name]
+        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def del_route(self, cidr: str):
+        if self._is_mac:
+            cmd = ["route", "-n", "delete", "-net", cidr, "-interface", self.name]
+        else:
+            cmd = ["ip", "route", "del", cidr, "dev", self.name]
+        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # -- I/O (raw IPv4) ---------------------------------------------------------
 

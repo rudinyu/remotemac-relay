@@ -25,6 +25,7 @@ Usage
 """
 import argparse
 import base64
+import ipaddress
 import json
 import os
 import socket
@@ -106,6 +107,82 @@ def _unb64(s: str) -> bytes:
 
 def _log(msg: str):
     print(f"[mesh] {msg}", file=sys.stderr, flush=True)
+
+# ─── subnet routing (Phase 4) ────────────────────────────────────────────────────
+
+_OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def parse_cidrs(spec):
+    """Parse a comma-separated CIDR list into normalized IPv4 network strings,
+    skipping malformed entries (with a warning). Used for --advertise-routes."""
+    out = []
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            net = ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            _log(f"ignoring invalid route CIDR: {part!r}")
+            continue
+        if net.version != 4:
+            _log(f"ignoring non-IPv4 route CIDR: {part!r}")
+            continue
+        out.append(str(net))
+    return out
+
+
+def route_is_safe(cidr, coord_ip, endpoint_ips):
+    """Whether a peer's advertised subnet route is safe to accept: IPv4, not
+    overlapping the overlay net, and not containing the coordinator IP or any
+    peer's UDP endpoint IP — otherwise mesh transport packets would be pulled
+    back into the tunnel and loop."""
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+    if net.version != 4 or net.overlaps(_OVERLAY_NET):
+        return False
+    for ip in (coord_ip, *endpoint_ips):
+        if not ip:
+            continue
+        try:
+            if ipaddress.ip_address(ip) in net:
+                return False
+        except ValueError:
+            pass
+    return True
+
+
+def build_route_table(peers, coord_ip):
+    """Return [(ip_network, pubkey)] for every safe advertised route in the peer
+    map, sorted by prefix length descending (longest-prefix match wins)."""
+    endpoint_ips = []
+    for info in peers.values():
+        for ep in info.get("endpoints", []):
+            host = ep.rpartition(":")[0]
+            if host:
+                endpoint_ips.append(host)
+    table = []
+    for pk, info in peers.items():
+        for cidr in info.get("routes", []):
+            if route_is_safe(cidr, coord_ip, endpoint_ips):
+                table.append((ipaddress.ip_network(cidr, strict=False), pk))
+    table.sort(key=lambda t: t[0].prefixlen, reverse=True)
+    return table
+
+
+def match_route(table, dst_ip):
+    """Longest-prefix-match a destination IP against a route table → pubkey/None."""
+    try:
+        addr = ipaddress.ip_address(dst_ip)
+    except ValueError:
+        return None
+    for net, pk in table:
+        if addr in net:
+            return pk
+    return None
 
 # ─── identity ──────────────────────────────────────────────────────────────────
 
@@ -252,7 +329,7 @@ class PeerConn:
 
 class MeshNode:
     def __init__(self, identity: X25519PrivateKey, hostname: str, is_exit: bool = False,
-                 bind_host: str = "0.0.0.0", udp_port: int = 0):
+                 bind_host: str = "0.0.0.0", udp_port: int = 0, advertise_routes=None):
         self._id      = identity
         self._pub     = pub_bytes(identity)
         self.pubkey_b64 = _b64(self._pub)
@@ -260,6 +337,9 @@ class MeshNode:
         self.is_exit  = is_exit
         self._bind_host = bind_host
         self._udp_port  = udp_port
+        self.advertise_routes = list(advertise_routes or [])   # CIDRs I route to
+        self.accept_routes = False        # opt in to peers' advertised subnet routes
+        self._route_table = []            # [(ip_network, pubkey)], longest-prefix first
         self.ch       = None
         self.udp      = None
         self._coord_udp = None       # (host, port) for STUN probes
@@ -279,6 +359,7 @@ class MeshNode:
         self.direct_retry_interval = 30.0  # re-punch cadence for a relayed path
         self.on_message = None     # optional callback(peer_pk_b64, msg_type, body)
         self.on_ip_packet = None   # optional callback(peer_pk_b64, raw_ip_packet) for MESH_IP
+        self.on_routes_changed = None  # optional callback(added_cidrs, removed_cidrs)
 
     # -- control channel --------------------------------------------------------
 
@@ -297,7 +378,8 @@ class MeshNode:
         self._start_udp()
         self._send({"t": "register", "pubkey": self.pubkey_b64,
                     "hostname": self.hostname, "exit": self.is_exit,
-                    "endpoints": self.local_endpoints})
+                    "endpoints": self.local_endpoints,
+                    "routes": self.advertise_routes})
         # Discover our public (post-NAT) endpoint via the coordinator's STUN
         # responder, then re-advertise it so peers can hole-punch to us.
         threading.Thread(target=self._discover_endpoint, daemon=True).start()
@@ -395,9 +477,22 @@ class MeshNode:
         for p in msg.get("peers", []):
             peers[p["pubkey"]] = {"ip": p.get("ip"), "hostname": p.get("hostname"),
                                   "exit": p.get("exit", False),
-                                  "endpoints": p.get("endpoints", [])}
+                                  "endpoints": p.get("endpoints", []),
+                                  "routes": p.get("routes", [])}
         with self._lock:
             self.peers = peers
+        if self.accept_routes:
+            self._refresh_routes()
+
+    def _refresh_routes(self):
+        """Rebuild the accepted subnet-route table from the peer map and notify
+        the TUN layer of any CIDRs to add/remove from the OS routing table."""
+        coord_ip = self._coord_udp[0] if self._coord_udp else None
+        old = {str(net) for net, _ in self._route_table}
+        self._route_table = build_route_table(self.peers, coord_ip)
+        new = {str(net) for net, _ in self._route_table}
+        if self.on_routes_changed and old != new:
+            self.on_routes_changed(new - old, old - new)
 
     # -- peer lookup ------------------------------------------------------------
 
@@ -408,6 +503,34 @@ class MeshNode:
                 if info.get("hostname") == name_or_ip or info.get("ip") == name_or_ip:
                     return pk
         return None
+
+    def route_for(self, dst_ip: str):
+        """Peer that should carry a packet to dst_ip: an overlay peer (matches a
+        node's own overlay IP) or, failing that, a subnet router advertising a
+        matching route. None if unroutable."""
+        pk = self.resolve(dst_ip)
+        if pk:
+            return pk
+        return match_route(self._route_table, dst_ip)
+
+    def src_permitted(self, src_pk: str, src_ip: str) -> bool:
+        """Anti-spoof for an inbound tunnelled packet: a peer may source its own
+        overlay IP, or — if it is a subnet router whose route we accepted — any
+        IP within one of those accepted routes (so LAN-sourced replies pass).
+        A non-IPv4/unparseable source isn't blocked here (handled elsewhere)."""
+        if src_ip is None:
+            return True
+        info = self.peers.get(src_pk) or {}
+        if src_ip == info.get("ip"):
+            return True
+        try:
+            addr = ipaddress.ip_address(src_ip)
+        except ValueError:
+            return False
+        for net, pk in self._route_table:
+            if pk == src_pk and addr in net:
+                return True
+        return False
 
     def _peer_static(self, pk_b64: str) -> bytes:
         return _unb64(pk_b64)
@@ -748,17 +871,32 @@ def _run_tun(node, mtu, name):
 
     def _to_tun(src_pk, pkt):
         # Anti-spoof: a peer may only inject packets whose IPv4 source is its own
-        # assigned overlay IP. Stops a compromised peer forging traffic as another.
-        expected = (node.peers.get(src_pk) or {}).get("ip")
-        if not tun.src_allowed(pkt, expected):
-            _warn(f"drop spoofed packet: src {tun.parse_ipv4_src(pkt)} != "
-                  f"{src_pk[:12]}… overlay {expected}")
+        # overlay IP, or (for an accepted subnet router) an IP within a route we
+        # accepted from it. Stops a peer forging traffic as another identity.
+        src = tun.parse_ipv4_src(pkt)
+        if not node.src_permitted(src_pk, src):
+            _warn(f"drop spoofed packet: src {src} not permitted for {src_pk[:12]}…")
             return
         try:
             dev.write(pkt)
         except OSError:
             pass
     node.on_ip_packet = _to_tun
+
+    # Client subnet routes: install/remove OS routes for accepted CIDRs as the
+    # peer map changes, and sync whatever is already accepted right now.
+    if node.accept_routes:
+        def _sync_routes(added, removed):
+            for cidr in added:
+                dev.add_route(cidr)
+                _log(f"route + {cidr} via mesh")
+            for cidr in removed:
+                dev.del_route(cidr)
+                _log(f"route - {cidr}")
+        node.on_routes_changed = _sync_routes
+        for net, _pk in list(node._route_table):
+            dev.add_route(str(net))
+            _log(f"route + {net} via mesh")
 
     def _from_tun():
         while not node._done.is_set():
@@ -768,12 +906,11 @@ def _run_tun(node, mtu, name):
             dst = tun.parse_ipv4_dst(pkt)
             if not dst:
                 continue                       # non-IPv4 / truncated → drop
-            pk = node.resolve(dst)
+            pk = node.route_for(dst)           # overlay peer, or accepted subnet router
             if pk:
                 node.send(pk, MESH_IP, pkt)
             else:
-                # not an overlay destination → drop (exit-node routing is Phase 3.5)
-                _warn(f"drop packet to {dst}: no mesh peer with that overlay IP")
+                _warn(f"drop packet to {dst}: no mesh peer or accepted route for it")
     reader = threading.Thread(target=_from_tun, daemon=True)
     reader.start()
 
@@ -791,12 +928,16 @@ def _run_tun(node, mtu, name):
 
 
 def _cmd_up(args):
+    advertise = parse_cidrs(getattr(args, "advertise_routes", None))
+    accept = getattr(args, "accept_routes", False)
     if getattr(args, "tun", False):
         if args.ping:
             sys.exit("error: --tun and --ping are mutually exclusive")
         # Fail fast, before any token prompt / coordinator join, if not root.
         if not hasattr(os, "geteuid") or os.geteuid() != 0:
             sys.exit("error: --tun needs root (creates a virtual interface + routes). Re-run with sudo.")
+    elif advertise or accept:
+        sys.exit("error: --advertise-routes / --accept-routes require --tun")
 
     token = args.token or os.environ.get("REMOTEMAC_MESH_TOKEN")
     if not token:
@@ -806,7 +947,9 @@ def _cmd_up(args):
     identity = load_or_create_identity()
     name = args.name or socket.gethostname()
     node = MeshNode(identity, name, is_exit=args.exit,
-                    bind_host=args.bind, udp_port=args.udp_port)
+                    bind_host=args.bind, udp_port=args.udp_port,
+                    advertise_routes=advertise)
+    node.accept_routes = accept
 
     pong_event = threading.Event()
     pong_at = {}
@@ -885,6 +1028,12 @@ def main():
     up.add_argument("--tun-mtu", type=int, default=1280, help="TUN interface MTU (default 1280)")
     up.add_argument("--tun-name", default="remotemac0",
                     help="TUN interface name on Linux (default remotemac0; ignored on macOS)")
+    up.add_argument("--advertise-routes", metavar="CIDR[,CIDR…]",
+                    help="act as a subnet router for these CIDRs (needs --tun; NAT egress on Linux)")
+    up.add_argument("--accept-routes", action="store_true",
+                    help="route peers' advertised subnet CIDRs through the mesh (needs --tun)")
+    up.add_argument("--egress", metavar="IFACE",
+                    help="egress interface for subnet NAT (default: the system default route's device)")
     up.set_defaults(func=_cmd_up)
 
     args = p.parse_args()

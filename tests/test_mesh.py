@@ -81,6 +81,39 @@ class TestHandshake(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAVE_CRYPTO, "cryptography not installed")
+class TestSubnetRouteHelpers(unittest.TestCase):
+    def test_parse_cidrs_normalizes_and_skips_bad(self):
+        self.assertEqual(mesh.parse_cidrs("192.168.1.0/24, 10.0.0.5/8"),
+                         ["192.168.1.0/24", "10.0.0.0/8"])   # host bits masked off
+        self.assertEqual(mesh.parse_cidrs("nonsense, 192.168.0.0/16"), ["192.168.0.0/16"])
+        self.assertEqual(mesh.parse_cidrs(""), [])
+
+    def test_route_is_safe_guards(self):
+        # overlaps the overlay net → unsafe
+        self.assertFalse(mesh.route_is_safe("100.64.0.0/16", None, []))
+        # contains the coordinator IP → unsafe (would loop mesh transport)
+        self.assertFalse(mesh.route_is_safe("198.51.100.0/24", "198.51.100.9", []))
+        # contains a peer endpoint IP → unsafe
+        self.assertFalse(mesh.route_is_safe("203.0.113.0/24", None, ["203.0.113.7"]))
+        # a private LAN unrelated to transport → safe
+        self.assertTrue(mesh.route_is_safe("192.168.1.0/24", "198.51.100.9", ["203.0.113.7"]))
+
+    def test_build_table_longest_prefix_and_match(self):
+        peers = {
+            "gw": {"ip": "100.64.0.2", "endpoints": ["203.0.113.5:41000"],
+                   "routes": ["10.0.0.0/8", "10.1.2.0/24"]},
+            "bad": {"ip": "100.64.0.3", "endpoints": [],
+                    "routes": ["0.0.0.0/0", "100.64.0.0/12"]},   # both unsafe → dropped
+        }
+        table = mesh.build_route_table(peers, "198.51.100.9")
+        self.assertEqual([str(n) for n, _ in table], ["10.1.2.0/24", "10.0.0.0/8"])
+        self.assertEqual(mesh.match_route(table, "10.1.2.9"), "gw")   # longest prefix
+        self.assertEqual(mesh.match_route(table, "10.9.9.9"), "gw")
+        self.assertIsNone(mesh.match_route(table, "8.8.8.8"))
+        self.assertIsNone(mesh.match_route(table, "not-an-ip"))
+
+
+@unittest.skipUnless(_HAVE_CRYPTO, "cryptography not installed")
 class TestAllocator(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
@@ -130,8 +163,10 @@ class TestMeshEndToEnd(unittest.TestCase):
         except OSError:
             pass
 
-    def _node(self, name):
-        n = mesh.MeshNode(X25519PrivateKey.generate(), name)
+    def _node(self, name, advertise_routes=None, accept_routes=False):
+        n = mesh.MeshNode(X25519PrivateKey.generate(), name,
+                          advertise_routes=advertise_routes)
+        n.accept_routes = accept_routes
         n.connect(f"127.0.0.1:{self.port}", self.token)
         threading.Thread(target=n.run, daemon=True).start()
         self.nodes.append(n)
@@ -350,6 +385,35 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertEqual(seen["pkt"], packet)
         self.assertEqual(seen["src"], a.pubkey_b64)
         self.assertNotIn(mesh.MESH_IP, leaked, "MESH_IP leaked to on_message")
+
+    def test_subnet_routes_advertise_accept_and_redirect(self):
+        # A subnet router advertises a CIDR; a client that accepts routes learns
+        # it (via the coordinator), routes matching packets to that peer, and
+        # accepts LAN-sourced replies from it (anti-spoof widened for routers).
+        gw = self._node("gw", advertise_routes=["192.168.1.0/24"])
+        client = self._node("laptop", accept_routes=True)
+
+        self.assertTrue(self._wait(
+            lambda: gw.pubkey_b64 in client.peers
+            and client.peers[gw.pubkey_b64].get("routes") == ["192.168.1.0/24"]),
+            "client did not learn the advertised route via the coordinator")
+        # The route table is rebuilt from the map when accept_routes is on.
+        self.assertTrue(self._wait(lambda: client.route_for("192.168.1.50") == gw.pubkey_b64))
+        # A non-advertised destination stays unroutable.
+        self.assertIsNone(client.route_for("8.8.8.8"))
+        # Anti-spoof: the subnet router may source its own overlay IP or a LAN IP
+        # within the accepted route, but not an arbitrary address.
+        self.assertTrue(client.src_permitted(gw.pubkey_b64, gw.overlay_ip))
+        self.assertTrue(client.src_permitted(gw.pubkey_b64, "192.168.1.50"))
+        self.assertFalse(client.src_permitted(gw.pubkey_b64, "203.0.113.1"))
+
+    def test_routes_ignored_without_accept(self):
+        gw = self._node("gw2", advertise_routes=["192.168.9.0/24"])
+        client = self._node("laptop2")            # accept_routes defaults off
+        self.assertTrue(self._wait(lambda: gw.pubkey_b64 in client.peers))
+        # Learned in the map, but not installed as a route (no opt-in).
+        self.assertEqual(client.peers[gw.pubkey_b64].get("routes"), ["192.168.9.0/24"])
+        self.assertIsNone(client.route_for("192.168.9.5"))
 
     def test_resolve_by_overlay_ip(self):
         a = self._node("alice2")

@@ -105,7 +105,8 @@ class Coordinator:
             me = self._nodes.get(pubkey)
             peers = [
                 {"pubkey": pk, "ip": n["ip"], "hostname": n["hostname"],
-                 "exit": n["exit"], "endpoints": n.get("endpoints", []), "online": True}
+                 "exit": n["exit"], "endpoints": n.get("endpoints", []),
+                 "routes": n.get("routes", []), "online": True}
                 for pk, n in self._nodes.items() if pk != pubkey
             ]
         self_info = {"pubkey": pubkey, "ip": me["ip"]} if me else {}
@@ -145,8 +146,10 @@ class Coordinator:
                     return
             ip = self._alloc.get(pk)
             endpoints = [str(e)[:64] for e in (reg.get("endpoints") or [])][:16]
+            routes = [str(r)[:64] for r in (reg.get("routes") or [])][:32]
             record = {"ch": ch, "hostname": reg.get("hostname", "node")[:64],
-                      "exit": bool(reg.get("exit")), "ip": ip, "endpoints": endpoints}
+                      "exit": bool(reg.get("exit")), "ip": ip,
+                      "endpoints": endpoints, "routes": routes}
             with self._lock:
                 old = self._nodes.get(pk)
                 if old:
