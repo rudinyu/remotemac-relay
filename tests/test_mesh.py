@@ -441,11 +441,13 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertIsNone(a.route_for("8.8.8.8"))
 
     def test_exit_node_ignored_if_peer_not_advertising_exit(self):
-        # Naming a peer that isn't an exit must not enable full-tunnel.
+        # Naming a peer that isn't an exit must not enable full-tunnel: exit_node_pk
+        # stays unresolved and internet traffic stays unrouted.
         plain = self._node("not-an-exit")
         client = self._node("laptop4", exit_node="not-an-exit")
         self.assertTrue(self._wait(lambda: plain.pubkey_b64 in client.peers))
-        self.assertTrue(self._wait(lambda: client.exit_node_name is None))  # rejected
+        # Give the map a moment; the non-exit peer must never resolve as the exit.
+        time.sleep(0.3)
         self.assertIsNone(client.exit_node_pk)
         self.assertIsNone(client.route_for("8.8.8.8"))
 

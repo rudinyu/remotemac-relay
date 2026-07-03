@@ -489,23 +489,26 @@ class MeshNode:
             self.peers = peers
         if self.accept_routes:
             self._refresh_routes()
-        if self.exit_node_name and self.exit_node_pk is None:
+        if self.exit_node_name:
             self._resolve_exit_node()
         if self.on_transport_ips_changed:
             self.on_transport_ips_changed(self.transport_ips())
 
     def _resolve_exit_node(self):
-        """Resolve --exit-node NAME to a peer pubkey once it appears in the map,
-        verifying the peer actually advertises itself as an exit."""
+        """(Re)validate --exit-node NAME against the current map: set exit_node_pk
+        when the named peer is present AND advertises as an exit, and clear it if
+        the peer disappears or stops advertising (full-tunnel routing then pauses
+        rather than sending to a peer that can't forward)."""
         pk = self.resolve(self.exit_node_name)
-        if not pk:
-            return                       # not in the map yet; try again next update
-        if not (self.peers.get(pk) or {}).get("exit"):
-            _log(f"exit-node '{self.exit_node_name}' is not advertising as an exit — ignoring")
-            self.exit_node_name = None
+        if not pk or not (self.peers.get(pk) or {}).get("exit"):
+            if self.exit_node_pk is not None:
+                _log(f"exit node '{self.exit_node_name}' is gone or no longer advertising as "
+                     f"an exit — full-tunnel routing paused")
+            self.exit_node_pk = None
             return
-        self.exit_node_pk = pk
-        _log(f"full-tunnel: routing all traffic through exit '{self.exit_node_name}' ({pk[:16]}…)")
+        if self.exit_node_pk != pk:
+            self.exit_node_pk = pk
+            _log(f"full-tunnel: routing all traffic through exit '{self.exit_node_name}' ({pk[:16]}…)")
 
     def transport_ips(self):
         """IPs that must keep bypassing the tunnel (coordinator + every peer's UDP
@@ -718,6 +721,10 @@ class MeshNode:
                     queued = []
             for payload in queued:
                 self._transmit(pc, payload)
+        # If the exit peer's transport just changed (e.g. a newly punched direct
+        # endpoint), re-pin transport promptly instead of waiting for the resync.
+        if self.on_transport_ips_changed and peer_pk == self.exit_node_pk:
+            self.on_transport_ips_changed(self.transport_ips())
 
     @staticmethod
     def _upgrade_if_udp(pc, via, addr):
@@ -991,15 +998,50 @@ def _run_tun(node, mtu, name, egress=None):
     reader = threading.Thread(target=_from_tun, daemon=True)
     reader.start()
 
-    _log("running — Ctrl-C to leave the mesh")
+    # Everything below runs under try/finally so any early exit (including the
+    # full-tunnel setup errors) still tears down NAT / routes / the device.
+    ftr = None
     try:
+        # Full-tunnel: pin mesh transport to the physical gateway, then redirect
+        # the default route through the exit. Opt-in (only with --exit-node).
+        if node.exit_node_name:
+            import netroute
+            gw, iface = netroute.default_route()
+            if not gw or not iface:
+                sys.exit("error: could not detect the physical default route for full-tunnel")
+            ftr = netroute.FullTunnelRoutes(dev.name, gw, iface)
+            # Wait for the exit peer to resolve before redirecting, so we never
+            # blackhole traffic to an exit that isn't routable yet.
+            for _ in range(100):
+                if node.exit_node_pk or node._done.is_set():
+                    break
+                time.sleep(0.1)
+            if not node.exit_node_pk:
+                sys.exit(f"error: exit node '{node.exit_node_name}' not found or not advertising as an exit")
+            # Pin transport, THEN wire the callback (so the first pin can't race
+            # a map-driven callback), THEN redirect the default route.
+            ftr.sync_pins(node.transport_ips())
+            node.on_transport_ips_changed = ftr.sync_pins   # re-pin as endpoints change
+            ftr.install_split_default()                # default → TUN → exit
+            _log(f"full-tunnel: default route → exit '{node.exit_node_name}' via {dev.name} "
+                 f"(transport pinned to {gw} dev {iface})")
+
+            def _resync():                             # backstop for endpoints punched between maps
+                while not node._done.wait(2.0):
+                    ftr.sync_pins(node.transport_ips())
+            threading.Thread(target=_resync, daemon=True).start()
+
+        _log("running — Ctrl-C to leave the mesh")
         while not node._done.is_set():
             time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
-        node.close()                           # sets _done → reader unblocks
-        reader.join(timeout=2)                 # let it exit before we close the fd
+        node.on_transport_ips_changed = None       # stop re-pinning during teardown
+        node.close()                               # sets _done → reader unblocks
+        reader.join(timeout=2)                     # let it exit before we close the fd
+        if ftr:
+            ftr.teardown()                         # restore default route + unpin transport
         if snat:
             snat.cleanup()
         dev.close()
