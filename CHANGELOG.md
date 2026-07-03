@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Docker deployment for the server side.** `docker-compose.yml` +
+  `docker/Dockerfile.relay` / `docker/Dockerfile.coordinator` bring up `relay.py`
+  and the mesh `coordinator.py` as non-root, pure-stdlib containers with one
+  command. The mesh token comes from `REMOTEMAC_MESH_TOKEN` (see
+  `docker/.env.example`); coordinator overlay-IP state persists in a named volume.
+  Deployment packaging only — no change to the modules or their `__version__`.
+
 ## [1.8.0] - 2026-07-03
 
 ### Added

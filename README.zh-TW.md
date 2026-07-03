@@ -208,6 +208,27 @@ sudo systemctl daemon-reload
 
 ---
 
+## 用 Docker 部署伺服器（relay + coordinator）
+
+兩個伺服器 daemon —— `relay.py` 與 mesh `coordinator.py` —— 都是純 Python stdlib,以非 root 容器執行。一鍵拉起:
+
+```bash
+cp docker/.env.example .env          # 然後把 REMOTEMAC_MESH_TOKEN 設成強密碼
+docker compose up -d --build
+docker compose logs -f               # relay + coordinator 的 log
+```
+
+- **relay** 監聽 `21118/tcp`;**coordinator** 監聽 `21200`(tcp 控制 + udp STUN)。記得在防火牆 / 雲端 security group 開這些埠。
+- mesh token 透過 `REMOTEMAC_MESH_TOKEN`(來自 `.env`)傳入,**不會**烤進映像;所有 mesh 節點要用同一個 token。
+- coordinator 的 overlay IP 配發持久化在 `coordinator-state` volume,節點重啟後仍保留 IP。
+- 只容器化 relay + coordinator。帶 `--tun` 的 mesh 節點(`--exit` / subnet router)需要 `NET_ADMIN` + `/dev/net/tun`,遠端桌面 `host` 模式需要真實桌面 —— 這些直接跑在主機上。
+
+```bash
+docker compose down                  # 停止;加 -v 連 state volume 一起刪
+```
+
+---
+
 ## 二、設定 RemoteMac app（Mac + iPad）
 
 ### Mac 端

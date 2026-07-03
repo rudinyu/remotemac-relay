@@ -208,6 +208,33 @@ sudo systemctl daemon-reload
 
 ---
 
+## Deploy the servers with Docker (relay + coordinator)
+
+The two server daemons — `relay.py` and the mesh `coordinator.py` — are pure
+Python stdlib and run as non-root containers. One command brings both up:
+
+```bash
+cp docker/.env.example .env          # then set REMOTEMAC_MESH_TOKEN to a strong secret
+docker compose up -d --build
+docker compose logs -f               # relay + coordinator logs
+```
+
+- **relay** listens on `21118/tcp`; **coordinator** on `21200` (tcp control + udp
+  STUN). Open those in your firewall / cloud security group.
+- The mesh token is passed via `REMOTEMAC_MESH_TOKEN` (from `.env`) — never baked
+  into the image. Every mesh node must join with the same token.
+- Coordinator overlay-IP assignments persist in the `coordinator-state` volume, so
+  nodes keep their IPs across restarts.
+- Only the relay + coordinator are containerized. Mesh nodes with `--tun`
+  (`--exit` / subnet routers) need `NET_ADMIN` + `/dev/net/tun`, and the
+  remote-desktop `host` mode needs a real desktop — those run on the host directly.
+
+```bash
+docker compose down                  # stop; add -v to also drop the state volume
+```
+
+---
+
 ## 2. Configure the RemoteMac app (Mac + iPad)
 
 ### On the Mac

@@ -1,0 +1,43 @@
+# One-command deploy of the RemoteMac server side (relay + mesh coordinator):
+#
+#   cp docker/.env.example .env      # then set REMOTEMAC_MESH_TOKEN
+#   docker compose up -d --build
+#
+# Open 21118/tcp and 21200 (tcp+udp) in your firewall / cloud security group.
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.relay
+    image: remotemac-relay
+    restart: unless-stopped
+    ports:
+      - "21118:21118"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 21118), 3).close()"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.coordinator
+    image: remotemac-coordinator
+    restart: unless-stopped
+    environment:
+      # Required — compose refuses to start if it's unset (see docker/.env.example).
+      REMOTEMAC_MESH_TOKEN: ${REMOTEMAC_MESH_TOKEN:?set REMOTEMAC_MESH_TOKEN in .env}
+    ports:
+      - "21200:21200/tcp"
+      - "21200:21200/udp"
+    volumes:
+      - coordinator-state:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 21200), 3).close()"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  coordinator-state:
