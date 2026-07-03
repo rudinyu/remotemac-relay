@@ -1,6 +1,8 @@
-# RemoteMac mesh coordinator — control plane. Pure Python stdlib (uses
-# remote_desktop's SecureChannel over hashlib; no `cryptography` needed here).
+# RemoteMac mesh coordinator — control plane. Needs `cryptography` for the
+# registration proof-of-possession (X25519); the rest uses stdlib.
 FROM python:3.12-slim
+
+RUN pip install --no-cache-dir cryptography
 
 WORKDIR /app
 COPY coordinator.py remote_desktop.py .

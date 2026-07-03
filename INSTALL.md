@@ -20,9 +20,11 @@ Everything else (mesh nodes, remote desktop) connects *outbound* to them.
 - **Python 3.8+** on every machine (`python3 --version`).
 - The **relay/coordinator host** must be reachable from the internet — a VPS, or a
   home box with the port forwarded.
-- **Mesh nodes only** need one pip package: `pip install cryptography`. The relay,
-  coordinator, and remote-desktop `pipe`/`gateway`/`socks` modes are **pure stdlib**
-  (no pip). The remote-desktop `host`/`viewer` modes need `pip install mss Pillow pynput`.
+- **Mesh nodes and the coordinator** need `pip install cryptography` (the coordinator
+  uses X25519 for the registration proof-of-possession). The relay and the
+  remote-desktop `pipe`/`gateway`/`socks` modes are **pure stdlib** (no pip). The
+  remote-desktop `host`/`viewer` modes need `pip install mss Pillow pynput`. (The
+  Docker images and `scripts/install-linux.sh` handle this for you.)
 - **Docker** (optional) for the one-command server deploy: Docker Engine + the
   Compose plugin.
 

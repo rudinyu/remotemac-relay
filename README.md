@@ -212,8 +212,9 @@ sudo systemctl daemon-reload
 
 ## Deploy the servers with Docker (relay + coordinator)
 
-The two server daemons — `relay.py` and the mesh `coordinator.py` — are pure
-Python stdlib and run as non-root containers. One command brings both up:
+The two server daemons — `relay.py` and the mesh `coordinator.py` — run as
+non-root containers (the image installs `cryptography` for the coordinator; the
+relay is pure stdlib). One command brings both up:
 
 ```bash
 cp docker/.env.example .env          # then set REMOTEMAC_MESH_TOKEN to a strong secret

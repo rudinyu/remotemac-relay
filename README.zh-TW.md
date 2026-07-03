@@ -212,7 +212,7 @@ sudo systemctl daemon-reload
 
 ## 用 Docker 部署伺服器（relay + coordinator）
 
-兩個伺服器 daemon —— `relay.py` 與 mesh `coordinator.py` —— 都是純 Python stdlib,以非 root 容器執行。一鍵拉起:
+兩個伺服器 daemon —— `relay.py` 與 mesh `coordinator.py` —— 以非 root 容器執行(映像會幫 coordinator 裝 `cryptography`;relay 是純 stdlib)。一鍵拉起:
 
 ```bash
 cp docker/.env.example .env          # 然後把 REMOTEMAC_MESH_TOKEN 設成強密碼

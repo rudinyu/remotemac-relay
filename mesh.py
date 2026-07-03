@@ -32,6 +32,8 @@ Usage
 """
 import argparse
 import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -54,7 +56,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
@@ -382,6 +384,10 @@ class MeshNode:
         sock = socket.create_connection((host, int(port)), timeout=15)
         sock.settimeout(30)
         self.ch = _auth(sock, token, is_host=False)
+        # Answer the coordinator's proof-of-possession challenge (prove we hold the
+        # private key for our pubkey) before registering.
+        chal = json.loads(self.ch.recv().decode())
+        proof = self._registration_proof(chal)
         sock.settimeout(None)
         # Resolve to an IP so we can match the STUN reply's source address.
         try:
@@ -390,7 +396,7 @@ class MeshNode:
             coord_ip = host
         self._coord_udp = (coord_ip, int(port))
         self._start_udp()
-        self._send({"t": "register", "pubkey": self.pubkey_b64,
+        self._send({"t": "register", "pubkey": self.pubkey_b64, "proof": proof,
                     "hostname": self.hostname, "exit": self.is_exit,
                     "endpoints": self.local_endpoints,
                     "routes": self.advertise_routes})
@@ -399,6 +405,15 @@ class MeshNode:
         threading.Thread(target=self._discover_endpoint, daemon=True).start()
         # Keep NAT mappings warm on direct paths and fail silent ones over to DERP.
         threading.Thread(target=self._keepalive_loop, daemon=True).start()
+
+    def _registration_proof(self, chal: dict) -> str:
+        """Prove key possession: HMAC-SHA256(DH(our_static, coord_ephemeral),
+        nonce ‖ our_pubkey). Only the holder of our static private key can compute
+        the same DH the coordinator derives from our advertised pubkey."""
+        epk = _unb64(chal["epk"])
+        nonce = _unb64(chal["nonce"])
+        dh = self._id.exchange(X25519PublicKey.from_public_bytes(epk))
+        return _b64(hmac.new(dh, nonce + self._pub, hashlib.sha256).digest())
 
     def _discover_endpoint(self):
         if not self._coord_udp:
@@ -519,22 +534,28 @@ class MeshNode:
             _log(f"full-tunnel: routing all traffic through exit '{self.exit_node_name}' ({pk[:16]}…)")
 
     def transport_ips(self):
-        """IPs that must keep bypassing the tunnel (coordinator + every peer's UDP
-        endpoints + a live direct exit endpoint), so full-tunnel doesn't loop the
-        mesh's own transport back into itself."""
+        """IPs that must keep bypassing the tunnel so full-tunnel doesn't loop the
+        mesh's own transport: the coordinator, plus the UDP endpoints of only the
+        peers we actually talk to (those with a PeerConn) and the selected exit —
+        NOT every advertised endpoint in the map, so a peer we never connect to
+        can't influence our host-route pins."""
         ips = set()
         if self._coord_udp:
             ips.add(self._coord_udp[0])
         with self._lock:
             peers = dict(self.peers)
-            exit_pc = self._conns.get(self.exit_node_pk) if self.exit_node_pk else None
-        for info in peers.values():
-            for ep in info.get("endpoints", []):
+            conns = dict(self._conns)
+        relevant = set(conns)                       # peers we've opened a connection to
+        if self.exit_node_pk:
+            relevant.add(self.exit_node_pk)
+        for pk in relevant:
+            for ep in (peers.get(pk) or {}).get("endpoints", []):
                 host = ep.rpartition(":")[0]
                 if host:
                     ips.add(host)
-        if exit_pc and exit_pc.transport == "direct" and exit_pc.endpoint:
-            ips.add(exit_pc.endpoint[0])
+            pc = conns.get(pk)
+            if pc and pc.transport == "direct" and pc.endpoint:
+                ips.add(pc.endpoint[0])
         return ips
 
     def _refresh_routes(self):
@@ -826,6 +847,10 @@ class MeshNode:
             if pc.initiated:
                 return
             pc.initiated = True
+        # Pin this peer's transport endpoints before we punch to them, so the
+        # first UDP packets don't get pulled into a full-tunnel default route.
+        if self.on_transport_ips_changed:
+            self.on_transport_ips_changed(self.transport_ips())
         threading.Thread(target=self._connect_worker, args=(pc,), daemon=True).start()
 
     def _connect_worker(self, pc):

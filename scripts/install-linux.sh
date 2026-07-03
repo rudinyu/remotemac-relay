@@ -31,6 +31,22 @@ log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarn:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
+ensure_cryptography() {  # the coordinator needs it (X25519 registration proof)
+  if "$PY" -c 'import cryptography' 2>/dev/null; then return 0; fi
+  log "installing python 'cryptography' (required by the coordinator)"
+  if command -v apt-get >/dev/null; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y python3-cryptography >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null; then
+    dnf install -y python3-cryptography >/dev/null 2>&1 || true
+  fi
+  if "$PY" -c 'import cryptography' 2>/dev/null; then return 0; fi
+  "$PY" -m pip install --quiet cryptography >/dev/null 2>&1 || \
+  "$PY" -m pip install --quiet --break-system-packages cryptography >/dev/null 2>&1 || true
+  if "$PY" -c 'import cryptography' 2>/dev/null; then return 0; fi
+  die "could not install 'cryptography' — install it manually (apt install python3-cryptography, or pip install cryptography) and re-run"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --relay-only)   COORD=0 ;;
@@ -96,6 +112,7 @@ fi
 
 # --- coordinator service (needs a token + a writable state dir) --------------
 if [ "$COORD" -eq 1 ]; then
+  ensure_cryptography
   if [ -z "$TOKEN" ]; then
     if [ -t 0 ]; then
       printf 'Mesh network token (blank = generate one): '
