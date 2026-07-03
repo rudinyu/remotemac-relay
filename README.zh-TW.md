@@ -365,7 +365,7 @@ ALL_PROXY=socks5h://127.0.0.1:1080 curl https://example.com
 
 ---
 
-## 四、Mesh overlay（實驗性 — Phase 2）
+## 四、Mesh overlay（實驗性 — Phase 3）
 
 除了 1:1 遠端桌面,`coordinator.py` + `mesh.py` 把系統擴充成 **mesh**(自架的簡化版 Tailscale):多個節點加入同一張網,各自拿到穩定的 overlay IP,節點之間端到端加密,而且在網路允許時**走 UDP P2P 直連**而非繞經 coordinator。需要 `cryptography`(`pip install cryptography`)。
 
@@ -384,10 +384,18 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 - 每個節點有持久的 X25519 身份(`~/.config/remotemac/mesh/key`,可用 `$REMOTEMAC_MESH_KEY` 覆寫);coordinator 從 `100.64.0.0/10` 配發 overlay IP。
 - 節點間握手是雙向認證 + 前向保密(X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305)。
 - **P2P 直連(Phase 2)**:節點透過向 coordinator 做 STUN-lite 探測得知自己的公網端點,互換候選端點後**同時打洞建立 UDP 直連**(以 pubkey 定序避免握手 glare)。之後資料在兩節點間直送。若數秒內打不通(例如雙方對稱 NAT),流量會**透明回退到 coordinator relay(DERP)** —— relay 全程只看得到密文。keepalive 維持 NAT 映射;直連靜默會回退 DERP,並週期性重新打洞,連通恢復時再升級回直連。
+- **TUN overlay(Phase 3)**:加上 `--tun`(需 root)後,節點會開一個虛擬網卡、綁上自己的 overlay IP、並把 `100.64.0.0/10` 路由過去 —— 讓**真實 app 直接用 overlay IP 連 peer**(`ping 100.64.0.x`、`ssh`、http),不再只有內建 `--ping`。核心的 IP 封包走同一條加密 P2P/DERP 資料路徑。macOS 用 `utun`(免 kext),Linux 用 `/dev/net/tun`。peer 只能送出「來源是自己 overlay IP」的封包(anti-spoof)。
 
-**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。
+```bash
+# 兩台機器都開完整 VPN 資料面(root),之後直接用 overlay IP:
+sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name a --tun
+sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name b --tun
+ping 100.64.0.3      # a → b 走 overlay;mesh log 顯示 [direct] 或 [derp]
+```
 
-**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。**Phase 2(本版)** 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換 —— 免 root。後續:**Phase 3** — TUN overlay 裝置 + 自動路由 + 出口節點選擇(完整 VPN,需 root)。純 Python 資料面吞吐中等,一般用途足夠。
+**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。`--tun` 啟用 VPN 介面;`--tun-mtu`(預設 1280)、`--tun-name`(Linux 介面名,預設 `remotemac0`)可微調。
+
+**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。**Phase 3(本版)** 加上 **TUN overlay**,讓真實 app 把 mesh 當成一張網用(macOS + Linux,需 root)。後續:**exit-node NAT**(把所有對外流量繞經 `--exit` 節點 —— pf/nftables + IP forwarding)、IPv6、split-DNS。純 Python 資料面吞吐中等,一般用途足夠。
 
 ---
 
@@ -432,5 +440,6 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 | `relay.py` | 中繼伺服器，Python 3.8+，無相依套件 |
 | `remote_desktop.py` | 加密傳輸層 + 遠端桌面 + SOCKS5 proxy（host / viewer / pipe / gateway / socks 五種模式）|
 | `coordinator.py` | Mesh 控制平面 — 節點註冊、overlay IP 配發、端點分發、STUN 回應器、DERP 轉發。需 `cryptography` |
-| `mesh.py` | Mesh 節點 — X25519 身份、UDP P2P 資料面 + NAT 打洞 + direct↔DERP 切換。需 `cryptography` |
+| `mesh.py` | Mesh 節點 — X25519 身份、UDP P2P 資料面 + NAT 打洞 + direct↔DERP 切換、TUN overlay(`--tun`)。需 `cryptography` |
+| `tun.py` | overlay 的 TUN 虛擬網卡(macOS `utun` / Linux `/dev/net/tun`)—— 供 `mesh.py --tun` 使用。需 root |
 | `remotemac-relay.service` | systemd unit，讓 relay.py 開機自動啟動 |

@@ -9,10 +9,11 @@ is end-to-end encrypted with a mutually authenticated, forward-secret handshake
 (X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305); the coordinator only ever
 relays ciphertext.
 
-Phase 1 (this file): identity + control channel + peer map + an encrypted data
-path relayed through the coordinator (DERP), with a built-in ping to prove the
-tunnel works. No UDP / NAT hole punching (Phase 2) and no TUN overlay (Phase 3)
-yet, so this needs no root.
+Phases 1–3: identity + token-authenticated control channel + peer map; an
+encrypted data path that is **UDP peer-to-peer** where the network allows (NAT
+hole punching, Phase 2) and transparently falls back to a coordinator relay
+(DERP); and a **TUN overlay** (Phase 3, `--tun`) so real apps reach peers by
+overlay IP. Only `--tun` needs root; everything else runs unprivileged.
 
 Requires: pip install cryptography
 
@@ -20,6 +21,7 @@ Usage
 -----
     python3 mesh.py up <coord:port> --token <network-token> [--name NAME] [--exit]
     python3 mesh.py up <coord:port> --token <token> --ping <peer-name-or-ip>
+    sudo python3 mesh.py up <coord:port> --token <token> --tun   # VPN data plane
 """
 import argparse
 import base64
@@ -27,6 +29,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -43,7 +46,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
@@ -51,7 +54,7 @@ _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
 # mesh application message types (first byte of the decrypted payload)
 MESH_PING = 0x01
 MESH_PONG = 0x02
-MESH_IP   = 0x03   # reserved for Phase 3 (TUN packets)
+MESH_IP   = 0x03   # a tunnelled raw IP packet (Phase 3 TUN overlay)
 # internal liveness probe over an established direct path (not surfaced to apps)
 MESH_KEEPALIVE     = 0x04
 MESH_KEEPALIVE_ACK = 0x05
@@ -275,6 +278,7 @@ class MeshNode:
         self.direct_timeout     = 45.0   # silence before a direct path is failed
         self.direct_retry_interval = 30.0  # re-punch cadence for a relayed path
         self.on_message = None     # optional callback(peer_pk_b64, msg_type, body)
+        self.on_ip_packet = None   # optional callback(peer_pk_b64, raw_ip_packet) for MESH_IP
 
     # -- control channel --------------------------------------------------------
 
@@ -560,6 +564,12 @@ class MeshNode:
             return
         if mtype == MESH_KEEPALIVE_ACK:
             return   # internal liveness only — not surfaced to the app
+        if mtype == MESH_IP:
+            # A tunnelled IP packet (Phase 3): hand it straight to the TUN pump,
+            # not to the generic on_message path.
+            if self.on_ip_packet:
+                self.on_ip_packet(pc.peer_pk, payload)
+            return
         if mtype == MESH_PING:
             self.send(pc.peer_pk, MESH_PONG, payload)
         if self.on_message:
@@ -702,7 +712,92 @@ class MeshNode:
 
 # ─── CLI ────────────────────────────────────────────────────────────────────────
 
+def _run_tun(node, mtu, name):
+    """Bring up a TUN overlay interface and pump packets between it and the mesh.
+
+    Blocks until the node is torn down (Ctrl-C). Needs root — it creates a
+    virtual interface and installs the overlay route. The root check is done
+    earlier (in _cmd_up), before we ever touch the network."""
+    import tun
+
+    # Wait a little longer for the coordinator to assign our overlay IP.
+    for _ in range(50):
+        if node.overlay_ip or node._done.is_set():
+            break
+        time.sleep(0.1)
+    if not node.overlay_ip:
+        sys.exit("error: no overlay IP assigned yet — cannot bring up the TUN interface")
+
+    try:
+        dev = tun.TunDevice(name=name, mtu=mtu).open()
+    except (tun.TunError, OSError) as exc:
+        sys.exit(f"error: could not open TUN: {exc}")
+    try:
+        dev.configure(node.overlay_ip)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        dev.close()                            # don't leak the interface/socket
+        sys.exit(f"error: could not configure TUN {dev.name}: {exc}")
+    _log(f"TUN up: {dev.name}  ip={node.overlay_ip}  mtu={mtu}  (overlay {tun.OVERLAY_CIDR})")
+
+    _last_warn = [0.0]
+    def _warn(msg):
+        now = time.monotonic()
+        if now - _last_warn[0] > 5.0:          # rate-limit so a loop can't spam
+            _last_warn[0] = now
+            _log(msg)
+
+    def _to_tun(src_pk, pkt):
+        # Anti-spoof: a peer may only inject packets whose IPv4 source is its own
+        # assigned overlay IP. Stops a compromised peer forging traffic as another.
+        expected = (node.peers.get(src_pk) or {}).get("ip")
+        if not tun.src_allowed(pkt, expected):
+            _warn(f"drop spoofed packet: src {tun.parse_ipv4_src(pkt)} != "
+                  f"{src_pk[:12]}… overlay {expected}")
+            return
+        try:
+            dev.write(pkt)
+        except OSError:
+            pass
+    node.on_ip_packet = _to_tun
+
+    def _from_tun():
+        while not node._done.is_set():
+            pkt = dev.read()                   # bounded wait; b"" on timeout
+            if not pkt:
+                continue
+            dst = tun.parse_ipv4_dst(pkt)
+            if not dst:
+                continue                       # non-IPv4 / truncated → drop
+            pk = node.resolve(dst)
+            if pk:
+                node.send(pk, MESH_IP, pkt)
+            else:
+                # not an overlay destination → drop (exit-node routing is Phase 3.5)
+                _warn(f"drop packet to {dst}: no mesh peer with that overlay IP")
+    reader = threading.Thread(target=_from_tun, daemon=True)
+    reader.start()
+
+    _log("running — Ctrl-C to leave the mesh")
+    try:
+        while not node._done.is_set():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.close()                           # sets _done → reader unblocks
+        reader.join(timeout=2)                 # let it exit before we close the fd
+        dev.close()
+        _log("TUN down")
+
+
 def _cmd_up(args):
+    if getattr(args, "tun", False):
+        if args.ping:
+            sys.exit("error: --tun and --ping are mutually exclusive")
+        # Fail fast, before any token prompt / coordinator join, if not root.
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            sys.exit("error: --tun needs root (creates a virtual interface + routes). Re-run with sudo.")
+
     token = args.token or os.environ.get("REMOTEMAC_MESH_TOKEN")
     if not token:
         import getpass
@@ -758,6 +853,10 @@ def _cmd_up(args):
         node.close()
         return
 
+    if getattr(args, "tun", False):
+        _run_tun(node, args.tun_mtu, args.tun_name)
+        return
+
     _log("running — Ctrl-C to leave the mesh")
     try:
         while not node._done.is_set():
@@ -777,10 +876,15 @@ def main():
     up.add_argument("coord_addr", metavar="coord:port")
     up.add_argument("--token", help="network join token (or set REMOTEMAC_MESH_TOKEN)")
     up.add_argument("--name", help="hostname to advertise (default: system hostname)")
-    up.add_argument("--exit", action="store_true", help="advertise as an exit node (Phase 3)")
+    up.add_argument("--exit", action="store_true", help="advertise as an exit node (routing support lands in a later phase)")
     up.add_argument("--bind", default="0.0.0.0", help="UDP data-plane bind address (default 0.0.0.0)")
     up.add_argument("--udp-port", type=int, default=0, help="UDP data-plane port (default: random)")
     up.add_argument("--ping", metavar="PEER", help="ping a peer (name or overlay IP) then exit")
+    up.add_argument("--tun", action="store_true",
+                    help="bring up a TUN overlay interface so real apps reach peers by overlay IP (needs root)")
+    up.add_argument("--tun-mtu", type=int, default=1280, help="TUN interface MTU (default 1280)")
+    up.add_argument("--tun-name", default="remotemac0",
+                    help="TUN interface name on Linux (default remotemac0; ignored on macOS)")
     up.set_defaults(func=_cmd_up)
 
     args = p.parse_args()
