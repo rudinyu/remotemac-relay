@@ -7,7 +7,9 @@ forwarded). Nodes (`mesh.py`) connect *outbound* to the coordinator over an
 encrypted, token-authenticated control channel. The coordinator:
 
   • authenticates each node with a shared **network token** (via the same
-    SecureChannel handshake used by remote_desktop.py),
+    SecureChannel handshake used by remote_desktop.py), then challenges it to
+    **prove possession** of the X25519 private key for the pubkey it registers
+    (so a token holder can't claim another node's identity),
   • assigns each node a stable overlay IP from 100.64.0.0/10 (persisted),
   • distributes the network map (peers: pubkey, overlay IP, hostname, exit flag,
     UDP endpoints, advertised subnet routes) and pushes updates as nodes join/leave,
@@ -26,6 +28,9 @@ TUN overlay, subnet routing) lives in mesh.py and, wherever possible, bypasses
 the coordinator entirely.
 """
 import argparse
+import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -36,7 +41,13 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from remote_desktop import SecureChannel, _auth  # noqa: E402
 
-__version__ = "1.8.0"
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey, X25519PublicKey)
+except ImportError:
+    sys.exit("coordinator requires the 'cryptography' package:\n  pip install cryptography")
+
+__version__ = "2.0.0"
 
 OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 MAX_NODES = 1024
@@ -93,6 +104,22 @@ class IPAllocator:
             raise RuntimeError("overlay address space exhausted")
 
 
+def _verify_pop(ce_priv, nonce: bytes, pubkey_b64: str, proof_b64) -> bool:
+    """Verify a node's proof that it holds the private key for `pubkey_b64`:
+    HMAC-SHA256(DH(node_static, ce_pub), nonce ‖ pubkey). By X25519 commutativity
+    DH(ce_priv, node_static_pub) equals the node's DH(node_static_priv, ce_pub),
+    so only the real key holder can produce the expected HMAC."""
+    try:
+        claimed = base64.b64decode(pubkey_b64)
+        if len(claimed) != 32:
+            return False
+        dh = ce_priv.exchange(X25519PublicKey.from_public_bytes(claimed))
+        expected = hmac.new(dh, nonce + claimed, hashlib.sha256).digest()
+        return hmac.compare_digest(expected, base64.b64decode(proof_b64 or ""))
+    except Exception:
+        return False
+
+
 class Coordinator:
     def __init__(self, token: bytes, allocator: IPAllocator):
         self._token = token
@@ -135,6 +162,19 @@ class Coordinator:
                 pass
             return
 
+        # Proof-of-possession: challenge the node to prove it holds the private
+        # key for the pubkey it will claim, so a token holder can't register under
+        # another node's identity. (The shared token only proves network membership.)
+        ce = X25519PrivateKey.generate()
+        nonce = os.urandom(32)
+        try:
+            send_json(ch, {"t": "challenge",
+                           "epk": base64.b64encode(ce.public_key().public_bytes_raw()).decode(),
+                           "nonce": base64.b64encode(nonce).decode()})
+        except Exception:
+            conn.close()
+            return
+
         pk = None
         record = None
         try:
@@ -142,6 +182,10 @@ class Coordinator:
             if reg.get("t") != "register" or not reg.get("pubkey"):
                 return
             pk = reg["pubkey"]
+            if not _verify_pop(ce, nonce, pk, reg.get("proof")):
+                print(f"[coord] rejecting {addr[0]}: bad identity proof", flush=True)
+                pk = None
+                return
             with self._lock:
                 if len(self._nodes) >= MAX_NODES and pk not in self._nodes:
                     pk = None   # not admitted; nothing to clean up

@@ -18,7 +18,7 @@
 
 - 每台機器 **Python 3.8+**(`python3 --version`)。
 - **relay/coordinator 主機**必須從網際網路可達 —— VPS,或家用主機有做轉埠。
-- **只有 mesh 節點**需要一個 pip 套件:`pip install cryptography`。relay、coordinator、以及遠端桌面的 `pipe`/`gateway`/`socks` 模式都是**純 stdlib**(免 pip)。遠端桌面 `host`/`viewer` 需要 `pip install mss Pillow pynput`。
+- **mesh 節點與 coordinator** 需要 `pip install cryptography`(coordinator 用 X25519 做註冊的持有性證明)。relay 與遠端桌面的 `pipe`/`gateway`/`socks` 模式是**純 stdlib**(免 pip)。遠端桌面 `host`/`viewer` 需要 `pip install mss Pillow pynput`。(Docker 映像與 `scripts/install-linux.sh` 會自動幫你裝。)
 - **Docker**(選用):一鍵部署伺服器,需要 Docker Engine + Compose plugin。
 
 ---

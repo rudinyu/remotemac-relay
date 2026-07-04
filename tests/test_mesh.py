@@ -11,9 +11,12 @@ import unittest
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
 try:
+    import hashlib
+    import hmac
     import mesh
     import coordinator
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey, X25519PublicKey)
     _HAVE_CRYPTO = True
 except Exception:
     _HAVE_CRYPTO = False
@@ -78,6 +81,41 @@ class TestHandshake(unittest.TestCase):
         self.assertEqual(b.decrypt(ct), b"once")
         with self.assertRaises(ValueError):
             b.decrypt(ct)   # replay of the same counter
+
+
+@unittest.skipUnless(_HAVE_CRYPTO, "cryptography not installed")
+class TestRegistrationProof(unittest.TestCase):
+    """Proof-of-possession: a node must prove it holds the private key for the
+    pubkey it registers, so a token holder can't claim another node's identity."""
+
+    def _proof(self, node_priv, ce_pub, nonce, claimed_pub):
+        dh = node_priv.exchange(X25519PublicKey.from_public_bytes(ce_pub))
+        return hmac.new(dh, nonce + claimed_pub, hashlib.sha256).digest()
+
+    def test_valid_proof_accepted(self):
+        ce = X25519PrivateKey.generate()
+        node = X25519PrivateKey.generate()
+        npub = mesh.pub_bytes(node)
+        nonce = os.urandom(32)
+        proof = self._proof(node, mesh.pub_bytes(ce), nonce, npub)
+        self.assertTrue(coordinator._verify_pop(ce, nonce, mesh._b64(npub), mesh._b64(proof)))
+
+    def test_wrong_key_rejected(self):
+        ce = X25519PrivateKey.generate()
+        node = X25519PrivateKey.generate()
+        imposter = X25519PrivateKey.generate()
+        npub = mesh.pub_bytes(node)
+        nonce = os.urandom(32)
+        # Imposter signs a proof but claims the victim's pubkey → must be rejected.
+        bad = self._proof(imposter, mesh.pub_bytes(ce), nonce, npub)
+        self.assertFalse(coordinator._verify_pop(ce, nonce, mesh._b64(npub), mesh._b64(bad)))
+
+    def test_malformed_rejected(self):
+        ce = X25519PrivateKey.generate()
+        nonce = os.urandom(32)
+        self.assertFalse(coordinator._verify_pop(ce, nonce, "!!not-base64!!", "x"))
+        self.assertFalse(coordinator._verify_pop(ce, nonce, mesh._b64(b"tooshort"), mesh._b64(b"x")))
+        self.assertFalse(coordinator._verify_pop(ce, nonce, mesh._b64(os.urandom(32)), None))
 
 
 @unittest.skipUnless(_HAVE_CRYPTO, "cryptography not installed")
@@ -450,6 +488,40 @@ class TestMeshEndToEnd(unittest.TestCase):
         time.sleep(0.3)
         self.assertIsNone(client.exit_node_pk)
         self.assertIsNone(client.route_for("8.8.8.8"))
+
+    def test_registration_rejects_claimed_pubkey_without_the_key(self):
+        # A node that claims a pubkey it doesn't own (its proof is computed from
+        # its real key) must be rejected — not admitted, not in the map.
+        imp = mesh.MeshNode(X25519PrivateKey.generate(), "imp")
+        imp.pubkey_b64 = mesh._b64(mesh.pub_bytes(X25519PrivateKey.generate()))  # claim a key we lack
+        imp.connect(f"127.0.0.1:{self.port}", self.token)
+        threading.Thread(target=imp.run, daemon=True).start()
+        self.nodes.append(imp)
+
+        good = self._node("good")
+        self.assertTrue(self._wait(lambda: good.overlay_ip), "legit node was not admitted")
+        time.sleep(0.4)
+        self.assertIsNone(imp.overlay_ip, "imposter was admitted despite a bad proof")
+        self.assertNotIn(imp.pubkey_b64, good.peers)
+
+    def test_transport_ips_scoped_to_connected_peers(self):
+        # transport_ips() must only pin the coordinator + peers we actually have a
+        # connection to (+ the exit), not every advertised endpoint in the map.
+        a = self._node("ti-a")
+        b = self._node("ti-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers))
+        coord_ip = a._coord_udp[0]
+
+        # b advertises an endpoint but a has NOT connected to it yet → not pinned.
+        with a._lock:
+            a.peers[b.pubkey_b64]["endpoints"] = ["203.0.113.9:41000"]
+        self.assertEqual(a.transport_ips(), {coord_ip})
+
+        # After a talks to b, b's endpoint IS pinned.
+        a.send(a.resolve("ti-b"), mesh.MESH_PING, b"x")
+        self.assertTrue(self._wait(lambda: "203.0.113.9" in a.transport_ips()
+                                   or b.pubkey_b64 in a._conns))
+        self.assertIn("203.0.113.9", a.transport_ips())
 
     def test_resolve_by_overlay_ip(self):
         a = self._node("alice2")

@@ -3,20 +3,39 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.0.0] - 2026-07-04
+
+**Breaking release.** The registration protocol changed (proof-of-possession), so
+a v2.0.0 coordinator and v2.0.0 nodes are **not compatible with 1.x** — upgrade the
+coordinator and every node together. The coordinator also now requires the
+`cryptography` package.
+
+### Security
+- **Registration proof-of-possession.** The coordinator now challenges each
+  joining node to prove it holds the X25519 private key for the pubkey it
+  registers (ephemeral-DH → HMAC-SHA256), so a mesh member (shared-token holder)
+  can no longer register under another node's identity to evict it or poison its
+  map entry. **Breaking:** the coordinator and all nodes must be on this version
+  together (adds a challenge round-trip), and the **coordinator now needs the
+  `cryptography` package** (the Docker image and `scripts/install-linux.sh`
+  install it automatically).
+- **Scoped full-tunnel transport pinning.** `MeshNode.transport_ips()` now pins
+  only the coordinator plus the UDP endpoints of peers we actually connect to (and
+  the selected exit) — not every advertised endpoint in the map — so a peer we
+  never talk to can't influence our host-route pins. Pins refresh the moment a
+  connection starts.
 
 ### Added
 - **Docker deployment for the server side.** `docker-compose.yml` +
   `docker/Dockerfile.relay` / `docker/Dockerfile.coordinator` bring up `relay.py`
-  and the mesh `coordinator.py` as non-root, pure-stdlib containers with one
-  command. The mesh token comes from `REMOTEMAC_MESH_TOKEN` (see
-  `docker/.env.example`); coordinator overlay-IP state persists in a named volume.
-  Deployment packaging only — no change to the modules or their `__version__`.
+  and the mesh `coordinator.py` as non-root containers with one command. The mesh
+  token comes from `REMOTEMAC_MESH_TOKEN` (see `docker/.env.example`); coordinator
+  overlay-IP state persists in a named volume.
 - **One-shot Linux installer** `scripts/install-linux.sh`: installs the relay
   and/or mesh coordinator as hardened systemd services (relay as `nobody`;
   coordinator with a `StateDirectory` + token in a root-only `EnvironmentFile`),
   idempotent, with `--relay-only`/`--coord-only`, port flags, and `--open-firewall`.
-  Generates a mesh token if none is given. `INSTALL.md` documents it.
+  Generates a mesh token if none is given. `INSTALL.md` (en/zh) documents both.
 
 ## [1.8.0] - 2026-07-03
 
