@@ -20,6 +20,22 @@
 
 ## 架構說明
 
+整體系統 —— mesh VPN(coordinator 控制平面 + 節點的 UDP P2P 資料面)與最初的遠端桌面 / proxy:
+
+![整體架構](docs/architecture-overview.svg)
+
+<details><summary>更多圖 —— 資料面連線流程與部署拓撲</summary>
+
+資料面:打洞與透明的 direct↔DERP 切換 —
+
+![資料面連線流程](docs/architecture-data-plane.svg)
+
+部署:各元件執行位置 —
+
+![部署拓撲](docs/architecture-deployment.svg)
+
+</details>
+
 ### relay.py — 盲管道
 
 Relay 只做一件事：把兩條 outbound TCP 連線配對，然後把位元組雙向轉發。它**永遠看不到明文**，因為加解密在兩端進行。

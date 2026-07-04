@@ -20,6 +20,23 @@ Two Python scripts that together form a complete remote-control system — with 
 
 ## Architecture
 
+Overall system — the mesh VPN (coordinator control plane + nodes with a UDP P2P
+data plane) and the original remote-desktop / proxy:
+
+![Overall architecture](docs/architecture-overview.svg)
+
+<details><summary>More diagrams — data-plane connection flow &amp; deployment topology</summary>
+
+Data plane: hole punching and the transparent direct↔DERP switching —
+
+![Data-plane connection flow](docs/architecture-data-plane.svg)
+
+Deployment: where each piece runs —
+
+![Deployment topology](docs/architecture-deployment.svg)
+
+</details>
+
 ### relay.py — the blind pipe
 
 The relay does exactly one thing: pair two outbound TCP connections and forward bytes in both directions. It **never sees plaintext**, because encryption and decryption happen at the two endpoints.
