@@ -56,7 +56,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "1.9.0"
+__version__ = "2.0.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")

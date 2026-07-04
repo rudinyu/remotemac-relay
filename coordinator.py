@@ -47,7 +47,7 @@ try:
 except ImportError:
     sys.exit("coordinator requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "1.9.0"
+__version__ = "2.0.0"
 
 OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 MAX_NODES = 1024

@@ -3,7 +3,12 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [1.9.0] - 2026-07-03
+## [2.0.0] - 2026-07-04
+
+**Breaking release.** The registration protocol changed (proof-of-possession), so
+a v2.0.0 coordinator and v2.0.0 nodes are **not compatible with 1.x** — upgrade the
+coordinator and every node together. The coordinator also now requires the
+`cryptography` package.
 
 ### Security
 - **Registration proof-of-possession.** The coordinator now challenges each
