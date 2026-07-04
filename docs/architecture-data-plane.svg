@@ -1,0 +1,54 @@
+<svg width="680" viewBox="0 0 680 412" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>mesh data-plane connection flow</title>
+<desc>First packet triggers connect: STUN discovery + connect nudge via the coordinator, simultaneous hole punching (smaller pubkey initiates), then direct UDP P2P if a handshake completes in ~3s, else DERP relay; keepalive, failover on silence, and re-punch to upgrade.</desc>
+<style>
+.t{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-weight:500;font-size:14px;fill:#181818}
+.ts{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-weight:400;font-size:12px;fill:#6b6b6b}
+.blue{fill:#e8eef9;stroke:#c2d1ea}
+.amber{fill:#f7ecd9;stroke:#e6d3ad}
+.neutral{fill:#f5f5f4;stroke:#d6d3d1}
+.dia{fill:#f5f5f4;stroke:#b8b8b8}
+.ln{stroke:#9a9a9a}
+</style>
+<rect x="0" y="0" width="680" height="412" fill="#ffffff"/>
+<defs>
+<marker id="a2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#9a9a9a"/></marker>
+</defs>
+
+<rect class="blue" x="250" y="36" width="180" height="44" rx="8"/>
+<text class="t" x="340" y="58" text-anchor="middle">node A → send to B</text>
+<text class="ts" x="340" y="74" text-anchor="middle">lazy connect on first packet</text>
+<line class="ln" x1="340" y1="80" x2="340" y2="98" stroke-width="1.4" marker-end="url(#a2)"/>
+
+<rect class="neutral" x="170" y="98" width="340" height="44" rx="8"/>
+<text class="t" x="340" y="120" text-anchor="middle">STUN discovery + connect nudge</text>
+<text class="ts" x="340" y="136" text-anchor="middle">via coordinator control channel</text>
+<line class="ln" x1="340" y1="142" x2="340" y2="158" stroke-width="1.4" marker-end="url(#a2)"/>
+
+<rect class="neutral" x="170" y="158" width="340" height="44" rx="8"/>
+<text class="t" x="340" y="180" text-anchor="middle">simultaneous hole-punch</text>
+<text class="ts" x="340" y="196" text-anchor="middle">PUNCH + HS · smaller pubkey initiates</text>
+<line class="ln" x1="340" y1="202" x2="340" y2="214" stroke-width="1.4" marker-end="url(#a2)"/>
+
+<polygon class="dia" points="340,214 444,258 340,302 236,258"/>
+<text class="t" x="340" y="263" text-anchor="middle">direct in ~3s?</text>
+
+<line class="ln" x1="444" y1="258" x2="540" y2="322" stroke-width="1.4" marker-end="url(#a2)"/>
+<text class="ts" x="470" y="300">yes</text>
+<line class="ln" x1="236" y1="258" x2="140" y2="322" stroke-width="1.4" marker-end="url(#a2)"/>
+<text class="ts" x="196" y="300" text-anchor="end">no</text>
+
+<rect class="blue" x="440" y="322" width="200" height="48" rx="8"/>
+<text class="t" x="540" y="345" text-anchor="middle">direct — UDP P2P</text>
+<text class="ts" x="540" y="361" text-anchor="middle">ChaCha20-Poly1305 · low latency</text>
+<rect class="amber" x="40" y="322" width="200" height="48" rx="8"/>
+<text class="t" x="140" y="345" text-anchor="middle">DERP — coordinator relay</text>
+<text class="ts" x="140" y="361" text-anchor="middle">no direct path · ciphertext</text>
+
+<line class="ln" x1="242" y1="338" x2="438" y2="338" stroke-width="1.3" marker-end="url(#a2)"/>
+<text class="ts" x="340" y="333" text-anchor="middle">re-punch → upgrade</text>
+<line class="ln" x1="438" y1="356" x2="242" y2="356" stroke-width="1.3" marker-end="url(#a2)"/>
+<text class="ts" x="340" y="369" text-anchor="middle">silent → failover</text>
+
+<text class="ts" x="340" y="398" text-anchor="middle">keepalive holds the NAT mapping open; the relay only ever sees ciphertext</text>
+</svg>

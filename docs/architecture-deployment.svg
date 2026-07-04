@@ -1,0 +1,55 @@
+<svg width="680" viewBox="0 0 680 400" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>remotemac deployment topology</title>
+<desc>A reachable host runs relay.py (:21118/tcp) and coordinator.py (:21200 tcp+udp), via docker compose or scripts/install-linux.sh. Nodes behind NAT and a public Linux exit node connect outbound to the coordinator; nodes talk directly by UDP P2P; a client routes via the exit which NAT-masquerades to the internet. Overlay 100.64.0.0/10.</desc>
+<style>
+.t{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-weight:500;font-size:14px;fill:#181818}
+.ts{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-weight:400;font-size:12px;fill:#6b6b6b}
+.blue{fill:#e8eef9;stroke:#c2d1ea}
+.amber{fill:#f7ecd9;stroke:#e6d3ad}
+.teal{fill:#dff0ec;stroke:#bfe0d8}
+.neutral{fill:#f5f5f4;stroke:#d6d3d1}
+.host{fill:#fbfbfa;stroke:#cfccc7}
+.ln{stroke:#9a9a9a}
+</style>
+<rect x="0" y="0" width="680" height="400" fill="#ffffff"/>
+<defs>
+<marker id="a3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#9a9a9a"/></marker>
+<marker id="a3s" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto"><path d="M8,0 L0,4 L8,8 Z" fill="#9a9a9a"/></marker>
+</defs>
+
+<rect class="host" x="185" y="44" width="310" height="94" rx="10"/>
+<text class="ts" x="195" y="66">reachable host — VPS / port-forwarded</text>
+<rect class="blue" x="199" y="76" width="135" height="48" rx="8"/>
+<text class="t" x="266" y="99" text-anchor="middle">relay.py</text>
+<text class="ts" x="266" y="115" text-anchor="middle">:21118 / tcp</text>
+<rect class="blue" x="346" y="76" width="135" height="48" rx="8"/>
+<text class="t" x="413" y="99" text-anchor="middle">coordinator.py</text>
+<text class="ts" x="413" y="115" text-anchor="middle">:21200 tcp+udp</text>
+<text class="ts" x="340" y="152" text-anchor="middle">deploy: docker compose  ·  scripts/install-linux.sh</text>
+
+<line class="ln" x1="115" y1="248" x2="280" y2="140" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#a3)"/>
+<line class="ln" x1="340" y1="248" x2="350" y2="140" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#a3)"/>
+<line class="ln" x1="565" y1="248" x2="470" y2="140" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#a3)"/>
+
+<rect class="teal" x="40" y="248" width="150" height="52" rx="8"/>
+<text class="t" x="115" y="271" text-anchor="middle">laptop node</text>
+<text class="ts" x="115" y="288" text-anchor="middle">behind NAT · --tun</text>
+<rect class="teal" x="265" y="248" width="150" height="52" rx="8"/>
+<text class="t" x="340" y="271" text-anchor="middle">home box node</text>
+<text class="ts" x="340" y="288" text-anchor="middle">behind NAT</text>
+<rect class="amber" x="490" y="248" width="150" height="52" rx="8"/>
+<text class="t" x="565" y="271" text-anchor="middle">exit node</text>
+<text class="ts" x="565" y="288" text-anchor="middle">Linux · public</text>
+
+<line class="ln" x1="190" y1="274" x2="265" y2="274" stroke-width="1.6" marker-end="url(#a3)" marker-start="url(#a3s)"/>
+<text class="ts" x="227" y="267" text-anchor="middle">UDP P2P</text>
+<line class="ln" x1="415" y1="274" x2="490" y2="274" stroke-width="1.6" marker-end="url(#a3)"/>
+<text class="ts" x="452" y="267" text-anchor="middle">via exit</text>
+
+<line class="ln" x1="565" y1="300" x2="565" y2="330" stroke-width="1.4" marker-end="url(#a3)"/>
+<text class="ts" x="565" y="320" text-anchor="middle">NAT masquerade</text>
+<rect class="neutral" x="505" y="332" width="120" height="28" rx="14"/>
+<text class="t" x="565" y="350" text-anchor="middle">internet</text>
+
+<text class="ts" x="40" y="382">overlay 100.64.0.0/10 · dashed = outbound control (auth + PoP) · solid = data</text>
+</svg>
