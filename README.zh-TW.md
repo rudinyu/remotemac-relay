@@ -289,6 +289,8 @@ Relay log 應出現：`host registered id=...`
 pip install mss Pillow pynput
 ```
 
+> **macOS:** viewer 可打包成有連線表單的雙擊 `.app` —— 見 [mac/README.md](mac/README.md)(`./mac/build.sh`)。
+
 ### macOS 權限設定
 
 | 端 | 需要的權限 |

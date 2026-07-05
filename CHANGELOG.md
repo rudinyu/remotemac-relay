@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **macOS app for the remote-desktop viewer** (`mac/`). A double-clickable `.app`
+  with a connection form (relay, device id, passphrase → optional login Keychain,
+  clipboard toggle) that reuses `remote_desktop.py`'s encrypted transport, built
+  with py2app (`mac/build.sh`). Also runs from source: `python3 mac/viewer_app.py`.
+  Client tooling — no change to the modules or their `__version__`.
+
 ## [2.0.0] - 2026-07-04
 
 **Breaking release.** The registration protocol changed (proof-of-possession), so

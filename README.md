@@ -297,6 +297,9 @@ The relay log should show: `host registered id=...`
 pip install mss Pillow pynput
 ```
 
+> **macOS:** the viewer can be built as a double-clickable `.app` with a connection
+> form — see [mac/README.md](mac/README.md) (`./mac/build.sh`).
+
 ### macOS permissions
 
 | Side | Permission needed |
