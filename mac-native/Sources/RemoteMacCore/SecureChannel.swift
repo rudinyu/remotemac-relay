@@ -30,6 +30,7 @@ public final class SecureChannel {
     private var sseq: UInt64 = 0
     private var rseq: UInt64 = 0
     private let maxFrame = 4 * 1024 * 1024
+    private let sendLock = NSLock()          // send() may be called from multiple threads
 
     init(sock: RMSocket, enc: [UInt8], dec: [UInt8], macSend: [UInt8], macRecv: [UInt8]) {
         self.sock = sock
@@ -40,6 +41,8 @@ public final class SecureChannel {
     }
 
     public func send(_ plaintext: [UInt8]) throws {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         let ct = enc.crypt(plaintext)
         let mac = hmacSHA256(key: macSend, beBytes(sseq) + ct)
         sseq += 1

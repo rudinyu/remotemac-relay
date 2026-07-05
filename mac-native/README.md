@@ -1,10 +1,10 @@
 # RemoteMac Viewer — pure-native (Swift)
 
 A **pure Swift** reimplementation of the client — no Python, no bundled runtime.
-This is the foundation: a verified, byte-compatible port of the encrypted transport
-(`SecureChannel`) plus the relay + auth handshake, with a CLI to prove it works
-end-to-end against a real Python host. The SwiftUI window (frame display + input) is
-the next step on top of this core.
+A verified, byte-compatible port of the encrypted transport (`SecureChannel`) plus
+the relay + auth handshake, and a native **AppKit GUI** on top: a connection form, a
+window that renders the host's screen, and mouse + keyboard forwarded back to the
+host. A headless CLI is also included and is what the interop test drives.
 
 ## Why a port (and what was the hard part)
 
@@ -17,14 +17,32 @@ SHAKE-256 are implemented from scratch here (`Scrypt.swift`, `SHAKE256.swift`) a
 
 ```bash
 cd mac-native
-swift build -c release            # builds .build/release/remotemac-viewer
+swift build -c release            # builds the CLI + the GUI executable
 swift test                        # crypto vectors: SHAKE-256, HMAC, scrypt, XOF cipher
 ./interop-test.sh                 # live end-to-end auth + frames vs a real Python host
+./build-app.sh                    # assemble "dist/RemoteMac Viewer.app" (add --run to launch)
 ```
 
 `swift test` checks the primitives against known/Python-computed vectors.
 `interop-test.sh` stands up a Python `remote_desktop._auth` host and has the Swift
 client authenticate and exchange encrypted frames both ways — proving interop.
+
+## GUI app
+
+`./build-app.sh` produces `dist/RemoteMac Viewer.app` (ad-hoc signed for local
+use). Double-click it, then fill in the connection form:
+
+- **Relay host / Port** — the relay the host is registered with.
+- **Device ID** — the host's device id (the relay pairing key).
+- **Passphrase** — the shared secret; optionally remembered in the login Keychain.
+
+On connect a window renders the host's screen (letterboxed, aspect-preserving).
+Mouse move/drag/click/scroll and keyboard (including modifiers) are forwarded to
+the host as the same `MSG_*` events the Python viewer sends. Closing the window
+ends the session and returns to the form.
+
+Not code-signed for distribution — for sharing outside your machine, sign with a
+Developer ID and notarize.
 
 ## CLI (headless client)
 
@@ -46,6 +64,8 @@ client authenticate and exchange encrypted frames both ways — proving interop.
 | `Sources/RemoteMacCore/SecureChannel.swift` | XOF cipher + framed encrypted channel |
 | `Sources/RemoteMacCore/RelayClient.swift` | relay pairing + scrypt auth handshake |
 | `Sources/remotemac-viewer/` | CLI (`authtest`, `connect`) |
+| `Sources/RemoteMacViewerApp/` | AppKit GUI (form, `Session`, `RemoteView`, Keychain) |
+| `build-app.sh` | assemble the `.app` bundle |
 | `Tests/…` | crypto vectors |
 
 ## Interop caveat
@@ -55,11 +75,14 @@ OpenSSL where Python silently falls back to PBKDF2 (`hashlib.scrypt` missing) wo
 derive a different key and fail to authenticate — run such a host with the
 `cryptography` package's scrypt, or a current OpenSSL.
 
-## Next
+## Status & limitations
 
-A SwiftUI app target on top of `RemoteMacCore`: a connection form, a window that
-renders the received JPEG frames (`MSG_FRAME`), and mouse/keyboard → `MSG_*` events.
-The transport core it needs is done and verified.
+The transport core is verified byte-compatible with Python (unit + live interop).
+The GUI compiles and is wired to that core; runtime interaction (rendering + input)
+is best confirmed against a live host on a real desktop session. Known rough edges:
 
-(There is also a py2app-packaged variant in [`../mac/`](../mac/) that bundles the
-existing Python viewer — quicker to ship, but not pure-native.)
+- Keyboard maps macOS keycodes → the same `Key.<name>` / character strings the
+  Python viewer sends; exotic keys and `⌘`-equivalents may need tuning.
+- Scroll direction follows `scrollingDeltaY` sign — flip in `RemoteView.scrollWheel`
+  if it feels inverted for your setup.
+- No clipboard sync yet (`MSG_CLIP` is received but ignored).

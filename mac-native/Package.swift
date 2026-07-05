@@ -7,6 +7,7 @@ let package = Package(
     targets: [
         .target(name: "RemoteMacCore"),
         .executableTarget(name: "remotemac-viewer", dependencies: ["RemoteMacCore"]),
+        .executableTarget(name: "RemoteMacViewerApp", dependencies: ["RemoteMacCore"]),
         .testTarget(name: "RemoteMacCoreTests", dependencies: ["RemoteMacCore"]),
     ]
 )
