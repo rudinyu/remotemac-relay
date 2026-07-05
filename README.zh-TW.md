@@ -289,6 +289,8 @@ Relay log 應出現：`host registered id=...`
 pip install mss Pillow pynput
 ```
 
+> **macOS 原生 client:** [`mac-native/`](mac-native/) 是 viewer 加密傳輸(scrypt + SHAKE-256 + HMAC)的**純 Swift 移植**,已驗證與 Python **byte 相容**(`./mac-native/interop-test.sh`)—— 原生 app 的基礎。
+
 ### macOS 權限設定
 
 | 端 | 需要的權限 |

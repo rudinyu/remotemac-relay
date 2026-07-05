@@ -297,6 +297,10 @@ The relay log should show: `host registered id=...`
 pip install mss Pillow pynput
 ```
 
+> **macOS native client:** [`mac-native/`](mac-native/) is a pure-Swift port of the
+> viewer's encrypted transport (scrypt + SHAKE-256 + HMAC), verified byte-compatible
+> with Python (`./mac-native/interop-test.sh`) — the foundation for a native app.
+
 ### macOS permissions
 
 | Side | Permission needed |

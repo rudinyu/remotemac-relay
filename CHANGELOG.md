@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Pure-Swift macOS client core** (`mac-native/`). A native SwiftPM port of the
+  viewer's encrypted transport — scrypt and SHAKE-256 implemented from scratch
+  (CryptoKit has neither), plus the SecureChannel framing and the relay + scrypt
+  auth handshake. Verified **byte-compatible with the Python protocol**: `swift test`
+  checks SHAKE-256/HMAC/scrypt/XOF-cipher vectors, and `interop-test.sh`
+  authenticates + exchanges encrypted frames against a live `remote_desktop._auth`
+  host. Ships a headless CLI (`authtest`, `connect`); the SwiftUI window is next.
+  Client tooling — no change to the server modules or their `__version__`.
+
 ## [2.0.0] - 2026-07-04
 
 **Breaking release.** The registration protocol changed (proof-of-possession), so
