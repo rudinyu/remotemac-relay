@@ -10,7 +10,7 @@ enum Keychain {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         p.arguments = args
-        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
         do { try p.run() } catch { return (-1, "") }
         p.waitUntilExit()
         let data = out.fileHandleForReading.readDataToEndOfFile()

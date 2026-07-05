@@ -70,7 +70,11 @@ final class RemoteView: NSView {
     override func mouseUp(with e: NSEvent)        { session?.sendMouseButton(0, down: false) }
     override func rightMouseDown(with e: NSEvent) { let (x, y) = norm(e); session?.sendMouseMove(xn: x, yn: y); session?.sendMouseButton(1, down: true) }
     override func rightMouseUp(with e: NSEvent)   { session?.sendMouseButton(1, down: false) }
-    override func otherMouseDown(with e: NSEvent) { if e.buttonNumber == 2 { session?.sendMouseButton(2, down: true) } }
+    override func otherMouseDown(with e: NSEvent) {
+        guard e.buttonNumber == 2 else { return }
+        let (x, y) = norm(e); session?.sendMouseMove(xn: x, yn: y)
+        session?.sendMouseButton(2, down: true)
+    }
     override func otherMouseUp(with e: NSEvent)   { if e.buttonNumber == 2 { session?.sendMouseButton(2, down: false) } }
 
     override func scrollWheel(with e: NSEvent) {
@@ -120,5 +124,15 @@ final class RemoteView: NSView {
         let down = !modsDown.contains(e.keyCode)
         if down { modsDown.insert(e.keyCode) } else { modsDown.remove(e.keyCode) }
         session?.sendKey(s, down: down)
+    }
+
+    // Losing focus mid-hold (⌘-Tab away) would otherwise leave modifiers "stuck"
+    // on the host and desync our parity — release everything we think is held.
+    override func resignFirstResponder() -> Bool {
+        for code in modsDown {
+            if let s = RemoteView.modifierKeys[code] { session?.sendKey(s, down: false) }
+        }
+        modsDown.removeAll()
+        return super.resignFirstResponder()
     }
 }

@@ -23,6 +23,8 @@ final class Session {
     private let ioQueue = DispatchQueue(label: "remotemac.session.send")   // serialises all sends
     private var running = false
     private var pingTimer: DispatchSourceTimer?
+    private let stateLock = NSLock()
+    private var finished = false
 
     /// Connect through the relay and authenticate, off the main thread. On success
     /// the receive loop starts; on failure `onDisconnect` fires with the message.
@@ -42,15 +44,18 @@ final class Session {
         }
     }
 
-    func stop() {
-        running = false
-        pingTimer?.cancel(); pingTimer = nil
-        channel?.close()
-    }
+    /// User-initiated clean stop (e.g. the viewer window was closed). Fires
+    /// `onDisconnect(nil)` exactly once, like any other teardown.
+    func stop() { finish(nil) }
 
+    /// Single idempotent teardown path — reached from a clean stop, an I/O error,
+    /// or a failed connect. Guaranteed to deliver `onDisconnect` once.
     private func finish(_ reason: String?) {
-        guard running || reason != nil else { return }
+        stateLock.lock()
+        if finished { stateLock.unlock(); return }
+        finished = true
         running = false
+        stateLock.unlock()
         pingTimer?.cancel(); pingTimer = nil
         channel?.close()
         DispatchQueue.main.async { [weak self] in self?.onDisconnect?(reason); self?.onDisconnect = nil }

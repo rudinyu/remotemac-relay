@@ -125,7 +125,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func sessionEnded(_ reason: String?) {
         connectButton.isEnabled = true
-        viewerWindow?.close(); viewerWindow = nil
+        if let vw = viewerWindow {
+            viewerWindow = nil
+            vw.delegate = nil          // avoid windowWillClose re-entering this path
+            vw.close()
+        }
         session = nil
         connectWindow.makeKeyAndOrderFront(nil)
         setStatus(reason.map { "Disconnected: \($0)" } ?? "Disconnected.", error: reason != nil)
@@ -151,7 +155,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         viewerWindow = w
-        connectWindow.orderOut(nil)
+        // Keep the connect window open (behind) so closing the viewer can't
+        // terminate the app before we can return to the form.
         w.makeKeyAndOrderFront(nil)
         w.makeFirstResponder(view)
     }
