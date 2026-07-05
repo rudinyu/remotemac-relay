@@ -6,14 +6,18 @@ All notable changes to this project are documented here. This project follows
 ## [Unreleased]
 
 ### Added
-- **Pure-Swift macOS client core** (`mac-native/`). A native SwiftPM port of the
+- **Pure-Swift native macOS viewer** (`mac-native/`). A native SwiftPM port of the
   viewer's encrypted transport — scrypt and SHAKE-256 implemented from scratch
   (CryptoKit has neither), plus the SecureChannel framing and the relay + scrypt
   auth handshake. Verified **byte-compatible with the Python protocol**: `swift test`
   checks SHAKE-256/HMAC/scrypt/XOF-cipher vectors, and `interop-test.sh`
   authenticates + exchanges encrypted frames against a live `remote_desktop._auth`
-  host. Ships a headless CLI (`authtest`, `connect`); the SwiftUI window is next.
-  Client tooling — no change to the server modules or their `__version__`.
+  host. On top of that core, a native **AppKit GUI**: a connection form (relay /
+  device / passphrase, optionally remembered in the Keychain), a window that renders
+  the host's screen, and mouse + keyboard forwarded back as the same `MSG_*` events
+  the Python viewer sends. `build-app.sh` assembles a double-clickable `.app`. A
+  headless CLI (`authtest`, `connect`) is retained for interop testing. Client
+  tooling — no change to the server modules or their `__version__`.
 
 ## [2.0.0] - 2026-07-04
 
