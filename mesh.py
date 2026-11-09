@@ -540,6 +540,12 @@ class MeshNode:
     def close(self):
         self._done.set()
         if self.ch:
+            # shutdown() first: on Linux, close() alone doesn't wake run()'s
+            # blocked recv or send a FIN, so the coordinator never sees us leave.
+            try:
+                self.ch._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             self.ch.close()
         if self.udp:
             try:
