@@ -29,6 +29,7 @@ the coordinator entirely.
 """
 import argparse
 import base64
+import collections
 import hashlib
 import hmac
 import ipaddress
@@ -39,6 +40,7 @@ import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import remote_desktop  # noqa: E402
 from remote_desktop import SecureChannel, _auth  # noqa: E402
 
 try:
@@ -51,6 +53,14 @@ __version__ = "2.0.0"
 
 OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 MAX_NODES = 1024
+
+# Admission limits for connections that haven't registered yet. Every accepted
+# connection costs a thread, and its handshake a 16 MiB scrypt run, before the
+# peer has proven anything — so bound them globally and per source IP.
+MAX_PENDING        = 64     # unregistered connections in flight, total
+MAX_PENDING_PER_IP = 4      # ... from one IP
+KDF_SLOTS          = max(2, min(os.cpu_count() or 2, 8))   # concurrent scrypt runs
+REGISTER_TIMEOUT   = 30     # seconds from accept to a completed registration
 
 # ─── control-channel JSON framing (one JSON object per SecureChannel frame) ────
 
@@ -120,12 +130,81 @@ def _verify_pop(ce_priv, nonce: bytes, pubkey_b64: str, proof_b64) -> bool:
         return False
 
 
+class _Outbox:
+    """Per-node sender thread, so one slow or stalled node can't block pushes to
+    everyone else. Map pushes are coalesced (only the latest map matters and it is
+    built when sent); relayed messages queue up to MAX_QUEUED, beyond which they
+    are dropped — DERP carries UDP-like traffic, so loss beats head-of-line
+    blocking. A send failure shuts the connection so its handler cleans up."""
+
+    MAX_QUEUED = 256
+
+    def __init__(self, ch: SecureChannel, conn: socket.socket, build_map):
+        self._ch = ch
+        self._conn = conn
+        self._build_map = build_map
+        self._cv = threading.Condition()
+        self._map_dirty = False
+        self._queue = collections.deque()
+        self._closed = False
+        self.dropped = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def push_map(self):
+        with self._cv:
+            self._map_dirty = True
+            self._cv.notify()
+
+    def put(self, obj: dict):
+        with self._cv:
+            if self._closed:
+                return
+            if len(self._queue) >= self.MAX_QUEUED:
+                self.dropped += 1
+                return
+            self._queue.append(obj)
+            self._cv.notify()
+
+    def close(self):
+        with self._cv:
+            self._closed = True
+            self._cv.notify()
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while not (self._closed or self._map_dirty or self._queue):
+                    self._cv.wait()
+                if self._closed:
+                    return
+                send_map, self._map_dirty = self._map_dirty, False
+                msgs = list(self._queue)
+                self._queue.clear()
+            try:
+                # Map first: a node ignores relayed messages from peers it
+                # doesn't know yet.
+                if send_map:
+                    send_json(self._ch, self._build_map())
+                for m in msgs:
+                    send_json(self._ch, m)
+            except Exception:
+                self.close()
+                try:
+                    self._conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
+
+
 class Coordinator:
     def __init__(self, token: bytes, allocator: IPAllocator):
         self._token = token
         self._alloc = allocator
         self._lock = threading.Lock()
         self._nodes = {}          # pubkey (b64) -> node record
+        self._pending = collections.Counter()   # source ip -> unregistered connections
+        self._pending_total = 0
+        self._kdf_slots = threading.BoundedSemaphore(KDF_SLOTS)
 
     # -- map distribution -------------------------------------------------------
 
@@ -142,19 +221,69 @@ class Coordinator:
         return {"t": "map", "self": self_info, "peers": peers}
 
     def _push_all(self):
+        # O(n) here: each node's outbox builds and sends its own map off-thread.
         with self._lock:
-            targets = list(self._nodes.items())
-        for pk, n in targets:
+            outboxes = [n["outbox"] for n in self._nodes.values()]
+        for ob in outboxes:
+            ob.push_map()
+
+    # -- admission ----------------------------------------------------------------
+
+    def accept(self, conn: socket.socket, addr) -> bool:
+        """Admit a new connection if under the pending limits (total and per IP),
+        handling it on its own thread; otherwise close it at once."""
+        ip = addr[0]
+        with self._lock:
+            if (self._pending_total >= MAX_PENDING
+                    or self._pending[ip] >= MAX_PENDING_PER_IP):
+                admitted = False
+            else:
+                self._pending_total += 1
+                self._pending[ip] += 1
+                admitted = True
+        if not admitted:
             try:
-                send_json(n["ch"], self._map_for(pk))
+                conn.close()
             except Exception:
                 pass
+            return False
+        threading.Thread(target=self._handle_admitted, args=(conn, addr), daemon=True).start()
+        return True
+
+    def _handle_admitted(self, conn: socket.socket, addr):
+        released = []
+
+        def expire():
+            # Hard registration deadline, whatever the handshake's own per-read
+            # timeouts: wakes the handler's blocked read so it gives up.
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        watchdog = threading.Timer(REGISTER_TIMEOUT, expire)
+        watchdog.daemon = True
+        watchdog.start()
+
+        def release():
+            if released:
+                return
+            released.append(True)
+            watchdog.cancel()
+            with self._lock:
+                self._pending_total -= 1
+                self._pending[addr[0]] -= 1
+                if self._pending[addr[0]] <= 0:
+                    del self._pending[addr[0]]
+        try:
+            self.handle(conn, addr, on_registered=release)
+        finally:
+            release()
 
     # -- per-connection handler -------------------------------------------------
 
-    def handle(self, conn: socket.socket, addr):
+    def handle(self, conn: socket.socket, addr, on_registered=None):
         try:
-            ch = _auth(conn, self._token, is_host=True)
+            ch = _auth(conn, self._token, is_host=True, kdf_slots=self._kdf_slots)
         except Exception:
             try:
                 conn.close()
@@ -195,15 +324,23 @@ class Coordinator:
             routes = [str(r)[:64] for r in (reg.get("routes") or [])][:32]
             record = {"ch": ch, "hostname": reg.get("hostname", "node")[:64],
                       "exit": bool(reg.get("exit")), "ip": ip,
-                      "endpoints": endpoints, "routes": routes}
+                      "endpoints": endpoints, "routes": routes,
+                      "outbox": _Outbox(ch, conn, lambda: self._map_for(pk))}
             with self._lock:
                 old = self._nodes.get(pk)
                 if old:
+                    old["outbox"].close()
                     try:
                         old["ch"].close()
                     except Exception:
                         pass
                 self._nodes[pk] = record
+            # Registered: no longer counts against the pending limits, and from
+            # here a silent channel is reaped by the idle timeout (live nodes send
+            # a control keepalive well within it).
+            if on_registered:
+                on_registered()
+            conn.settimeout(remote_desktop._IDLE_TIMEOUT)
             print(f"[coord] node up hostname={record['hostname']} ip={ip} from {addr[0]}", flush=True)
             self._push_all()
 
@@ -212,6 +349,8 @@ class Coordinator:
                 mt = msg.get("t")
                 if mt == "to":
                     self._relay(pk, msg)
+                elif mt == "ka":
+                    pass        # control keepalive — receiving it is the point
                 elif mt == "endpoints":
                     eps = [str(e)[:64] for e in (msg.get("endpoints") or [])][:16]
                     with self._lock:
@@ -222,6 +361,8 @@ class Coordinator:
         except Exception:
             pass
         finally:
+            if record is not None:
+                record["outbox"].close()
             if pk and record is not None:
                 with self._lock:
                     if self._nodes.get(pk) is record:
@@ -239,11 +380,8 @@ class Coordinator:
             peer = self._nodes.get(dst)
         if not peer:
             return
-        try:
-            send_json(peer["ch"], {"t": "from", "src": src_pk,
-                                   "kind": msg.get("kind"), "body": msg.get("body")})
-        except Exception:
-            pass
+        peer["outbox"].put({"t": "from", "src": src_pk,
+                            "kind": msg.get("kind"), "body": msg.get("body")})
 
 
 _STUN_REQ = b"MSTU"
@@ -284,7 +422,7 @@ def serve(host: str, port: int, token: bytes, state_path: str):
     try:
         while True:
             conn, addr = srv.accept()
-            threading.Thread(target=coord.handle, args=(conn, addr), daemon=True).start()
+            coord.accept(conn, addr)
     except KeyboardInterrupt:
         pass
     finally:

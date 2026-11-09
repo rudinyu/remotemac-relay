@@ -56,6 +56,7 @@ Wire frame layout:
 """
 
 import argparse
+import contextlib
 import hashlib
 import hmac as _hmac_lib
 import io
@@ -246,9 +247,12 @@ def _relay_connect(relay_addr: str, device_id: str, is_host: bool) -> socket.soc
 
 # ─── auth handshake ───────────────────────────────────────────────────────────
 
-def _auth(sock: socket.socket, psk: bytes, is_host: bool) -> SecureChannel:
+def _auth(sock: socket.socket, psk: bytes, is_host: bool, kdf_slots=None) -> SecureChannel:
     """
     Mutual challenge-response with scrypt key stretching.
+
+    `kdf_slots` (optional semaphore) bounds how many scrypt derivations run at once
+    — a server facing unauthenticated peers uses it to cap CPU/RAM (16 MiB each).
 
     Wire sequence (H = host side, C = client side):
         H → nonce_h  (32 B random)
@@ -273,13 +277,14 @@ def _auth(sock: socket.socket, psk: bytes, is_host: bool) -> SecureChannel:
 
         _log("auth: deriving keys…")
         salt = nonce_h + nonce_c
-        try:
-            master = hashlib.scrypt(psk, salt=salt,
-                                    n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=32)
-        except (AttributeError, OSError):
-            _log("[WARNING] scrypt unavailable — falling back to PBKDF2-HMAC-SHA256/200000. "
-                 "This is weaker than scrypt. Upgrade your OpenSSL to enable scrypt.")
-            master = hashlib.pbkdf2_hmac("sha256", psk, salt, 200_000, dklen=32)
+        with kdf_slots or contextlib.nullcontext():
+            try:
+                master = hashlib.scrypt(psk, salt=salt,
+                                        n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=32)
+            except (AttributeError, OSError):
+                _log("[WARNING] scrypt unavailable — falling back to PBKDF2-HMAC-SHA256/200000. "
+                     "This is weaker than scrypt. Upgrade your OpenSSL to enable scrypt.")
+                master = hashlib.pbkdf2_hmac("sha256", psk, salt, 200_000, dklen=32)
 
         enc_h2c = _expand(master, "enc-h2c")
         enc_c2h = _expand(master, "enc-c2h")

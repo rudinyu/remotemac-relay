@@ -508,7 +508,10 @@ ssh user@gw.mesh              # resolves gw's overlay IP; example.com still work
 **Flags.** `--bind` sets the UDP data-plane bind address (default `0.0.0.0`);
 `--udp-port` pins the data-plane port (default: random) — handy behind a manually
 forwarded port. The coordinator's STUN responder shares its TCP control port
-(UDP), so no extra port to open. `--tun` enables the VPN interface; `--tun-mtu`
+(UDP), so no extra port to open. The coordinator caps unregistered connections
+(64 total, 4 per IP, 30 s to register) and concurrent scrypt handshakes, and sends
+to each node from its own queue so a slow node can't stall the others; nodes send
+a control keepalive every 30 s so idle ones aren't dropped. `--tun` enables the VPN interface; `--tun-mtu`
 (default 1280) and `--tun-name` (Linux interface name, default `remotemac0`) tune it.
 `--advertise-routes CIDR,…` / `--accept-routes` enable subnet routing; `--exit`
 advertises a full-tunnel exit node and `--exit-node NAME` routes all traffic through
