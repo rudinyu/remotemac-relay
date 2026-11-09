@@ -72,6 +72,11 @@ MESH_KEEPALIVE_ACK = 0x05
 # handshake stages (first byte of an "hs" body — transport-agnostic)
 _HS_INIT  = 0x01
 _HS_RESP  = 0x02
+# hs body = [1B stage][32B ephemeral][4B sender index][AEAD part]:
+#   INIT seals an 8-byte timestamp (24 B with the tag); RESP carries a bare tag.
+_HS_INIT_LEN = 1 + 32 + 4 + 8 + 16
+_HS_RESP_LEN = 1 + 32 + 4 + 16
+_ZERO_NONCE  = b"\x00" * 12
 
 # UDP data-plane packet types (first byte of a datagram)
 _PKT_PUNCH = 0x01   # empty — opens/keeps a NAT mapping
@@ -221,14 +226,42 @@ def pub_bytes(key: X25519PrivateKey) -> bytes:
 
 # ─── handshake + session crypto ────────────────────────────────────────────────
 
+def _init_key(static: X25519PrivateKey, my_static_pub: bytes, peer_static_pub: bytes,
+              eph_pub: bytes, index: int, *, eph: X25519PrivateKey = None):
+    """Key that seals an INIT's timestamp: HKDF(es ‖ ss) bound to both statics, the
+    initiator ephemeral and its index. The initiator passes its `eph`; the
+    responder derives the same DH values from its static key. Only the holder of
+    the initiator's static key (ss) can produce an INIT the responder accepts.
+    """
+    peer_stat = X25519PublicKey.from_public_bytes(peer_static_pub)
+    ss = static.exchange(peer_stat)
+    if eph is not None:                       # initiator
+        es = eph.exchange(peer_stat)
+        i_static_pub, r_static_pub = my_static_pub, peer_static_pub
+    else:                                     # responder
+        es = static.exchange(X25519PublicKey.from_public_bytes(eph_pub))
+        i_static_pub, r_static_pub = peer_static_pub, my_static_pub
+    info = _HS_INFO + b"/init" + i_static_pub + r_static_pub + eph_pub + struct.pack(">I", index)
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(es + ss)
+
+
 def _derive(static: X25519PrivateKey, my_static_pub: bytes, peer_static_pub: bytes,
             eph: X25519PrivateKey, my_eph_pub: bytes, peer_eph_pub: bytes,
             *, initiator: bool):
-    """Triple-DH → two directional keys. Both peers derive the same pair.
+    """Triple-DH → two directional keys (tx, rx). See `_derive_keys`."""
+    return _derive_keys(static, my_static_pub, peer_static_pub, eph, my_eph_pub,
+                        peer_eph_pub, initiator=initiator)[:2]
+
+
+def _derive_keys(static: X25519PrivateKey, my_static_pub: bytes, peer_static_pub: bytes,
+                 eph: X25519PrivateKey, my_eph_pub: bytes, peer_eph_pub: bytes,
+                 *, initiator: bool):
+    """Triple-DH → (tx, rx, confirm) keys. Both peers derive the same set.
 
     ee = DH(eph_i, eph_r), se = DH(static_i, eph_r), es = DH(eph_i, static_r).
     Only holders of the respective static keys can compute se/es, so agreeing on
-    the keys mutually authenticates both static identities.
+    the keys mutually authenticates both static identities. The responder proves
+    it derived them by tagging its RESP under the confirm key.
     """
     peer_eph = X25519PublicKey.from_public_bytes(peer_eph_pub)
     peer_stat = X25519PublicKey.from_public_bytes(peer_static_pub)
@@ -246,12 +279,12 @@ def _derive(static: X25519PrivateKey, my_static_pub: bytes, peer_static_pub: byt
         i_eph_pub, r_eph_pub = peer_eph_pub, my_eph_pub
 
     transcript = i_static_pub + r_static_pub + i_eph_pub + r_eph_pub
-    material = HKDF(algorithm=hashes.SHA256(), length=64, salt=None,
+    material = HKDF(algorithm=hashes.SHA256(), length=96, salt=None,
                     info=_HS_INFO + transcript).derive(ee + se + es)
-    k_i2r, k_r2i = material[:32], material[32:]
+    k_i2r, k_r2i, k_conf = material[:32], material[32:64], material[64:]
     if initiator:
-        return k_i2r, k_r2i   # (tx, rx)
-    return k_r2i, k_i2r
+        return k_i2r, k_r2i, k_conf   # (tx, rx, confirm)
+    return k_r2i, k_i2r, k_conf
 
 
 class Session:
@@ -314,7 +347,13 @@ class PeerConn:
         self.endpoint     = None           # chosen direct (ip, port)
         self.transport    = "connecting"   # connecting | direct | derp
         self.eph          = None           # my ephemeral while initiating
-        self.resp_eph_pub = None           # my ephemeral pub as responder (resend on upgrade)
+        self.prev_session = None           # previous session, kept briefly for in-flight packets
+        self.session_born = 0.0            # monotonic time the current session was installed
+        self.init_body    = None           # my pending INIT (initiator; None when idle)
+        self.want_rekey   = False          # initiator: start a fresh handshake
+        self.last_init_ts = 0              # newest INIT timestamp accepted from the peer
+        self.last_init    = None           # that INIT's body (recognizes retransmits)
+        self.resp_body    = None           # my RESP to it (resent on a retransmit)
         self.initiated    = False
         self.queued       = []             # payloads awaiting a session
         self.last_rx      = time.monotonic()  # last authenticated packet from peer
@@ -326,8 +365,20 @@ class PeerConn:
         if via == "udp" and addr is not None:
             self.transport = "direct"
             self.endpoint  = addr
-        else:
+        elif self.session is None:
             self.transport = "derp"
+        # else: a rekey over DERP keeps whatever path is already working
+
+    def install(self, tx: bytes, rx: bytes, via, addr):
+        """Install a freshly handshaken session (caller holds self.lock); the old
+        one stays as prev_session so packets already in flight still decrypt.
+        Returns the payloads queued while no session existed."""
+        self.bind_transport(via, addr)
+        self.prev_session = self.session
+        self.session      = Session(tx, rx)
+        self.session_born = time.monotonic()
+        self.last_rx      = self.session_born
+        return self.flush()
 
     def flush(self):
         q, self.queued = self.queued, []
@@ -372,6 +423,9 @@ class MeshNode:
         self.keepalive_interval = 15.0   # send a keepalive on an idle direct path
         self.direct_timeout     = 45.0   # silence before a direct path is failed
         self.direct_retry_interval = 30.0  # re-punch cadence for a relayed path
+        self.rekey_after        = 120.0  # initiator re-handshakes a session this old
+        self.prev_session_ttl   = 10.0   # keep the replaced session this long after a rekey
+        self._last_ts = 0                # last INIT timestamp sent (strictly increasing)
         self.on_message = None     # optional callback(peer_pk_b64, msg_type, body)
         self.on_ip_packet = None   # optional callback(peer_pk_b64, raw_ip_packet) for MESH_IP
         self.on_routes_changed = None  # optional callback(added_cidrs, removed_cidrs)
@@ -677,15 +731,25 @@ class MeshNode:
             return
         if kind == "connect":
             # Peer wants a path to us: start punching (opens our NAT) and, if we
-            # are the designated initiator, drive the handshake.
-            self._ensure_connecting(self._get_conn(src))
-        elif kind == "hs" and len(body) >= 37:
-            stage, eph, index = body[0], body[1:33], struct.unpack(">I", body[33:37])[0]
-            self._handle_hs(src, self._peer_static(src), stage, eph, index, "derp", None)
+            # are the designated initiator, drive the handshake. A 0x01 flag means
+            # the peer has no session (e.g. it restarted) — any session we still
+            # hold for it is stale, so the initiator must re-handshake.
+            pc = self._get_conn(src)
+            if body[:1] == b"\x01" and pc.session is not None and self._am_initiator(pc.peer_static):
+                self._request_rekey(pc)
+            else:
+                self._ensure_connecting(pc)
+        elif kind == "hs" and body:
+            self._handle_hs(src, self._peer_static(src), body, "derp", None)
         elif kind == "data" and body:
-            pc = self._conns.get(src)
-            if pc and pc.session:
-                self._recv_data(pc, body)
+            pc = self._get_conn(src)
+            if pc.session:
+                self._recv_data(pc, body, "derp", None)
+            else:
+                # DERP data is attributed to `src` by the coordinator, so a sessionless
+                # arrival means the peer holds a session we lost (we restarted) — ask
+                # for a fresh handshake.
+                self._ensure_connecting(pc)
 
     # -- inbound: UDP data plane ------------------------------------------------
 
@@ -705,86 +769,124 @@ class MeshNode:
         t = data[0]
         if t == _PKT_PUNCH:
             return
-        if t == _PKT_HS and len(data) >= 33 + 37:
+        if t == _PKT_HS and len(data) >= 33 + _HS_RESP_LEN:
             static = data[1:33]
             peer_pk = _b64(static)
             if peer_pk not in self.peers:
                 return
-            body = data[33:]
-            stage, eph, index = body[0], body[1:33], struct.unpack(">I", body[33:37])[0]
-            self._handle_hs(peer_pk, static, stage, eph, index, "udp", addr)
+            self._handle_hs(peer_pk, static, data[33:], "udp", addr)
         elif t == _PKT_DATA and len(data) >= 5:
             index = struct.unpack(">I", data[1:5])[0]
             pc = self._by_index.get(index)
             if pc and pc.session:
-                self._recv_data(pc, data[5:])
+                self._recv_data(pc, data[5:], "udp", addr)
 
     # -- handshake state machine (shared by both transports) --------------------
+    #
+    # Handshake messages never move an established path: a direct endpoint is only
+    # adopted from a fresh authenticated INIT/RESP that installs a session, or from
+    # an authenticated, non-replayed DATA packet (see _recv_data). Replayed or
+    # forged handshake packets therefore can't redirect or squat a session.
 
-    def _handle_hs(self, peer_pk, peer_static, stage, peer_eph, peer_index, via, addr):
-        pc = self._get_conn(peer_pk)
-        if stage == _HS_INIT:
-            with pc.lock:
-                if pc.session is None:
-                    eph = X25519PrivateKey.generate()
-                    tx, rx = _derive(self._id, self._pub, peer_static,
-                                     eph, pub_bytes(eph), peer_eph, initiator=False)
-                    pc.session = Session(tx, rx)
-                    pc.remote_index = peer_index
-                    pc.resp_eph_pub = pub_bytes(eph)
-                    pc.bind_transport(via, addr)
-                    queued = pc.flush()
-                else:
-                    # Session already up (likely over DERP). A retransmitted INIT
-                    # arriving over UDP proves a working direct path — upgrade.
-                    self._upgrade_if_udp(pc, via, addr)
-                    queued = []
-                resp_eph_pub = pc.resp_eph_pub
-            # Answer with the real responder ephemeral so the peer can (re)derive
-            # or re-confirm the path. If we never acted as responder for this peer
-            # (resp_eph_pub is None — e.g. an unexpected INIT toward the initiator),
-            # drop it rather than fabricate a meaningless key.
-            if resp_eph_pub is not None:
-                self._send_hs(pc, self._hs_body(_HS_RESP, resp_eph_pub, pc.local_index), via, addr)
-            for payload in queued:
-                self._transmit(pc, payload)
-        elif stage == _HS_RESP:
-            with pc.lock:
-                if pc.session is None:
-                    if pc.eph is None:
-                        return
-                    tx, rx = _derive(self._id, self._pub, peer_static,
-                                     pc.eph, pub_bytes(pc.eph), peer_eph, initiator=True)
-                    pc.session = Session(tx, rx)
-                    pc.remote_index = peer_index
-                    pc.bind_transport(via, addr)
-                    queued = pc.flush()
-                else:
-                    self._upgrade_if_udp(pc, via, addr)
-                    queued = []
-            for payload in queued:
-                self._transmit(pc, payload)
+    def _handle_hs(self, peer_pk, peer_static, body, via, addr):
+        stage = body[0]
+        if stage == _HS_INIT and len(body) == _HS_INIT_LEN:
+            self._on_init(peer_pk, peer_static, body, via, addr)
+        elif stage == _HS_RESP and len(body) == _HS_RESP_LEN:
+            self._on_resp(peer_pk, peer_static, body, via, addr)
+        else:
+            return
         # If the exit peer's transport just changed (e.g. a newly punched direct
         # endpoint), re-pin transport promptly instead of waiting for the resync.
         if self.on_transport_ips_changed and peer_pk == self.exit_node_pk:
             self.on_transport_ips_changed(self.transport_ips())
 
-    @staticmethod
-    def _upgrade_if_udp(pc, via, addr):
-        """Confirm a working direct endpoint for an already-established session,
-        transparently switching a DERP-relayed path over to UDP. Caller holds pc.lock."""
-        if via == "udp" and addr is not None:
-            pc.endpoint = addr
-            pc.transport = "direct"
-            pc.last_rx = time.monotonic()   # fresh direct path — don't instantly re-fail
+    def _new_init(self, pc) -> bytes:
+        """Start a handshake as initiator: fresh ephemeral + a strictly increasing
+        timestamp sealed under the INIT key. Caller holds pc.lock."""
+        eph = X25519PrivateKey.generate()
+        eph_pub = pub_bytes(eph)
+        with self._lock:
+            self._last_ts = max(time.time_ns(), self._last_ts + 1)
+            ts = self._last_ts
+        key = _init_key(self._id, self._pub, pc.peer_static, eph_pub, pc.local_index, eph=eph)
+        sealed = ChaCha20Poly1305(key).encrypt(_ZERO_NONCE, struct.pack(">Q", ts), None)
+        pc.eph = eph
+        pc.init_body = self._hs_body(_HS_INIT, eph_pub, pc.local_index) + sealed
+        pc.want_rekey = False
+        return pc.init_body
 
-    def _recv_data(self, pc, body):
-        try:
-            pt = pc.session.decrypt(body)
-        except Exception as exc:
-            _log(f"data decrypt from {pc.peer_pk[:12]}…: {exc}")
+    def _on_init(self, peer_pk, peer_static, body, via, addr):
+        pc = self._get_conn(peer_pk)
+        peer_eph, peer_index = body[1:33], struct.unpack(">I", body[33:37])[0]
+        queued = []
+        with pc.lock:
+            if body == pc.last_init:
+                # Retransmit of the INIT we already answered (e.g. sprayed to several
+                # endpoints, or a lost RESP): resend the same RESP, change nothing.
+                resp = pc.resp_body
+            else:
+                try:
+                    key = _init_key(self._id, self._pub, peer_static, peer_eph, peer_index)
+                    ts = struct.unpack(">Q", ChaCha20Poly1305(key).decrypt(
+                        _ZERO_NONCE, body[37:], None))[0]
+                except Exception:
+                    return                        # forged / corrupt INIT
+                if ts <= pc.last_init_ts:
+                    return                        # replayed or stale INIT
+                eph = X25519PrivateKey.generate()
+                eph_pub = pub_bytes(eph)
+                tx, rx, conf = _derive_keys(self._id, self._pub, peer_static,
+                                            eph, eph_pub, peer_eph, initiator=False)
+                head = self._hs_body(_HS_RESP, eph_pub, pc.local_index)
+                resp = head + ChaCha20Poly1305(conf).encrypt(_ZERO_NONCE, b"", head)
+                pc.last_init_ts, pc.last_init, pc.resp_body = ts, body, resp
+                pc.remote_index = peer_index
+                queued = pc.install(tx, rx, via, addr)
+        self._send_hs(pc, resp, via, addr)
+        for payload in queued:
+            self._transmit(pc, payload)
+
+    def _on_resp(self, peer_pk, peer_static, body, via, addr):
+        pc = self._get_conn(peer_pk)
+        with pc.lock:
+            if pc.eph is None or pc.init_body is None:
+                return                            # no handshake pending (dup/stray RESP)
+            try:
+                tx, rx, conf = _derive_keys(self._id, self._pub, peer_static,
+                                            pc.eph, pub_bytes(pc.eph), body[1:33],
+                                            initiator=True)
+                ChaCha20Poly1305(conf).decrypt(_ZERO_NONCE, body[37:], body[:37])
+            except Exception:
+                return                            # not a RESP to our pending INIT
+            pc.remote_index = struct.unpack(">I", body[33:37])[0]
+            pc.eph = pc.init_body = None
+            queued = pc.install(tx, rx, via, addr)
+        for payload in queued:
+            self._transmit(pc, payload)
+
+    def _recv_data(self, pc, body, via, addr):
+        pt = None
+        for sess in (pc.session, pc.prev_session):
+            if sess is None:
+                continue
+            try:
+                pt = sess.decrypt(body)
+                break
+            except Exception:
+                continue
+        if pt is None:
+            _log(f"data decrypt from {pc.peer_pk[:12]}… failed")
             return
         pc.last_rx = time.monotonic()   # authenticated traffic ⇒ path is alive
+        if via == "udp" and addr is not None:
+            # Authenticated, non-replayed data over UDP proves a working direct path
+            # (this is how a DERP session upgrades, and how a roaming peer moves).
+            with pc.lock:
+                moved = pc.transport != "direct" or pc.endpoint != addr
+                pc.transport, pc.endpoint = "direct", addr
+            if moved and self.on_transport_ips_changed and pc.peer_pk == self.exit_node_pk:
+                self.on_transport_ips_changed(self.transport_ips())
         if not pt:
             return
         mtype, payload = pt[0], pt[1:]
@@ -823,6 +925,15 @@ class MeshNode:
         else:
             self._relay_to(pc.peer_pk, "data", packet)
 
+    def _probe(self, pc, ep):
+        """Send an authenticated keepalive straight to a candidate endpoint. If it
+        gets through, the peer adopts the path and its ACK lets us adopt it too."""
+        try:
+            packet = pc.session.encrypt(bytes([MESH_KEEPALIVE]))
+            self.udp.sendto(bytes([_PKT_DATA]) + struct.pack(">I", pc.remote_index) + packet, ep)
+        except Exception:
+            pass
+
     def send(self, dst_pk: str, mtype: int, payload: bytes = b""):
         """Send an encrypted mesh message to a peer, handshaking if needed."""
         data = bytes([mtype]) + payload
@@ -841,6 +952,16 @@ class MeshNode:
         peers agree, so glare (simultaneous initiation) can't produce two sessions."""
         return self._pub < peer_static
 
+    def _request_rekey(self, pc):
+        """Initiator: replace the current session with a fresh handshake (periodic
+        rekey, a silent path, or a peer that lost its session)."""
+        with pc.lock:
+            if pc.init_body is not None:
+                return                            # a handshake is already in flight
+            pc.want_rekey = True
+            pc.initiated = False                  # let a new connect worker start
+        self._ensure_connecting(pc)
+
     def _ensure_connecting(self, pc):
         """Start (once) the connect worker that punches and drives the handshake."""
         with pc.lock:
@@ -856,25 +977,27 @@ class MeshNode:
     def _connect_worker(self, pc):
         """Establish a path to the peer: nudge it to punch back, spray PUNCH + (if
         we are the designated initiator) HS at every candidate endpoint, and fall
-        back to a DERP-relayed handshake if no direct path forms in time."""
+        back to a DERP-relayed handshake if no direct path forms in time. With a
+        session already up, probe candidates with authenticated keepalives instead
+        so a relayed path can upgrade to direct."""
         am_init = self._am_initiator(pc.peer_static)
-        # Nudge the peer to start punching toward us (opens their NAT mapping).
+        # Nudge the peer to start punching toward us (opens their NAT mapping);
+        # flag 0x01 tells it we have no session, so a stale one must be replaced.
         try:
-            self._relay_to(pc.peer_pk, "connect", b"")
+            self._relay_to(pc.peer_pk, "connect", b"" if pc.session else b"\x01")
         except Exception:
             pass
-        init_body = None
-        if am_init:
-            with pc.lock:
-                if pc.eph is None:
-                    pc.eph = X25519PrivateKey.generate()
-                init_body = self._hs_body(_HS_INIT, pub_bytes(pc.eph), pc.local_index)
 
         start = time.monotonic()
         derp_sent = False
         while not self._done.is_set():
             elapsed = time.monotonic() - start
-            if pc.transport == "direct":
+            with pc.lock:
+                if am_init and pc.init_body is None and (pc.session is None or pc.want_rekey):
+                    self._new_init(pc)
+                    derp_sent = False
+                init_body = pc.init_body if am_init else None
+            if pc.transport == "direct" and init_body is None:
                 return                          # direct path locked in — done
             eps = self._peer_endpoints(pc.peer_pk)
             for ep in eps:
@@ -882,14 +1005,16 @@ class MeshNode:
                     self.udp.sendto(bytes([_PKT_PUNCH]), ep)   # keep NAT mapping open
                 except Exception:
                     pass
-                if am_init:
+                if init_body is not None:
                     try:
                         self.udp.sendto(bytes([_PKT_HS]) + self._pub + init_body, ep)
                     except Exception:
                         pass
+                elif pc.session is not None and pc.transport != "direct":
+                    self._probe(pc, ep)
             # DERP fallback: if direct is impossible (no endpoints) or just slow
-            # (>3s), establish a relayed session so queued data isn't stuck.
-            if (am_init and not derp_sent and pc.session is None
+            # (>3s), run the handshake over the relay so queued data isn't stuck.
+            if (init_body is not None and not derp_sent
                     and (not eps or elapsed >= 3.0)):
                 self._relay_to(pc.peer_pk, "hs", init_body)
                 derp_sent = True
@@ -899,24 +1024,25 @@ class MeshNode:
 
         # Gave up on establishing/restoring a direct path. Re-arm so a later
         # _ensure_connecting() (fresh send, or a keepalive-loop retry) can try
-        # again. This must NOT be gated on session state: after a failover the
-        # session is deliberately reused (non-None), yet the direct path still
-        # needs to be retryable. Only a brand-new handshake needs a fresh
-        # ephemeral, so clear eph only when there is no session.
-        if pc.transport != "direct":
-            with pc.lock:
+        # again; an unanswered handshake is abandoned (the next one gets a fresh
+        # ephemeral + timestamp).
+        with pc.lock:
+            if pc.init_body is not None:
+                pc.eph = pc.init_body = None
                 pc.initiated = False
-                if pc.session is None:
-                    pc.eph = None
+            elif pc.transport != "direct":
+                pc.initiated = False
 
     def _keepalive_loop(self):
-        """Keep established direct paths warm, and fail silent ones over to DERP.
+        """Keep established direct paths warm, fail silent ones over to DERP, and
+        rekey sessions.
 
         On a direct path we send a keepalive when it goes idle (holds the NAT
         mapping open and probes liveness). If nothing authenticated arrives for
         `direct_timeout`, the path is presumed dead: we drop back to the DERP
-        relay (reusing the same session) and re-arm hole punching to try direct
-        again."""
+        relay and re-arm hole punching to try direct again. The initiator also
+        re-handshakes then (the peer may have restarted and lost the session) and
+        every `rekey_after` seconds."""
         while not self._done.wait(self._ka_tick):
             now = time.monotonic()
             with self._lock:
@@ -924,15 +1050,22 @@ class MeshNode:
             for pc in conns:
                 if pc.session is None:
                     continue
+                am_init = self._am_initiator(pc.peer_static)
+                if pc.prev_session is not None and now - pc.session_born > self.prev_session_ttl:
+                    pc.prev_session = None
+                if am_init and now - pc.session_born > self.rekey_after:
+                    self._request_rekey(pc)
                 if pc.transport == "direct":
                     if now - pc.last_rx > self.direct_timeout:
                         _log(f"direct path to {pc.peer_pk[:12]}… went silent — failing over to DERP")
                         with pc.lock:
                             pc.transport = "derp"
                             pc.initiated = False
-                            pc.eph = None
                         pc.last_retry = now
-                        self._ensure_connecting(pc)   # immediately try to restore direct
+                        if am_init:
+                            self._request_rekey(pc)
+                        else:
+                            self._ensure_connecting(pc)   # immediately try to restore direct
                     elif now - pc.last_ka >= self.keepalive_interval:
                         pc.last_ka = now
                         self.send(pc.peer_pk, MESH_KEEPALIVE, b"")

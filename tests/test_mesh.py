@@ -2,6 +2,7 @@
 
 import os
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -81,6 +82,29 @@ class TestHandshake(unittest.TestCase):
         self.assertEqual(b.decrypt(ct), b"once")
         with self.assertRaises(ValueError):
             b.decrypt(ct)   # replay of the same counter
+
+
+    def test_init_key_matches_and_binds_initiator(self):
+        s_i, s_r, imposter = (X25519PrivateKey.generate() for _ in range(3))
+        e_i = X25519PrivateKey.generate()
+        pi, pr, ei = mesh.pub_bytes(s_i), mesh.pub_bytes(s_r), mesh.pub_bytes(e_i)
+        k_i = mesh._init_key(s_i, pi, pr, ei, 9, eph=e_i)
+        self.assertEqual(k_i, mesh._init_key(s_r, pr, pi, ei, 9))
+        # Someone without s_i (claiming pi) can't produce the responder's key.
+        k_x = mesh._init_key(imposter, pi, pr, ei, 9, eph=e_i)
+        self.assertNotEqual(k_x, mesh._init_key(s_r, pr, pi, ei, 9))
+        # The sender index is bound in.
+        self.assertNotEqual(k_i, mesh._init_key(s_r, pr, pi, ei, 10))
+
+    def test_derive_keys_confirm_key_agrees(self):
+        s_i, s_r = X25519PrivateKey.generate(), X25519PrivateKey.generate()
+        e_i, e_r = X25519PrivateKey.generate(), X25519PrivateKey.generate()
+        pi, pr = mesh.pub_bytes(s_i), mesh.pub_bytes(s_r)
+        ei, er = mesh.pub_bytes(e_i), mesh.pub_bytes(e_r)
+        ki = mesh._derive_keys(s_i, pi, pr, e_i, ei, er, initiator=True)
+        kr = mesh._derive_keys(s_r, pr, pi, e_r, er, ei, initiator=False)
+        self.assertEqual(ki[2], kr[2])
+        self.assertEqual(len({ki[0], ki[1], ki[2]}), 3)
 
 
 @unittest.skipUnless(_HAVE_CRYPTO, "cryptography not installed")
@@ -202,8 +226,8 @@ class TestMeshEndToEnd(unittest.TestCase):
             pass
 
     def _node(self, name, advertise_routes=None, accept_routes=False,
-              is_exit=False, exit_node=None):
-        n = mesh.MeshNode(X25519PrivateKey.generate(), name, is_exit=is_exit,
+              is_exit=False, exit_node=None, identity=None):
+        n = mesh.MeshNode(identity or X25519PrivateKey.generate(), name, is_exit=is_exit,
                           advertise_routes=advertise_routes)
         n.accept_routes = accept_routes
         n.exit_node_name = exit_node
@@ -258,11 +282,12 @@ class TestMeshEndToEnd(unittest.TestCase):
 
     def test_derp_to_direct_upgrade(self):
         # A session that first forms over DERP must transparently upgrade to a
-        # direct UDP endpoint when a handshake later arrives over UDP — reusing
-        # the SAME session (not rebuilding it) and flipping transport to direct.
+        # direct UDP path once one is reachable — reusing the SAME session (not
+        # rebuilding it). Unauthenticated handshake bytes over UDP must NOT move it.
         a = self._node("up-a")
         b = self._node("up-b")
         self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        real_a_eps, real_b_eps = a._peer_endpoints, b._peer_endpoints
         a._peer_endpoints = lambda pk: []
         b._peer_endpoints = lambda pk: []
 
@@ -274,21 +299,27 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertEqual(a._conns[da].transport, "derp")
         db = b.resolve("up-a")
         self.assertTrue(self._wait(lambda: b._conns.get(db) and b._conns[db].session))
+        pa, pb = a._conns[da], b._conns[db]
+        sa, sb = pa.session, pb.session
 
-        def _upgrade(node, peer, stage):
-            pc = node._conns[peer]
-            sess = pc.session
-            fake = ("127.0.0.1", 40000)
-            node._handle_hs(peer, node._peer_static(peer), stage,
-                            b"\x11" * 32, 4242, "udp", fake)
-            self.assertIs(pc.session, sess, "session was rebuilt, not upgraded")
-            self.assertEqual(pc.transport, "direct")
-            self.assertEqual(pc.endpoint, fake)
+        # Junk handshakes over UDP (both stages) are ignored on both sides.
+        fake = ("127.0.0.1", 40000)
+        for node, peer, pc, sess in ((a, da, pa, sa), (b, db, pb, sb)):
+            for stage, n in ((mesh._HS_INIT, mesh._HS_INIT_LEN), (mesh._HS_RESP, mesh._HS_RESP_LEN)):
+                node._handle_hs(peer, node._peer_static(peer),
+                                bytes([stage]) + b"\x11" * (n - 1), "udp", fake)
+            self.assertIs(pc.session, sess, "junk handshake replaced the session")
+            self.assertEqual(pc.transport, "derp", "junk handshake moved the path")
 
-        # The initiator would receive a RESP over UDP; the responder, an INIT.
-        a_is_init = a._am_initiator(a._peer_static(da))
-        _upgrade(a, da, mesh._HS_RESP if a_is_init else mesh._HS_INIT)
-        _upgrade(b, db, mesh._HS_INIT if a_is_init else mesh._HS_RESP)
+        # Reachability returns → authenticated probes upgrade both sides to direct.
+        a._peer_endpoints, b._peer_endpoints = real_a_eps, real_b_eps
+        with pa.lock:
+            pa.initiated = False
+        a._ensure_connecting(pa)
+        self.assertTrue(self._wait(lambda: pa.transport == "direct" and pb.transport == "direct", 8),
+                        "DERP session did not upgrade to direct")
+        self.assertIs(pa.session, sa, "session was rebuilt, not upgraded")
+        self.assertIs(pb.session, sb, "session was rebuilt, not upgraded")
 
     def test_direct_failover_to_derp_on_silence(self):
         # A direct path that goes silent must fail over to the DERP relay so
@@ -304,14 +335,23 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertTrue(got.wait(6), "direct path did not form")
         self.assertEqual(a._conns[da].transport, "direct")
 
-        # No reachable endpoints to re-punch → failover must stick on DERP;
-        # mark the path silent and speed up the liveness loop.
+        # Simulate a real outage of the direct path: UDP between the two is
+        # dropped (authenticated UDP that still got through would rightly keep
+        # the path direct) and there are no endpoints to re-punch, so failover
+        # must stick on DERP. Mark the path silent on both ends and speed up the
+        # liveness loop.
+        db = b.resolve("fo-a")
+        a._on_udp = lambda data, addr: None
+        b._on_udp = lambda data, addr: None
         a._peer_endpoints = lambda pk: []
         b._peer_endpoints = lambda pk: []
-        a._ka_tick = 0.05
-        a.direct_timeout = 0.2
-        a.keepalive_interval = 0.1
+        for n in (a, b):
+            n._ka_tick = 0.05
+            n.direct_timeout = 0.2
+            n.keepalive_interval = 0.1
         a._conns[da].last_rx = time.monotonic() - 100
+        b._conns[db].last_rx = time.monotonic() - 100
+        self.assertTrue(self._wait(lambda: b._conns[db].transport == "derp", 5))
 
         self.assertTrue(self._wait(lambda: a._conns[da].transport == "derp", 5),
                         "did not fail over to DERP on silence")
@@ -378,6 +418,130 @@ class TestMeshEndToEnd(unittest.TestCase):
 
         self.assertTrue(a_pong.wait(6), "a did not get a PONG (glare broke keys?)")
         self.assertTrue(b_pong.wait(6), "b did not get a PONG (glare broke keys?)")
+
+    # -- handshake authentication + session lifecycle ---------------------------
+
+    def _pinger(self, node):
+        ev = threading.Event()
+        node.on_message = lambda s, mt, pl: ev.set() if mt == mesh.MESH_PONG else None
+        return ev
+
+    def _pair_ping(self, a, b, timeout=6):
+        """Ping a→b and b→a, retrying like real traffic would (a packet sent on a
+        stale session just before a rekey is lost); return (a_ok, b_ok)."""
+        a_pong, b_pong = self._pinger(a), self._pinger(b)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end and not (a_pong.is_set() and b_pong.is_set()):
+            if not a_pong.is_set():
+                a.send(b.pubkey_b64, mesh.MESH_PING, b"a")
+            if not b_pong.is_set():
+                b.send(a.pubkey_b64, mesh.MESH_PING, b"b")
+            time.sleep(0.5)
+        return a_pong.is_set(), b_pong.is_set()
+
+    def _restart_and_ping(self, restart_initiator):
+        a = self._node("rs-a")
+        b = self._node("rs-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        self.assertEqual(self._pair_ping(a, b), (True, True), "initial session failed")
+
+        a_is_init = a._am_initiator(b._pub)
+        victim, survivor = (a, b) if a_is_init == restart_initiator else (b, a)
+        # Restart the victim with the SAME identity (process restart): its new
+        # instance has no session, while the survivor still holds the old one.
+        key, name = victim._id, victim.hostname
+        victim.close()
+        self.nodes.remove(victim)
+        self.assertTrue(self._wait(lambda: victim.pubkey_b64 not in survivor.peers))
+        reborn = self._node(name, identity=key)
+        self.assertTrue(self._wait(lambda: reborn.pubkey_b64 in survivor.peers
+                                   and survivor.pubkey_b64 in reborn.peers))
+        ok = self._pair_ping(reborn, survivor, timeout=8)
+        self.assertEqual(ok, (True, True),
+                         "peer pair did not recover after a restart (stale session)")
+
+    def test_restart_of_responder_recovers(self):
+        self._restart_and_ping(restart_initiator=False)
+
+    def test_restart_of_initiator_recovers(self):
+        self._restart_and_ping(restart_initiator=True)
+
+    def test_periodic_rekey_replaces_session_and_traffic_flows(self):
+        a = self._node("rk-a")
+        b = self._node("rk-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        self.assertEqual(self._pair_ping(a, b), (True, True))
+        init, resp = (a, b) if a._am_initiator(b._pub) else (b, a)
+        pi = init._conns[resp.pubkey_b64]
+        pr = resp._conns[init.pubkey_b64]
+        old_i, old_r = pi.session, pr.session
+        init._ka_tick = 0.05
+        init.rekey_after = 0.3
+        self.assertTrue(self._wait(lambda: pi.session is not old_i and pr.session is not old_r, 5),
+                        "initiator did not rekey")
+        init.rekey_after = 120.0
+        self.assertEqual(self._pair_ping(a, b), (True, True), "traffic broke after rekey")
+        self.assertEqual(pi.transport, "direct")
+
+    def test_forged_init_cannot_squat_session(self):
+        # Anyone who learns a peer's static pubkey (it travels in cleartext in UDP
+        # handshake packets) must not be able to plant a session on the responder
+        # that blocks the real handshake.
+        a = self._node("sq-a")
+        b = self._node("sq-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        init, resp = (a, b) if a._am_initiator(b._pub) else (b, a)
+
+        forger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        forger.bind(("127.0.0.1", 0))
+        fake_eph = mesh.pub_bytes(X25519PrivateKey.generate())
+        body = bytes([mesh._HS_INIT]) + fake_eph + struct.pack(">I", 7) + os.urandom(24)
+        forger.sendto(bytes([mesh._PKT_HS]) + init._pub + body,
+                      ("127.0.0.1", resp.udp.getsockname()[1]))
+        forger.close()
+        time.sleep(0.3)
+        pc = resp._conns.get(init.pubkey_b64)
+        self.assertTrue(pc is None or pc.session is None,
+                        "forged INIT installed a session")
+        self.assertEqual(self._pair_ping(a, b), (True, True),
+                         "real handshake blocked after a forged INIT")
+
+    def test_replayed_init_does_not_move_endpoint(self):
+        # Replaying a captured INIT from another address must not redirect the
+        # responder's direct path to the attacker.
+        a = self._node("rp-a")
+        b = self._node("rp-b")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and a.pubkey_b64 in b.peers))
+        init, resp = (a, b) if a._am_initiator(b._pub) else (b, a)
+
+        captured = []
+        real_sendto = init.udp.sendto
+
+        class _Tap:
+            def __getattr__(self, n):
+                return getattr(init.udp_real, n)
+
+            def sendto(self, data, addr):
+                if data[:1] == bytes([mesh._PKT_HS]):
+                    captured.append(data)
+                return real_sendto(data, addr)
+        init.udp_real = init.udp
+        init.udp = _Tap()
+
+        self.assertEqual(self._pair_ping(init, resp), (True, True))
+        self.assertTrue(captured, "no INIT captured")
+        pc = resp._conns[init.pubkey_b64]
+        self.assertTrue(self._wait(lambda: pc.transport == "direct"))
+
+        attacker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        attacker.bind(("127.0.0.1", 0))
+        evil = attacker.getsockname()
+        for pkt in captured:
+            attacker.sendto(pkt, ("127.0.0.1", resp.udp.getsockname()[1]))
+        time.sleep(0.3)
+        attacker.close()
+        self.assertNotEqual(pc.endpoint, evil, "replayed INIT moved the direct endpoint")
+        self.assertEqual(self._pair_ping(init, resp), (True, True))
 
     def test_initiator_tie_break_is_symmetric(self):
         a = self._node("tb-a")

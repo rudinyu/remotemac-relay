@@ -423,7 +423,7 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 ```
 
 - 每個節點有持久的 X25519 身份(`~/.config/remotemac/mesh/key`,可用 `$REMOTEMAC_MESH_KEY` 覆寫);coordinator 從 `100.64.0.0/10` 配發 overlay IP。
-- 節點間握手是雙向認證 + 前向保密(X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305)。
+- 節點間握手是雙向認證 + 前向保密(X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305)。INIT 本身經過認證並帶時間戳(偽造或重放的握手一律丟棄),RESP 帶金鑰確認;session 每 2 分鐘換鑰,peer 重啟後可自動恢復;直連路徑只會因「已認證且非重放的資料封包」而變更。
 - **P2P 直連(Phase 2)**:節點透過向 coordinator 做 STUN-lite 探測得知自己的公網端點,互換候選端點後**同時打洞建立 UDP 直連**(以 pubkey 定序避免握手 glare)。之後資料在兩節點間直送。若數秒內打不通(例如雙方對稱 NAT),流量會**透明回退到 coordinator relay(DERP)** —— relay 全程只看得到密文。keepalive 維持 NAT 映射;直連靜默會回退 DERP,並週期性重新打洞,連通恢復時再升級回直連。
 - **TUN overlay(Phase 3)**:加上 `--tun`(需 root)後,節點會開一個虛擬網卡、綁上自己的 overlay IP、並把 `100.64.0.0/10` 路由過去 —— 讓**真實 app 直接用 overlay IP 連 peer**(`ping 100.64.0.x`、`ssh`、http),不再只有內建 `--ping`。核心的 IP 封包走同一條加密 P2P/DERP 資料路徑。macOS 用 `utun`(免 kext),Linux 用 `/dev/net/tun`。peer 只能送出「來源是自己 overlay IP」的封包(anti-spoof)。
 - **子網路由(Phase 4)**:節點可當 **subnet router**:用 `--advertise-routes 192.168.1.0/24` 宣告它能連到的 LAN 網段,並(在 Linux)開 IP forwarding + nftables masquerade,讓其他節點連到它「背後」的主機。client 用 `--accept-routes` 選擇接受,把那些 CIDR 的路由指到 TUN,匹配的封包就送給該 peer。**只有被宣告的網段走 mesh,預設路由不動**。與 overlay 重疊、或包含 coordinator / peer endpoint 的宣告 CIDR 會被拒絕(避免 mesh 傳輸迴圈);subnet router 可送出「來源在你接受的路由內」的回包(其餘 anti-spoof 照舊)。

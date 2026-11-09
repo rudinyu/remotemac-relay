@@ -5,6 +5,24 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Security
+- **Authenticated mesh handshake + session lifecycle.** The node↔node INIT now
+  carries an AEAD-sealed, strictly increasing timestamp keyed from
+  DH(eph_i, static_r) ‖ DH(static_i, static_r), and the RESP carries a key-confirmation
+  tag. Previously anyone who knew a peer's static pubkey (it travels in cleartext in
+  UDP handshakes) could plant an unusable session on the responder that blocked the
+  real handshake forever, and a replayed INIT from any address redirected the
+  responder's direct path. A direct endpoint is now adopted only from a fresh
+  handshake or an authenticated, non-replayed DATA packet (DERP→direct upgrades use
+  authenticated keepalive probes).
+- **Sessions are replaced and rekeyed.** A fresh authenticated INIT replaces an
+  existing session (the old one is kept briefly for in-flight packets); the
+  initiator rekeys every 2 minutes, when a direct path goes silent, and when a
+  sessionless peer asks (`connect` nudge flag). Previously a restart of either peer
+  left the pair unable to talk until the other side restarted too.
+- **Breaking (mesh nodes only):** the handshake wire format changed — upgrade every
+  `mesh.py` node together. The coordinator only relays handshakes and is unaffected.
+
 ### Added
 - **Pure-Swift native macOS viewer** (`mac-native/`). A native SwiftPM port of the
   viewer's encrypted transport — scrypt and SHAKE-256 implemented from scratch
