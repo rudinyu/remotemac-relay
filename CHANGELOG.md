@@ -5,6 +5,12 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-11-10
+
+**Breaking release.** The mesh node handshake format changed; upgrade all
+`mesh.py` nodes together. The coordinator relays handshakes without inspecting
+them and does not need to upgrade at the same time.
+
 ### Security
 - **Authenticated mesh handshake + session lifecycle.** The node↔node INIT now
   carries an AEAD-sealed, strictly increasing timestamp keyed from
@@ -58,8 +64,8 @@ All notable changes to this project are documented here. This project follows
   device / passphrase, optionally remembered in the Keychain), a window that renders
   the host's screen, and mouse + keyboard forwarded back as the same `MSG_*` events
   the Python viewer sends. `build-app.sh` assembles a double-clickable `.app`. A
-  headless CLI (`authtest`, `connect`) is retained for interop testing. Client
-  tooling — no change to the server modules or their `__version__`.
+  headless CLI (`authtest`, `connect`) is retained for interop testing. The
+  viewer transport remains separate from the server modules.
 
 ## [2.0.0] - 2026-07-04
 
