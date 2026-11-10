@@ -251,5 +251,198 @@ class TestCoordinatorLimits(unittest.TestCase):
                             "silent node was never reaped")
 
 
+class _CoordServer:
+    """A coordinator on a fixed port that can be stopped (dropping every node
+    connection, like a crash/restart) and started again with the same state."""
+
+    def __init__(self, token, state, port=0):
+        self.token, self.state, self.port = token, state, port
+        self.coord = None
+        self.srv = None
+
+    def start(self):
+        self.coord = coordinator.Coordinator(self.token, coordinator.IPAllocator(self.state))
+        self.conns = []
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", self.port))
+        self.port = self.srv.getsockname()[1]
+        self.srv.listen(128)
+        srv = self.srv
+        threading.Thread(target=self._loop, args=(srv,), daemon=True).start()
+
+    def _loop(self, srv):
+        while True:
+            try:
+                conn, addr = srv.accept()
+            except OSError:
+                return
+            self.conns.append(conn)
+            self.coord.accept(conn, addr)
+
+    def stop(self):
+        # shutdown() first: on Linux, close() alone leaves a listener that a
+        # thread is blocked in accept() on still accepting connections.
+        try:
+            self.srv.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.srv.close()
+        for c in self.conns:
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            c.close()
+
+
+class _FreezableProxy:
+    """TCP forwarder. freeze() silently stops forwarding on the connections open
+    at that moment without closing them — a half-open link, as when the
+    coordinator's host dies or a NAT mapping expires. New connections forward
+    normally."""
+
+    def __init__(self, upstream_port):
+        self.upstream = ("127.0.0.1", upstream_port)
+        self.srv = socket.socket()
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(16)
+        self.port = self.srv.getsockname()[1]
+        self.frozen = []          # one Event per live connection
+        self.socks = []
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            u = socket.create_connection(self.upstream)
+            ev = threading.Event()
+            self.frozen.append(ev)
+            self.socks += [c, u]
+            for a, b in ((c, u), (u, c)):
+                threading.Thread(target=self._pump, args=(a, b, ev), daemon=True).start()
+
+    @staticmethod
+    def _pump(src, dst, frozen):
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    return
+                if frozen.is_set():
+                    continue        # swallow: the link has gone dark
+                dst.sendall(data)
+        except OSError:
+            return
+
+    def freeze(self):
+        for ev in list(self.frozen):
+            ev.set()
+
+    def close(self):
+        self.srv.close()
+        for s in self.socks:
+            s.close()
+
+
+@unittest.skipUnless(_HAVE_CRYPTO, "cryptography not installed")
+class TestNodeReconnect(unittest.TestCase):
+    def setUp(self):
+        self.token = b"reconnect-test-token"
+        self.server = _CoordServer(self.token, os.path.join(tempfile.mkdtemp(), "state.json"))
+        self.server.start()
+        self.nodes = []
+
+    def tearDown(self):
+        for n in self.nodes:
+            n.close()
+        self.server.stop()
+
+    def _node(self, name, port=None, **attrs):
+        n = mesh.MeshNode(X25519PrivateKey.generate(), name)
+        n.reconnect_min_delay = 0.1
+        n.reconnect_max_delay = 0.5
+        for k, v in attrs.items():
+            setattr(n, k, v)
+        n.connect(f"127.0.0.1:{port or self.server.port}", self.token)
+        t = threading.Thread(target=n.run, daemon=True)
+        t.start()
+        n._run_thread = t
+        self.nodes.append(n)
+        return n
+
+    def _ping(self, a, b, timeout=6):
+        got = threading.Event()
+        a.on_message = lambda s, mt, pl: got.set() if mt == mesh.MESH_PONG else None
+        a.send(b.pubkey_b64, mesh.MESH_PING, b"x")
+        return got.wait(timeout)
+
+    def test_reconnects_when_connection_is_dropped(self):
+        a = self._node("drop-a")
+        b = self._node("drop-b")
+        self.assertTrue(_wait(lambda: a.pubkey_b64 in b.peers))
+        with self.server.coord._lock:
+            conn = self.server.coord._nodes[a.pubkey_b64]["outbox"]._conn
+        conn.shutdown(socket.SHUT_RDWR)
+        self.assertTrue(_wait(lambda: a.reconnects >= 1), "node did not reconnect")
+        self.assertFalse(a._done.is_set(), "node stopped instead of reconnecting")
+        self.assertTrue(_wait(lambda: a.pubkey_b64 in b.peers), "node not back in the map")
+
+    def test_survives_coordinator_restart(self):
+        a = self._node("rs-a")
+        b = self._node("rs-b")
+        self.assertTrue(_wait(lambda: a.pubkey_b64 in b.peers and b.pubkey_b64 in a.peers))
+        ip_a = a.overlay_ip
+        self.assertTrue(self._ping(a, b), "no session before the restart")
+        self.assertTrue(_wait(lambda: a._conns[b.pubkey_b64].transport == "direct"))
+
+        self.server.stop()
+        # Coordinator down: established direct sessions keep working.
+        self.assertTrue(self._ping(a, b), "direct session broke while the coordinator was down")
+        time.sleep(0.5)                  # a few failed reconnect attempts
+        self.assertFalse(a._done.is_set() or b._done.is_set())
+
+        self.server.start()              # same port, same persisted state
+        self.assertTrue(_wait(lambda: a.reconnects >= 1 and b.reconnects >= 1, 8),
+                        "nodes did not reconnect after the restart")
+        self.assertTrue(_wait(lambda: a.pubkey_b64 in b.peers and b.pubkey_b64 in a.peers))
+        self.assertEqual(a.overlay_ip, ip_a, "overlay IP changed across the restart")
+        self.assertTrue(self._ping(a, b))
+
+    def test_detects_half_open_connection_via_keepalive_echo(self):
+        proxy = _FreezableProxy(self.server.port)
+        self.addCleanup(proxy.close)
+        a = self._node("ho-a", port=proxy.port, control_keepalive=0.2)
+        self.assertTrue(_wait(lambda: a._coord_echoes), "coordinator never echoed a keepalive")
+        proxy.freeze()                   # link goes dark without a FIN or RST
+        self.assertTrue(_wait(lambda: a.reconnects >= 1, 5),
+                        "dead control channel was not detected")
+        self.assertFalse(a._done.is_set())
+
+    def test_no_read_timeout_against_coordinator_without_echo(self):
+        # An older coordinator ignores keepalives (no echo); the node must then
+        # not treat a quiet channel as dead and churn reconnects.
+        real_put = coordinator._Outbox.put
+
+        def put_without_echo(ob, obj):
+            if obj.get("t") != "ka":
+                real_put(ob, obj)
+        with mock.patch.object(coordinator._Outbox, "put", put_without_echo):
+            a = self._node("old-a", control_keepalive=0.1)
+            time.sleep(1.5)
+            self.assertFalse(a._coord_echoes)
+            self.assertEqual(a.reconnects, 0, "node reconnected against a quiet coordinator")
+
+    def test_close_during_outage_stops_the_node(self):
+        a = self._node("bye")
+        self.server.stop()
+        time.sleep(0.3)
+        a.close()
+        a._run_thread.join(3)
+        self.assertFalse(a._run_thread.is_alive(), "run() kept reconnecting after close()")
+
 if __name__ == "__main__":
     unittest.main()

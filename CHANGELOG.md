@@ -38,6 +38,14 @@ All notable changes to this project are documented here. This project follows
   node was idle or all its peers were on direct UDP — `mesh.py up` then stopped.
   Nodes now send a control keepalive every 30 s. Compatible both ways: older
   coordinators ignore it.
+- **`mesh.py up` reconnects instead of stopping when the control channel drops**
+  (coordinator restart, network change). It retries with backoff (1 s → 30 s),
+  re-registers (keeping its overlay IP), and re-runs STUN; the UDP data plane and
+  established direct sessions keep working meanwhile. The coordinator now echoes
+  keepalives, and a node that has seen an echo treats 3 intervals (90 s) of silence
+  as a dead connection — catching half-open links (crashed host, expired NAT
+  mapping) that previously hung the node forever. Against an older coordinator (no
+  echo) there is no read timeout, as before.
 
 ### Added
 - **Pure-Swift native macOS viewer** (`mac-native/`). A native SwiftPM port of the

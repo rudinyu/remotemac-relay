@@ -350,7 +350,9 @@ class Coordinator:
                 if mt == "to":
                     self._relay(pk, msg)
                 elif mt == "ka":
-                    pass        # control keepalive — receiving it is the point
+                    # Control keepalive. Echo it so the node can tell a dead
+                    # connection from a quiet one.
+                    record["outbox"].put({"t": "ka"})
                 elif mt == "endpoints":
                     eps = [str(e)[:64] for e in (msg.get("endpoints") or [])][:16]
                     with self._lock:

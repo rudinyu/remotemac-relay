@@ -420,6 +420,17 @@ class MeshNode:
         # The coordinator drops a control channel that is silent for its idle
         # timeout (120 s), so send a keepalive well within it.
         self.control_keepalive = 30.0
+        # Control-channel reconnect (run() reopens it if it drops; the data plane
+        # keeps running meanwhile). Backoff doubles from min to max delay.
+        self.reconnect_min_delay = 1.0
+        self.reconnect_max_delay = 30.0
+        self.reconnects = 0          # successful reconnects (for tests / logs)
+        self._coord_addr = None
+        self._token = None
+        # Set once the coordinator echoes our keepalive: from then on a silent
+        # channel (3 keepalive intervals) is treated as dead. Older coordinators
+        # don't echo, so they keep the old no-read-timeout behavior.
+        self._coord_echoes = False
         self._done     = threading.Event()
         # keepalive / direct-path liveness (seconds; tests override for speed)
         self._ka_tick          = 1.0     # how often the keepalive loop wakes
@@ -437,32 +448,74 @@ class MeshNode:
     # -- control channel --------------------------------------------------------
 
     def connect(self, coord_addr: str, token: bytes):
-        host, _, port = coord_addr.rpartition(":")
-        sock = socket.create_connection((host, int(port)), timeout=15)
-        sock.settimeout(30)
-        self.ch = _auth(sock, token, is_host=False)
-        # Answer the coordinator's proof-of-possession challenge (prove we hold the
-        # private key for our pubkey) before registering.
-        chal = json.loads(self.ch.recv().decode())
-        proof = self._registration_proof(chal)
-        sock.settimeout(None)
-        # Resolve to an IP so we can match the STUN reply's source address.
-        try:
-            coord_ip = socket.gethostbyname(host)
-        except Exception:
-            coord_ip = host
-        self._coord_udp = (coord_ip, int(port))
-        self._start_udp()
-        self._send({"t": "register", "pubkey": self.pubkey_b64, "proof": proof,
-                    "hostname": self.hostname, "exit": self.is_exit,
-                    "endpoints": self.local_endpoints,
-                    "routes": self.advertise_routes})
+        """Join the mesh: open the control channel and start the data plane. If the
+        channel later drops, run() reconnects on its own."""
+        self._coord_addr, self._token = coord_addr, token
+        self._open_control()
         # Discover our public (post-NAT) endpoint via the coordinator's STUN
         # responder, then re-advertise it so peers can hole-punch to us.
         threading.Thread(target=self._discover_endpoint, daemon=True).start()
         # Keep NAT mappings warm on direct paths and fail silent ones over to DERP.
         threading.Thread(target=self._keepalive_loop, daemon=True).start()
         threading.Thread(target=self._control_keepalive_loop, daemon=True).start()
+
+    def _open_control(self):
+        """Authenticate to the coordinator, prove our identity, and register. The
+        UDP data plane is started on first use and kept across reconnects."""
+        host, _, port = self._coord_addr.rpartition(":")
+        sock = socket.create_connection((host, int(port)), timeout=15)
+        try:
+            sock.settimeout(30)
+            ch = _auth(sock, self._token, is_host=False)
+            # Answer the coordinator's proof-of-possession challenge (prove we hold
+            # the private key for our pubkey) before registering.
+            chal = json.loads(ch.recv().decode())
+            proof = self._registration_proof(chal)
+            sock.settimeout(None)
+        except Exception:
+            sock.close()
+            raise
+        # Resolve to an IP so we can match the STUN reply's source address.
+        try:
+            coord_ip = socket.gethostbyname(host)
+        except Exception:
+            coord_ip = host
+        self._coord_udp = (coord_ip, int(port))
+        if self.udp is None:
+            self._start_udp()
+        with self._send_lock:
+            self.ch = ch
+        self._coord_echoes = False
+        with self._lock:
+            endpoints = list(self.local_endpoints)
+        self._send({"t": "register", "pubkey": self.pubkey_b64, "proof": proof,
+                    "hostname": self.hostname, "exit": self.is_exit,
+                    "endpoints": endpoints,
+                    "routes": self.advertise_routes})
+
+    def _reconnect(self) -> bool:
+        """Reopen a lost control channel, backing off between attempts. Returns
+        False if the node was closed meanwhile."""
+        delay = self.reconnect_min_delay
+        while not self._done.wait(delay):
+            try:
+                self._open_control()
+            except Exception as exc:
+                delay = min(delay * 2, self.reconnect_max_delay)
+                _log(f"reconnect to coordinator failed: {exc} — retrying in {delay:g}s")
+                continue
+            if self._done.is_set():          # closed while we were reconnecting
+                self.ch.close()
+                return False
+            self.reconnects += 1
+            _log("control channel re-established")
+            # Our NAT mapping toward the coordinator may have changed: re-run STUN.
+            self._stun_done.clear()
+            threading.Thread(target=self._discover_endpoint, daemon=True).start()
+            if self.on_transport_ips_changed:
+                self.on_transport_ips_changed(self.transport_ips())
+            return True
+        return False
 
     def _control_keepalive_loop(self):
         """Keep the control channel from idling out at the coordinator — direct
@@ -472,7 +525,7 @@ class MeshNode:
             try:
                 self._send({"t": "ka"})
             except Exception:
-                return
+                pass        # channel down; run() is reconnecting
 
     def _registration_proof(self, chal: dict) -> str:
         """Prove key possession: HMAC-SHA256(DH(our_static, coord_ephemeral),
@@ -535,21 +588,40 @@ class MeshNode:
             self.ch.send(json.dumps(obj, separators=(",", ":")).encode())
 
     def run(self):
-        """Read control messages until the channel closes (blocking)."""
+        """Read control messages until close() (blocking). If the control channel
+        drops — coordinator restart, network change, or a dead connection — it is
+        reopened with backoff; direct UDP sessions keep working meanwhile."""
         try:
             while not self._done.is_set():
-                msg = json.loads(self.ch.recv().decode())
-                # A malformed message from a peer (relayed via the coordinator)
-                # must not tear down the whole control channel.
+                ch = self.ch
                 try:
-                    self._dispatch(msg)
+                    self._read_control(ch)
                 except Exception as exc:
-                    _log(f"dispatch error: {exc}")
-        except Exception as exc:
-            if not self._done.is_set():
-                _log(f"control channel closed: {exc}")
+                    if self._done.is_set():
+                        break
+                    _log(f"control channel lost: {exc} — reconnecting")
+                ch.close()
+                if not self._reconnect():
+                    break
         finally:
             self._done.set()
+
+    def _read_control(self, ch):
+        while not self._done.is_set():
+            msg = json.loads(ch.recv().decode())
+            if msg.get("t") == "ka":
+                # Keepalive echo: the coordinator talks at least this often, so
+                # a longer silence means the connection is dead.
+                if not self._coord_echoes:
+                    self._coord_echoes = True
+                    ch._sock.settimeout(self.control_keepalive * 3)
+                continue
+            # A malformed message from a peer (relayed via the coordinator)
+            # must not tear down the whole control channel.
+            try:
+                self._dispatch(msg)
+            except Exception as exc:
+                _log(f"dispatch error: {exc}")
 
     def close(self):
         self._done.set()
@@ -739,7 +811,10 @@ class MeshNode:
         return bytes([stage]) + eph_pub + struct.pack(">I", index)
 
     def _relay_to(self, dst_pk: str, kind: str, body: bytes):
-        self._send({"t": "to", "dst": dst_pk, "kind": kind, "body": _b64(body)})
+        try:
+            self._send({"t": "to", "dst": dst_pk, "kind": kind, "body": _b64(body)})
+        except Exception:
+            pass    # control channel down (reconnecting) — DERP is best-effort
 
     # -- inbound: DERP relay (over the control channel) -------------------------
 
