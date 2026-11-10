@@ -451,7 +451,7 @@ sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --dns
 ssh user@gw.mesh              # 解析成 gw 的 overlay IP;example.com 照常
 ```
 
-**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。`--tun` 啟用 VPN 介面;`--tun-mtu`(預設 1280)、`--tun-name`(Linux 介面名,預設 `remotemac0`)可微調。`--advertise-routes CIDR,…` / `--accept-routes` 啟用子網路由;`--exit` 宣告 full-tunnel 出口、`--exit-node NAME` 把全流量走某出口(皆需 `--tun`);`--lan-routes CIDR,…` 讓額外的本地網段不走隧道(見下);`--dns` 啟用 split-DNS(可用 `--dns-suffix`、`--dns-upstream` 微調);`--egress IFACE` 覆寫 NAT 出口介面。(若主機 FORWARD 防火牆政策較嚴,需手動為 overlay 網段加放行規則。)
+**參數**:`--bind` 設定 UDP 資料面綁定位址(預設 `0.0.0.0`);`--udp-port` 固定資料面埠(預設隨機)—— 在手動轉埠的情境很有用。coordinator 的 STUN 回應器與 TCP 控制埠共用同一個埠(UDP),不必額外開埠。coordinator 會限制尚未註冊的連線(總數 64、每 IP 4、30 秒內須完成註冊)與同時進行的 scrypt 握手數,並以每節點獨立佇列送出訊息,慢節點不會拖住其他節點;節點每 30 秒送一次控制通道 keepalive,閒置節點不會被踢掉。`--tun` 啟用 VPN 介面;`--tun-mtu`(預設 1280)、`--tun-name`(Linux 介面名,預設 `remotemac0`)可微調。`--advertise-routes CIDR,…` / `--accept-routes` 啟用子網路由;`--exit` 宣告 full-tunnel 出口、`--exit-node NAME` 把全流量走某出口(皆需 `--tun`);`--lan-routes CIDR,…` 讓額外的本地網段不走隧道(見下);`--dns` 啟用 split-DNS(可用 `--dns-suffix`、`--dns-upstream` 微調);`--egress IFACE` 覆寫 NAT 出口介面。(若主機 FORWARD 防火牆政策較嚴,需手動為 overlay 網段加放行規則。)
 
 > **Full-tunnel 注意事項**:它會改寫預設路由 —— 請在有 console/SSH 備援下測試。程序崩潰時兩條 `/1` 會隨 TUN 消失,預設路由自動恢復。DNS 走出口(公用 resolver 可用;LAN resolver 不行)。**直接連接的本地區網仍可達**(其 connected 路由比 `0.0.0.0/1`+`128.0.0.0/1` 更明確);只有原本要走預設閘道的流量才走隧道。若要讓**其他**經由 LAN 路由器才到的本地網段也保持可達,用 `--lan-routes 10.0.0.0/8,172.16.0.0/12` 列出。
 

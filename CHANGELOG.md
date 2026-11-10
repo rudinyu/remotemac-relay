@@ -22,6 +22,22 @@ All notable changes to this project are documented here. This project follows
   left the pair unable to talk until the other side restarted too.
 - **Breaking (mesh nodes only):** the handshake wire format changed — upgrade every
   `mesh.py` node together. The coordinator only relays handshakes and is unaffected.
+- **Coordinator resource limits.** Unauthenticated connections no longer get an
+  unbounded thread and scrypt run each: the coordinator now admits at most 64
+  unregistered connections (4 per source IP) with a hard 30 s registration
+  deadline, and runs at most a few scrypt derivations at once (`_auth` gained an
+  optional `kdf_slots` semaphore; other callers are unchanged). Pushes to nodes go
+  through a per-node outbox — map updates are coalesced, relayed messages are
+  queued (bounded, dropped when full) — so one slow node can't stall the map or
+  DERP relay for everyone, and a burst of changes no longer costs O(n²) sends on
+  the handler thread.
+
+### Fixed
+- **Idle mesh nodes were dropped after 2 minutes.** The coordinator times out a
+  control channel that is silent for 120 s, and nothing was sent on it while a
+  node was idle or all its peers were on direct UDP — `mesh.py up` then stopped.
+  Nodes now send a control keepalive every 30 s. Compatible both ways: older
+  coordinators ignore it.
 
 ### Added
 - **Pure-Swift native macOS viewer** (`mac-native/`). A native SwiftPM port of the

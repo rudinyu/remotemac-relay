@@ -417,6 +417,9 @@ class MeshNode:
         self._by_index = {}        # local_index (int) -> PeerConn  (UDP DATA demux)
         self._lock     = threading.Lock()
         self._send_lock = threading.Lock()   # serialize control-channel writes
+        # The coordinator drops a control channel that is silent for its idle
+        # timeout (120 s), so send a keepalive well within it.
+        self.control_keepalive = 30.0
         self._done     = threading.Event()
         # keepalive / direct-path liveness (seconds; tests override for speed)
         self._ka_tick          = 1.0     # how often the keepalive loop wakes
@@ -459,6 +462,17 @@ class MeshNode:
         threading.Thread(target=self._discover_endpoint, daemon=True).start()
         # Keep NAT mappings warm on direct paths and fail silent ones over to DERP.
         threading.Thread(target=self._keepalive_loop, daemon=True).start()
+        threading.Thread(target=self._control_keepalive_loop, daemon=True).start()
+
+    def _control_keepalive_loop(self):
+        """Keep the control channel from idling out at the coordinator — direct
+        UDP traffic never touches it, so an idle or all-direct node would
+        otherwise be dropped from the mesh."""
+        while not self._done.wait(self.control_keepalive):
+            try:
+                self._send({"t": "ka"})
+            except Exception:
+                return
 
     def _registration_proof(self, chal: dict) -> str:
         """Prove key possession: HMAC-SHA256(DH(our_static, coord_ephemeral),
