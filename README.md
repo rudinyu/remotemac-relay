@@ -440,7 +440,10 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   overridable with `$REMOTEMAC_MESH_KEY`); the coordinator assigns overlay IPs
   from `100.64.0.0/10`.
 - Node↔node handshake is mutually authenticated and forward-secret (X25519
-  triple-DH → HKDF-SHA256 → ChaCha20-Poly1305).
+  triple-DH → HKDF-SHA256 → ChaCha20-Poly1305). The INIT is itself authenticated
+  and timestamped (forged or replayed handshakes are dropped), the RESP is
+  key-confirmed, sessions rekey every 2 minutes and recover when a peer restarts,
+  and a direct path only moves on authenticated, non-replayed data.
 - **Direct P2P (Phase 2).** Nodes discover their public endpoint via a STUN-lite
   probe to the coordinator, exchange candidates, and **hole-punch a direct UDP
   path** (simultaneous punching; a deterministic pubkey tie-break avoids handshake
