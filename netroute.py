@@ -3,10 +3,10 @@
 netroute.py — physical default-route detection + full-tunnel route management.
 
 For a full-tunnel client (`mesh.py --exit-node`), mesh transport sockets are
-bound to the physical interface. Two /1 routes then send other IPv4 traffic to
-the TUN. No destination-wide host routes are installed: application traffic to
-a peer endpoint must not bypass the exit. Route setup fails if either /1 cannot
-be installed. macOS + Linux.
+bound to the physical interface. IPv4 /1 routes, and optional IPv6 /1 routes,
+send other traffic to the TUN. No destination-wide host routes are installed:
+application traffic to a peer endpoint must not bypass the exit. Route setup
+fails if any required /1 cannot be installed. macOS + Linux.
 """
 import socket
 import subprocess
@@ -14,6 +14,7 @@ import sys
 import threading
 
 SPLIT_DEFAULT = ["0.0.0.0/1", "128.0.0.0/1"]
+SPLIT_DEFAULT6 = ["::/1", "8000::/1"]
 
 
 class RouteError(RuntimeError):
@@ -92,7 +93,7 @@ def bind_socket(sock: socket.socket, iface: str):
 
 
 def ipv6_default_route_present():
-    """Full-tunnel mode is IPv4-only; detect an IPv6 default before enabling it."""
+    """Detect an IPv6 default before accepting an IPv4-only exit."""
     cmd = (["netstat", "-rn", "-f", "inet6"] if sys.platform == "darwin"
            else ["ip", "-6", "route", "show", "default"])
     try:
@@ -107,7 +108,7 @@ def ipv6_default_route_present():
 
 
 class FullTunnelRoutes:
-    """Redirect the IPv4 default route through a TUN device. macOS + Linux."""
+    """Redirect IPv4 and optional IPv6 default routes to a TUN. macOS + Linux."""
 
     def __init__(self, tun_name: str, gateway: str, phys_iface: str):
         self.tun_name = tun_name
@@ -116,6 +117,7 @@ class FullTunnelRoutes:
         self._is_mac = (sys.platform == "darwin")
         self._lan = set()             # extra LAN CIDRs kept on the physical gateway
         self._split = False
+        self._split6 = False
         self._lock = threading.Lock()
 
     # -- extra LAN routes (kept on the physical gateway) ------------------------
@@ -137,35 +139,40 @@ class FullTunnelRoutes:
 
     # -- split default via the TUN ----------------------------------------------
 
-    def install_split_default(self):
+    def _tun_route(self, action, cidr, family):
+        if self._is_mac:
+            cmd = ["route", "-n", action]
+            if family == 6:
+                cmd.append("-inet6")
+            return cmd + ["-net", cidr, "-interface", self.tun_name]
+        return ["ip"] + (["-6"] if family == 6 else []) + ["route",
+                "add" if action == "add" else "del", cidr, "dev", self.tun_name]
+
+    def install_split_default(self, ipv6=False):
         with self._lock:
             added = []
             try:
-                for cidr in SPLIT_DEFAULT:
-                    if self._is_mac:
-                        _run(["route", "-n", "add", "-net", cidr, "-interface", self.tun_name])
-                    else:
-                        _run(["ip", "route", "add", cidr, "dev", self.tun_name])
-                    added.append(cidr)
+                for family, cidr in ([(4, c) for c in SPLIT_DEFAULT] +
+                                     ([(6, c) for c in SPLIT_DEFAULT6] if ipv6 else [])):
+                    _run(self._tun_route("add", cidr, family))
+                    added.append((family, cidr))
             except RouteError:
-                for cidr in reversed(added):
-                    if self._is_mac:
-                        _cleanup(["route", "-n", "delete", "-net", cidr, "-interface", self.tun_name])
-                    else:
-                        _cleanup(["ip", "route", "del", cidr])
+                for family, cidr in reversed(added):
+                    _cleanup(self._tun_route("delete", cidr, family))
                 raise
             self._split = True
+            self._split6 = ipv6
 
     def teardown(self):
         """Remove routes we installed, even when the exit path is already down."""
         with self._lock:
             if self._split:
+                for cidr in (SPLIT_DEFAULT6 if self._split6 else []):
+                    _cleanup(self._tun_route("delete", cidr, 6))
                 for cidr in SPLIT_DEFAULT:
-                    if self._is_mac:
-                        _cleanup(["route", "-n", "delete", "-net", cidr, "-interface", self.tun_name])
-                    else:
-                        _cleanup(["ip", "route", "del", cidr])
+                    _cleanup(self._tun_route("delete", cidr, 4))
                 self._split = False
+                self._split6 = False
             for cidr in list(self._lan):
                 if self._is_mac:
                     _cleanup(["route", "-n", "delete", "-net", cidr, self.gateway])

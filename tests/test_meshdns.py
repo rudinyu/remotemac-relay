@@ -2,9 +2,11 @@
 127.0.0.1 on an ephemeral port and forwards to a stub upstream, so no privilege
 and no changes to the system resolver are needed."""
 
+import os
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -109,6 +111,84 @@ class TestResolverConfigHelpers(unittest.TestCase):
 
     def test_restore_is_a_noop_when_never_applied(self):
         meshdns.ResolverConfig("mesh", "100.64.0.2", "1.1.1.1").restore()   # must not raise
+
+
+class TestStaticResolverFallback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.resolv = os.path.join(self.tmp.name, "resolv.conf")
+        self.state = os.path.join(self.tmp.name, "state.json")
+        self.original = "search example.org\nnameserver 9.9.9.9\noptions timeout:2\n"
+        with open(self.resolv, "w") as f:
+            f.write(self.original)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _config(self):
+        return meshdns.ResolverConfig("mesh", "127.0.0.1", "9.9.9.9",
+                                      interface="remotemac0", resolv_path=self.resolv,
+                                      state_path=self.state)
+
+    def test_fallback_rewrites_static_file_then_restores_it(self):
+        with mock.patch.object(meshdns.sys, "platform", "linux"), \
+             mock.patch.object(meshdns.subprocess, "run", side_effect=FileNotFoundError):
+            cfg = self._config().apply()
+            with open(self.resolv) as f:
+                installed = f.read()
+            self.assertIn("nameserver 127.0.0.1", installed)
+            self.assertIn("search example.org", installed)
+            self.assertEqual(meshdns.detect_upstream(self.resolv, self.state), "9.9.9.9")
+            cfg.restore()
+        with open(self.resolv) as f:
+            self.assertEqual(f.read(), self.original)
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_previous_run_is_recovered_before_next_apply(self):
+        with mock.patch.object(meshdns.sys, "platform", "linux"), \
+             mock.patch.object(meshdns.subprocess, "run", side_effect=FileNotFoundError):
+            self._config().apply()  # simulate a process that exited without cleanup
+            next_run = self._config().apply()
+            next_run.restore()
+        with open(self.resolv) as f:
+            self.assertEqual(f.read(), self.original)
+
+    def test_saved_state_before_replace_is_discarded_safely(self):
+        cfg = self._config()
+        with open(self.state, "w") as f:
+            import json
+            json.dump({"original": self.original, "installed": "nameserver 127.0.0.1\n"}, f)
+        cfg._restore_file()
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_changed_resolver_is_not_overwritten_on_restore(self):
+        with mock.patch.object(meshdns.sys, "platform", "linux"), \
+             mock.patch.object(meshdns.subprocess, "run", side_effect=FileNotFoundError):
+            cfg = self._config().apply()
+            with open(self.resolv, "w") as f:
+                f.write("nameserver 1.1.1.1\n")
+            with self.assertRaisesRegex(meshdns.ResolverError, "changed"):
+                cfg.restore()
+        self.assertTrue(os.path.exists(self.state))
+        with open(self.resolv) as f:
+            self.assertEqual(f.read(), "nameserver 1.1.1.1\n")
+
+    def test_managed_symlink_is_not_overwritten(self):
+        link = os.path.join(self.tmp.name, "linked.conf")
+        os.symlink(self.resolv, link)
+        cfg = meshdns.ResolverConfig("mesh", "127.0.0.1", "9.9.9.9",
+                                     interface="remotemac0", resolv_path=link,
+                                     state_path=self.state)
+        with self.assertRaisesRegex(meshdns.ResolverError, "symlink"):
+            cfg._apply_file()
+        with open(self.resolv) as f:
+            self.assertEqual(f.read(), self.original)
+
+    def test_upstream_cannot_point_at_mesh_resolver(self):
+        cfg = meshdns.ResolverConfig("mesh", "127.0.0.1", "127.0.0.1",
+                                     resolv_path=self.resolv, state_path=self.state)
+        with self.assertRaisesRegex(meshdns.ResolverError, "upstream DNS"):
+            cfg._apply_file()
 
 
 class TestServerIntegration(unittest.TestCase):

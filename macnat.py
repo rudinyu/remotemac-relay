@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scoped IPv4 NAT for a macOS mesh gateway (subnet router or exit node).
+"""Scoped IPv4/IPv6 NAT for a macOS mesh gateway (subnet router or exit node).
 
 The stock macOS PF ruleset evaluates ``com.apple/*`` NAT anchors. We load only
 our own anchor, use PF's reference-counted enable token, and hold a process
@@ -19,6 +19,7 @@ import sys
 ANCHOR = "com.apple/remotemac"
 STATE_PATH = "/var/run/remotemac-pf.json"
 _FORWARD = "net.inet.ip.forwarding"
+_FORWARD6 = "net.inet6.ip6.forwarding"
 
 
 class MacNatError(RuntimeError):
@@ -37,16 +38,25 @@ def _run(argv, input_text=None):
     return result
 
 
-def _rule(cidr, egress):
+def _rule(cidr, egress, cidr6=None):
     try:
         net = ipaddress.ip_network(cidr, strict=True)
     except ValueError as exc:
         raise MacNatError(f"invalid overlay CIDR: {cidr}") from exc
     if net.version != 4:
-        raise MacNatError("macOS gateway NAT supports IPv4 only")
+        raise MacNatError("the primary macOS gateway overlay must be IPv4")
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", egress or ""):
         raise MacNatError(f"invalid egress interface: {egress!r}")
-    return f"nat on {egress} inet from {net} to any -> ({egress})\n"
+    rules = f"nat on {egress} inet from {net} to any -> ({egress})\n"
+    if cidr6:
+        try:
+            net6 = ipaddress.ip_network(cidr6, strict=True)
+        except ValueError as exc:
+            raise MacNatError(f"invalid IPv6 overlay CIDR: {cidr6}") from exc
+        if net6.version != 6:
+            raise MacNatError("IPv6 gateway NAT requires an IPv6 overlay")
+        rules += f"nat on {egress} inet6 from {net6} to any -> ({egress})\n"
+    return rules
 
 
 def _token_from(output):
@@ -57,10 +67,12 @@ def _token_from(output):
 
 
 class MacNat:
-    """Manage a single macOS PF NAT rule and IPv4 forwarding."""
+    """Manage scoped macOS PF NAT rules and IP forwarding."""
 
-    def __init__(self, overlay_cidr, egress=None, tun_name=None, state_path=STATE_PATH):
+    def __init__(self, overlay_cidr, egress=None, tun_name=None, state_path=STATE_PATH,
+                 overlay_cidr6=None):
         self.overlay_cidr = overlay_cidr
+        self.overlay_cidr6 = overlay_cidr6
         self.egress = egress
         self.tun_name = tun_name
         self.state_path = state_path
@@ -68,6 +80,7 @@ class MacNat:
         self._anchor_loaded = False
         self._token = None
         self._prev_forward = None
+        self._prev_forward6 = None
         self._state_written = False
 
     def _lock(self):
@@ -88,14 +101,14 @@ class MacNat:
             os.close(self._lock_fd)
             self._lock_fd = None
 
-    def _forwarding(self):
-        value = _run(["sysctl", "-n", _FORWARD]).stdout.strip()
+    def _forwarding(self, key=_FORWARD):
+        value = _run(["sysctl", "-n", key]).stdout.strip()
         if value not in ("0", "1"):
-            raise MacNatError(f"unexpected {_FORWARD} value: {value!r}")
+            raise MacNatError(f"unexpected {key} value: {value!r}")
         return value
 
-    def _set_forwarding(self, value):
-        _run(["sysctl", "-w", f"{_FORWARD}={value}"])
+    def _set_forwarding(self, value, key=_FORWARD):
+        _run(["sysctl", "-w", f"{key}={value}"])
 
     def _recover(self):
         """Clear only a rule/token recorded by a previous crashed run."""
@@ -109,11 +122,15 @@ class MacNat:
         if not isinstance(old, dict):
             raise MacNatError("invalid prior PF state; refusing to overwrite its anchor")
         token, prev = old.get("token"), old.get("previous_forwarding")
-        if not isinstance(token, str) or not token.isdecimal() or prev not in ("0", "1"):
+        prev6 = old.get("previous_forwarding6")
+        if (not isinstance(token, str) or not token.isdecimal() or
+                prev not in ("0", "1") or prev6 not in (None, "0", "1")):
             raise MacNatError("invalid prior PF state; refusing to overwrite its anchor")
         _run(["pfctl", "-a", ANCHOR, "-F", "nat"])
         if self._forwarding() != prev:
             self._set_forwarding(prev)
+        if prev6 is not None and self._forwarding(_FORWARD6) != prev6:
+            self._set_forwarding(prev6, _FORWARD6)
         _run(["pfctl", "-X", token])
         os.unlink(self.state_path)
         return prev
@@ -126,7 +143,7 @@ class MacNat:
             _gateway, self.egress = netroute.default_route()
         if self.egress == self.tun_name:
             raise MacNatError("egress interface cannot be the mesh TUN")
-        rule = _rule(self.overlay_cidr, self.egress)
+        rule = _rule(self.overlay_cidr, self.egress, self.overlay_cidr6)
         try:
             socket.if_nametoindex(self.egress)
         except OSError as exc:
@@ -146,6 +163,11 @@ class MacNat:
             self._prev_forward = previous if previous is not None else current
             if current != "1":
                 self._set_forwarding("1")
+            if self.overlay_cidr6:
+                current6 = self._forwarding(_FORWARD6)
+                self._prev_forward6 = current6
+                if current6 != "1":
+                    self._set_forwarding("1", _FORWARD6)
             _run(["pfctl", "-a", ANCHOR, "-f", "-"], input_text=rule)
             self._anchor_loaded = True
             enabled = _run(["pfctl", "-E"])
@@ -155,7 +177,8 @@ class MacNat:
                 with open(tmp, "w") as f:
                     os.chmod(tmp, 0o600)
                     json.dump({"token": self._token,
-                               "previous_forwarding": self._prev_forward}, f)
+                               "previous_forwarding": self._prev_forward,
+                               "previous_forwarding6": self._prev_forward6}, f)
                 os.replace(tmp, self.state_path)
                 self._state_written = True
             finally:
@@ -188,6 +211,13 @@ class MacNat:
                     if self._forwarding() != self._prev_forward:
                         self._set_forwarding(self._prev_forward)
                     self._prev_forward = None
+                except MacNatError as exc:
+                    errors.append(str(exc))
+            if self._prev_forward6 is not None and not self._anchor_loaded:
+                try:
+                    if self._forwarding(_FORWARD6) != self._prev_forward6:
+                        self._set_forwarding(self._prev_forward6, _FORWARD6)
+                    self._prev_forward6 = None
                 except MacNatError as exc:
                     errors.append(str(exc))
             if self._token and not errors:

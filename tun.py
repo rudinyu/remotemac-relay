@@ -15,8 +15,10 @@ Platforms
   The interface name (`utunN`) is assigned by the kernel; `--tun-name` is ignored.
 - **Linux**: `/dev/net/tun` with `TUNSETIFF` (`IFF_TUN | IFF_NO_PI`) — raw IP, no
   prefix. The interface name is honoured (default `remotemac0`).
+- **Windows**: Wintun via the official `wintun.dll`, supplied separately. The
+  interface name is honoured (default `remotemac0`).
 
-Creating the interface and setting routes needs **root**.
+Creating the interface and setting routes needs root or Windows Administrator.
 
 This module only handles the device + its addressing/route; the TUN↔mesh pump and
 CLI live in `mesh.py`.
@@ -130,6 +132,8 @@ class TunDevice:
         self._fd = None        # Linux file descriptor
         self._sock = None      # macOS utun control socket
         self._is_mac = (sys.platform == "darwin")
+        self._is_win = (sys.platform == "win32")
+        self._win = None       # Windows Wintun adapter/session
         self._cidr6 = None     # macOS IPv6 route installed by configure()
 
     # -- lifecycle --------------------------------------------------------------
@@ -139,6 +143,13 @@ class TunDevice:
             self._open_macos()
         elif sys.platform.startswith("linux"):
             self._open_linux()
+        elif self._is_win:
+            import wintun
+            try:
+                self._win = wintun.WintunDevice(self._name_req, self.mtu).open()
+            except wintun.WintunError as exc:
+                raise TunError(str(exc)) from exc
+            self.name = self._win.name
         else:
             raise TunError(f"TUN overlay is not supported on {sys.platform}")
         return self
@@ -176,7 +187,13 @@ class TunDevice:
     def configure(self, overlay_ip: str, cidr: str = OVERLAY_CIDR,
                   overlay_ip6: str = None, cidr6: str = None):
         """Assign overlay addresses and route their networks to this interface."""
-        if self._is_mac:
+        if self._is_win:
+            import wintun
+            try:
+                self._win.configure(overlay_ip, cidr, overlay_ip6, cidr6)
+            except wintun.WintunError as exc:
+                raise TunError(str(exc)) from exc
+        elif self._is_mac:
             # utun is point-to-point: address == destination is the usual idiom.
             _run(["ifconfig", self.name, "inet", overlay_ip, overlay_ip, "up"])
             _run(["ifconfig", self.name, "mtu", str(self.mtu)])
@@ -211,15 +228,29 @@ class TunDevice:
     def add_route(self, cidr: str):
         """Route an extra CIDR into this interface (accepted subnet routes).
         Tolerant of an already-present route so re-syncs don't fail."""
+        if self._is_win:
+            self._win.add_route(cidr)
+            return
         if self._is_mac:
-            cmd = ["route", "-n", "add", "-net", cidr, "-interface", self.name]
+            import ipaddress
+            family = ["-inet6"] if ipaddress.ip_network(cidr).version == 6 else []
+            cmd = ["route", "-n", "add"] + family + ["-net", cidr, "-interface", self.name]
+        elif ":" in cidr:
+            cmd = ["ip", "-6", "route", "add", cidr, "dev", self.name]
         else:
             cmd = ["ip", "route", "add", cidr, "dev", self.name]
         subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def del_route(self, cidr: str):
+        if self._is_win:
+            self._win.del_route(cidr)
+            return
         if self._is_mac:
-            cmd = ["route", "-n", "delete", "-net", cidr, "-interface", self.name]
+            import ipaddress
+            family = ["-inet6"] if ipaddress.ip_network(cidr).version == 6 else []
+            cmd = ["route", "-n", "delete"] + family + ["-net", cidr, "-interface", self.name]
+        elif ":" in cidr:
+            cmd = ["ip", "-6", "route", "del", cidr, "dev", self.name]
         else:
             cmd = ["ip", "route", "del", cidr, "dev", self.name]
         subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -234,6 +265,14 @@ class TunDevice:
         thread still parked in read(). The buffer is intentionally MTU-independent
         (the kernel hands us at most one interface-MTU frame per read for a TUN).
         """
+        if self._is_win:
+            if not self._win:
+                return b""
+            import wintun
+            try:
+                return self._win.read(timeout)
+            except wintun.WintunError as exc:
+                raise TunError(str(exc)) from exc
         handle = self._sock if self._is_mac else self._fd
         if handle is None:
             return b""
@@ -248,13 +287,22 @@ class TunDevice:
         return os.read(self._fd, 65535)
 
     def write(self, pkt: bytes):
-        if self._is_mac:
+        if self._is_win:
+            import wintun
+            try:
+                self._win.write(pkt)
+            except wintun.WintunError as exc:
+                raise OSError(str(exc)) from exc
+        elif self._is_mac:
             self._sock.send(mac_encap(pkt))
         else:
             os.write(self._fd, pkt)
 
     def close(self):
         self.teardown()
+        if self._win is not None:
+            self._win.close()
+            self._win = None
         try:
             if self._sock is not None:
                 self._sock.close()

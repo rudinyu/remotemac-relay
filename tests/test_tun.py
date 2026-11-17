@@ -104,6 +104,7 @@ class TestDualStackConfigure(unittest.TestCase):
     def test_linux_adds_ipv6_address(self):
         dev = tun.TunDevice(name="remotemac0")
         dev._is_mac = False
+        dev._is_win = False
         dev.name = "remotemac0"
         with mock.patch.object(tun, "_run") as run:
             dev.configure("100.64.0.2", overlay_ip6="fd12:3456:789a::2",
@@ -114,6 +115,7 @@ class TestDualStackConfigure(unittest.TestCase):
     def test_macos_adds_and_removes_ipv6_route(self):
         dev = tun.TunDevice()
         dev._is_mac = True
+        dev._is_win = False
         dev.name = "utun9"
         with mock.patch.object(tun, "_run") as run, \
              mock.patch.object(tun.subprocess, "run") as cleanup:

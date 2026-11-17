@@ -13,7 +13,7 @@ needs no inbound port.
 | `relay.py` | Rendezvous server (blind pipe) | A VPS / home box you control |
 | `remote_desktop.py` | Encrypted transport + remote desktop + SOCKS5 proxy (five modes) | Mac / Linux |
 | `coordinator.py` | Mesh control plane and STUN responder | A reachable VPS / home box |
-| `mesh.py` | Encrypted mesh node, optional TUN and gateway | Mac / Linux |
+| `mesh.py` | Encrypted mesh node, optional TUN and gateway | Mac / Linux / Windows client |
 | `mac-native/` | Native Swift viewer for a Python remote-desktop host | macOS |
 
 Remote desktop / proxy connection:
@@ -324,7 +324,8 @@ pip install mss Pillow pynput
 On macOS, run `./mac-native/build-app.sh` to create
 `mac-native/dist/RemoteMac Viewer.app`. Its encrypted transport passes Swift and
 Python interoperability tests; live screen and input interaction still needs
-testing with a real host. Clipboard sync is not implemented yet. See the
+testing with a real host. Plain-text clipboard sync is implemented in both
+directions; its GUI behavior still needs live testing. See the
 [native viewer guide](mac-native/README.md) for build and connection details.
 
 ### macOS permissions
@@ -442,7 +443,7 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
-## 4. Mesh overlay (experimental — Phase 10)
+## 4. Mesh overlay (experimental)
 
 Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
 into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
@@ -479,13 +480,14 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   the coordinator relay (DERP)** — which only ever sees ciphertext. A keepalive
   holds the NAT mapping open; a silent direct path fails over to DERP and is
   periodically re-punched so it can upgrade back to direct once reachable.
-- **TUN overlay (Phase 3).** With `--tun` (needs root), the node brings up a
+- **TUN overlay (Phase 3).** With `--tun` (needs root or Windows Administrator), the node brings up a
   virtual interface, assigns its overlay IPs, and routes the IPv4 and IPv6
   overlay networks to it — so **real apps reach peers by overlay IP**
   (`ping 100.64.0.x`, `ssh`, http),
   not just the built-in `--ping`. Kernel IP packets are carried over the same
   encrypted P2P/DERP data path. macOS uses `utun` (no kext); Linux uses
-  `/dev/net/tun`. A peer may only inject packets sourced from its own overlay IP
+  `/dev/net/tun`; Windows clients use the separately supplied official
+  [Wintun DLL](https://www.wintun.net/). A peer may only inject packets sourced from its own overlay IP
   (anti-spoof).
 - **Subnet routing (Phase 4).** A node can be a **subnet router**: with
   `--advertise-routes 192.168.1.0/24` it announces LAN CIDRs it can reach and sets
@@ -497,26 +499,29 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   CIDRs that overlap the overlay or contain the coordinator / a peer endpoint are
   refused (so mesh transport can't loop), and a subnet router may source replies
   from within the routes you accepted (anti-spoof stays enforced otherwise).
-- **IPv4 exit node (Phase 5, opt-in).** A client can route its IPv4 default
-  traffic through a pinned exit node with `--exit-node PUBKEY`, so its IPv4
-  public IP becomes the exit's (like a commercial VPN's server picker). The exit
-  node is a Linux or macOS node started with `--exit` (reuses the same IP-forwarding +
-  masquerade). The client binds its mesh transport sockets to the physical
-  interface, then routes `0.0.0.0/1`+`128.0.0.0/1` through the TUN. Route setup
-  errors abort startup; peer endpoint IPs do not get destination-wide bypass routes. This
-  is **off by default**; without `--exit-node` the default route is untouched.
+- **Exit node (Phase 5, opt-in).** A macOS or Linux node started with `--exit`
+  forwards IPv4 internet traffic; `--exit-ipv6` also enables IPv6 forwarding and
+  NAT66. A client selects its public key with `--exit-node PUBKEY`. The client
+  binds mesh transport to its physical interface, then installs IPv4 /1 routes
+  and, if the exit advertises IPv6 support, IPv6 /1 routes through the TUN.
+  Route setup errors abort startup. Without `--exit-node`, default routes stay
+  untouched. Windows full-tunnel exit clients and Windows gateways are not yet
+  supported.
 - **split-DNS (Phase 8, opt-in).** With `--dns`, a node runs a tiny resolver that
   answers `<name>.mesh` with the peer's overlay A and AAAA records and forwards
   everything else to your existing upstream — so `ssh laptop.mesh` works instead
   of memorizing overlay IPs. It binds `127.0.0.1:53` (local-only) and routes only `.mesh` queries to
   itself: macOS uses `/etc/resolver/mesh`; Linux uses `resolvectl` on the TUN
-  interface when systemd-resolved is available. Other DNS settings stay intact.
-  On other Linux resolver setups, the server runs but OS DNS must be configured manually.
-- **IPv6 overlay (Phase 9).** Peers receive stable ULA addresses and exchange
-  IPv6 packets through the same encrypted TUN data path. Direct UDP and
-  coordinator relay transport still use IPv4. IPv6 subnet routing and public
-  IPv6 exit traffic are not enabled.
-- **macOS gateway (Phase 10).** macOS uses a scoped PF NAT anchor for IPv4 subnet
+  interface when systemd-resolved is available. For a plain, unmanaged Linux
+  `/etc/resolv.conf`, it temporarily points all DNS to the local resolver, which
+  forwards non-mesh names to the saved upstream. It restores the file on exit or
+  the next run after a crash. Managed resolver files are left to their manager.
+- **IPv6 overlay and routes (Phases 9–11).** Peers receive stable ULA addresses
+  and exchange IPv6 packets through the same encrypted TUN data path. IPv6
+  subnets use the same explicit `--advertise-routes` / `--accept-route` grants
+  as IPv4. Linux and macOS gateways apply scoped NAT66 for IPv6 routes and exits.
+  Direct UDP and coordinator relay transport still use IPv4.
+- **macOS gateway (Phase 10).** macOS uses a scoped PF NAT anchor for subnet
   routing and exit traffic. A macOS gateway advertises its routes or exit status only
   after TUN and NAT setup succeeds. Upgrade the coordinator before enabling
   `--exit` or `--advertise-routes` on macOS with this node version. A custom PF ruleset
@@ -538,15 +543,30 @@ sudo python3 mesh.py up coord…:21200 --token … --name gw     --tun --adverti
 sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --accept-route GW_PUBKEY,192.168.1.0/24
 ping 192.168.1.1     # laptop reaches the LAN behind gw, through the mesh
 
+# IPv6 subnet: same grant model; replace the example prefix with your LAN prefix:
+sudo python3 mesh.py up coord…:21200 --token … --name gw --tun --advertise-routes fd20:1:2::/64
+sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --accept-route GW_PUBKEY,fd20:1:2::/64
+
 # IPv4 exit: on exit, run `sudo python3 mesh.py key` and copy its full public key:
 sudo python3 mesh.py up coord…:21200 --token … --name exit   --tun --exit
 sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --exit-node EXIT_PUBKEY
 curl https://ifconfig.me      # shows the exit node's public IP, not the client's
 
+# Dual-stack exit: the exit needs working IPv6 on its egress interface:
+sudo python3 mesh.py up coord…:21200 --token … --name exit --tun --exit --exit-ipv6
+sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --exit-node EXIT_PUBKEY
+
 # split-DNS: reach peers by name
 sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --dns
 ssh user@gw.mesh              # resolves gw's overlay IP; example.com still works normally
 ```
+
+On Windows, use an Administrator terminal, install `cryptography`, and put the
+architecture-matched official `wintun.dll` beside `wintun.py` (or set
+`REMOTEMAC_WINTUN_DLL` to its absolute path). Then run
+`py -3 mesh.py up coord.example.com:21200 --token "…" --tun`. Windows currently
+supports overlay peers and explicitly accepted subnet routes; `--exit`,
+`--exit-node`, and automatic OS DNS configuration need macOS or Linux.
 
 **Flags.** `--bind` sets the UDP data-plane bind address (default `0.0.0.0`);
 `--udp-port` pins the data-plane port (default: random) — handy behind a manually
@@ -559,9 +579,9 @@ drops (coordinator restart, network change, or a dead connection — detected af
 90 s without the coordinator's keepalive echo), `mesh.py up` reconnects with backoff
 (1 s → 30 s) and keeps its overlay IP; established direct sessions keep working
 meanwhile. `--tun` enables the VPN interface; `--tun-mtu`
-(default 1280) and `--tun-name` (Linux interface name, default `remotemac0`) tune it.
+(default 1280) and `--tun-name` (Linux/Windows interface name, default `remotemac0`) tune it.
 `--advertise-routes CIDR,…` / repeatable `--accept-route PUBKEY,CIDR` enable subnet routing; `--exit`
-advertises an exit node and `--exit-node PUBKEY` routes IPv4 default traffic through
+advertises an IPv4 exit node (`--exit-ipv6` adds IPv6) and `--exit-node PUBKEY` routes default traffic through
 one (all need `--tun`); `--lan-routes CIDR,…` keeps extra local subnets off the tunnel
 (see below); `--allow-ipv6-bypass` explicitly permits direct IPv6 when an IPv6
 default route exists; `--dns` runs split-DNS (`--dns-suffix`, `--dns-upstream` to tune);
@@ -575,9 +595,10 @@ FORWARD firewall policy needs a manual allow rule for the overlay net.)
 > specific than the `0.0.0.0/1`+`128.0.0.0/1` split); only traffic that would have used
 > the default gateway is tunneled. To also keep *other* local subnets reachable via
 > your LAN router, list them with `--lan-routes 10.0.0.0/8,172.16.0.0/12`.
-> The exit is IPv4-only. Startup refuses an existing IPv6 default route unless
-> you explicitly use `--allow-ipv6-bypass`, which sends IPv6 traffic directly.
-> A new IPv6 route appearing after startup is outside this check.
+> An IPv4-only exit refuses an existing IPv6 default route unless you explicitly
+> use `--allow-ipv6-bypass`, which sends IPv6 traffic directly. An exit started
+> with `--exit-ipv6` instead installs `::/1` and `8000::/1` through the TUN.
+> NAT66 requires usable IPv6 on the exit's egress interface.
 
 **Status / roadmap.** Phase 1 delivered the control plane, per-node identity, host
 pool + selection, and a relayed encrypted data path. Phase 2 added UDP P2P with NAT
@@ -587,7 +608,8 @@ Phase 6 added `--lan-routes` and corrected the LAN-reachability docs. Phase 7 ad
 an iptables fallback for NAT egress. Phase 8 added opt-in split-DNS (`--dns`).
 **Phase 9** adds IPv6 overlay addresses, TUN packet transport, and AAAA DNS.
 **Phase 10** adds macOS PF gateway NAT and delayed gateway advertisement.
-Still to come: IPv6 subnets and exit. Data-plane throughput is
+The current development version adds IPv6 subnets and exit, native clipboard,
+Linux static DNS fallback, and a Windows Wintun client. Data-plane throughput is
 modest (pure-Python), fine for typical use.
 
 ---
@@ -634,10 +656,10 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 | `remote_desktop.py` | Encrypted transport + remote desktop + SOCKS5 proxy (host / viewer / pipe / gateway / socks — five modes) |
 | `coordinator.py` | Mesh control plane — node registry, overlay-IP assignment, endpoint distribution, STUN responder, DERP relay. Needs `cryptography` |
 | `mesh.py` | Mesh node — X25519 identity, UDP P2P data plane with NAT hole punching + direct↔DERP failover, TUN overlay (`--tun`). Needs `cryptography` |
-| `tun.py` | TUN virtual interface for the overlay (macOS `utun` / Linux `/dev/net/tun`) — used by `mesh.py --tun`. Needs root |
+| `tun.py`, `wintun.py` | TUN virtual interface for the overlay (macOS `utun` / Linux `/dev/net/tun` / Windows Wintun) — used by `mesh.py --tun`. Needs root or Administrator |
 | `nat.py` | Linux NAT egress for a subnet router / exit node (`--advertise-routes` / `--exit`) — IP forwarding + masquerade (nftables, or iptables fallback). Needs root |
 | `macnat.py` | macOS PF NAT egress for a subnet router / exit node — scoped anchor, IP forwarding, and crash recovery. Needs root |
-| `netroute.py` | IPv4 exit route manager (`--exit-node`) — checked default-route redirect + per-socket transport binding, macOS + Linux. Needs root |
-| `meshdns.py` | split-DNS resolver (`--dns`) — answers `<name>.mesh`, forwards the rest; configures only the mesh suffix (macOS `/etc/resolver`, Linux `resolvectl`). Needs root |
+| `netroute.py` | IPv4/IPv6 exit route manager (`--exit-node`) — checked default-route redirect + per-socket transport binding, macOS + Linux. Needs root |
+| `meshdns.py` | split-DNS resolver (`--dns`) — answers `<name>.mesh`, forwards the rest; configures macOS `/etc/resolver`, Linux `resolvectl` or an unmanaged static `resolv.conf`. Needs root |
 | `mac-native/` | Swift macOS viewer app and headless interoperability client; connects to a Python `remote_desktop.py host` |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |

@@ -5,7 +5,9 @@ we cover the pure ruleset generator and the egress-interface parser.
 """
 
 import sys
+import subprocess
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
@@ -27,6 +29,11 @@ class TestNftRuleset(unittest.TestCase):
     def test_egress_is_interpolated(self):
         self.assertIn('oifname "wg-egress" masquerade',
                       nat.nft_ruleset("100.64.0.0/10", "wg-egress"))
+
+    def test_ipv6_masquerade_is_scoped_to_ula(self):
+        rs = nat.nft_ruleset("100.64.0.0/10", "eth0", "fd12:3456:789a::/64")
+        self.assertIn("table ip6 remotemac6", rs)
+        self.assertIn('ip6 saddr fd12:3456:789a::/64 oifname "eth0" masquerade', rs)
 
 
 class TestEgressParse(unittest.TestCase):
@@ -52,6 +59,8 @@ class TestIptablesFallback(unittest.TestCase):
         # The delete form is identical except the action verb.
         dele = nat.iptables_rule_args("100.64.0.0/10", "eth0", "-D")
         self.assertEqual(dele, ["-D" if a == "-A" else a for a in add])
+        self.assertEqual(nat.ip6tables_rule_args("fd12::/64", "eth0", "-A")[:5],
+                         ["ip6tables", "-t", "nat", "-A", "POSTROUTING"])
 
     def test_backend_selection(self):
         real = nat.shutil.which
@@ -75,6 +84,68 @@ class TestSubnetNatPlatformGuard(unittest.TestCase):
                 nat.SubnetNat("100.64.0.0/10", "en0").apply()
         finally:
             nat.sys.platform = real
+
+    def test_dual_stack_nft_restores_both_forwarding_values(self):
+        values = {"net.ipv4.ip_forward": "0", "net.ipv6.conf.all.forwarding": "0"}
+        commands = []
+        ra_writes = []
+        def run(cmd, **kwargs):
+            commands.append((cmd, kwargs.get("input")))
+            return subprocess.CompletedProcess(cmd, 0)
+        with mock.patch.object(nat.sys, "platform", "linux"), \
+             mock.patch.object(nat, "_nat_backend", return_value="nft"), \
+             mock.patch.object(nat, "_read_sysctl", side_effect=lambda k: values[k]), \
+             mock.patch.object(nat, "_write_sysctl", side_effect=lambda k, v: values.__setitem__(k, v)), \
+             mock.patch.object(nat, "_read_accept_ra", return_value="1"), \
+             mock.patch.object(nat, "_write_accept_ra", side_effect=lambda _e, v: ra_writes.append(v)), \
+             mock.patch.object(nat.subprocess, "run", side_effect=run):
+            gateway = nat.SubnetNat("100.64.0.0/10", "eth0", "fd12::/64").apply()
+            self.assertEqual(list(values.values()), ["1", "1"])
+            gateway.cleanup()
+        self.assertEqual(list(values.values()), ["0", "0"])
+        self.assertEqual(ra_writes, ["2", "1"])
+        self.assertTrue(any(cmd[:4] == ["nft", "delete", "table", "ip6"] for cmd, _ in commands))
+        self.assertTrue(any(inp and "table ip6 remotemac6" in inp for _, inp in commands))
+
+    def test_ipv6_iptables_failure_removes_ipv4_rule(self):
+        commands = []
+        def run(cmd, **kwargs):
+            commands.append(cmd)
+            if cmd[0] == "ip6tables" and "-A" in cmd:
+                raise OSError("ip6tables unavailable")
+            return subprocess.CompletedProcess(cmd, 0 if "-A" in cmd else 1)
+        with mock.patch.object(nat.sys, "platform", "linux"), \
+             mock.patch.object(nat, "_nat_backend", return_value="iptables"), \
+             mock.patch.object(nat.shutil, "which", return_value="/sbin/ip6tables"), \
+             mock.patch.object(nat, "_read_sysctl", return_value="0"), \
+             mock.patch.object(nat, "_write_sysctl"), \
+             mock.patch.object(nat, "_read_accept_ra", return_value="2"), \
+             mock.patch.object(nat.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(nat.NatError, "ip6tables unavailable"):
+                nat.SubnetNat("100.64.0.0/10", "eth0", "fd12::/64").apply()
+        self.assertTrue(any(cmd[0] == "iptables" and "-A" in cmd for cmd in commands))
+        self.assertTrue(any(cmd[0] == "iptables" and "-D" in cmd
+                            for cmd in commands[2:]))
+
+    def test_cleanup_restores_forwarding_even_if_rule_delete_fails(self):
+        gateway = nat.SubnetNat("100.64.0.0/10", "eth0", "fd12::/64")
+        gateway._backend = "nft"
+        gateway._applied = True
+        gateway._prev_forward = gateway._prev_forward6 = "0"
+        writes = []
+        with mock.patch.object(nat.subprocess, "run", side_effect=OSError("nft missing")), \
+             mock.patch.object(nat, "_write_sysctl", side_effect=lambda k, v: writes.append((k, v))):
+            with self.assertRaisesRegex(nat.NatError, "cleanup incomplete"):
+                gateway.cleanup()
+        self.assertEqual(writes, [("net.ipv4.ip_forward", "0"),
+                                  ("net.ipv6.conf.all.forwarding", "0")])
+        self.assertTrue(gateway._applied)
+
+    def test_invalid_egress_cannot_inject_nft_rules_or_sysctl_path(self):
+        with mock.patch.object(nat.sys, "platform", "linux"), \
+             mock.patch.object(nat, "_nat_backend", return_value="nft"):
+            with self.assertRaisesRegex(nat.NatError, "invalid egress"):
+                nat.SubnetNat("100.64.0.0/10", 'eth0"; delete table ip filter').apply()
 
 
 if __name__ == "__main__":

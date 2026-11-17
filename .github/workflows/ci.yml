@@ -42,3 +42,15 @@ jobs:
           cd mac-native
           swift test
           ./interop-test.sh
+
+  windows-tun:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install test dependency
+        run: python -m pip install pytest
+      - name: Test Windows TUN helpers without installing a driver
+        run: python -m pytest tests/test_wintun.py tests/test_tun.py -v

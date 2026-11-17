@@ -49,7 +49,7 @@ try:
 except ImportError:
     sys.exit("coordinator requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "4.2.1"
+__version__ = "4.3.0"
 
 OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 MAX_NODES = 1024
@@ -241,7 +241,8 @@ class Coordinator:
             me = self._nodes.get(pubkey)
             peers = [
                 {"pubkey": pk, "ip": n["ip"], "ip6": n["ip6"], "hostname": n["hostname"],
-                 "exit": n["exit"], "endpoints": n.get("endpoints", []),
+                 "exit": n["exit"], "exit6": n.get("exit6", False),
+                 "endpoints": n.get("endpoints", []),
                  "routes": n.get("routes", []), "online": True}
                 for pk, n in self._nodes.items() if pk != pubkey
             ]
@@ -353,7 +354,9 @@ class Coordinator:
             endpoints = [str(e)[:64] for e in (reg.get("endpoints") or [])][:16]
             routes = [str(r)[:64] for r in (reg.get("routes") or [])][:32]
             record = {"ch": ch, "hostname": reg.get("hostname", "node")[:64],
-                      "exit": bool(reg.get("exit")), "ip": ip, "ip6": ip6,
+                      "exit": bool(reg.get("exit")),
+                      "exit6": bool(reg.get("exit") and reg.get("exit6")),
+                      "ip": ip, "ip6": ip6,
                       "endpoints": endpoints, "routes": routes,
                       "outbox": _Outbox(ch, conn, lambda: self._map_for(pk))}
             with self._lock:
@@ -395,6 +398,7 @@ class Coordinator:
                         current = self._nodes.get(pk) is record
                         if current:
                             record["exit"] = bool(msg.get("exit"))
+                            record["exit6"] = bool(msg.get("exit") and msg.get("exit6"))
                             record["routes"] = routes
                     if current:
                         record["outbox"].put({"t": "advertise", "id": msg.get("id")})

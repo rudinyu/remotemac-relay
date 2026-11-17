@@ -23,12 +23,17 @@ class TestRule(unittest.TestCase):
         with self.assertRaises(macnat.MacNatError):
             macnat._rule("fd12::/64", "en0")
 
+    def test_ipv6_nat_rule_is_scoped_to_ula(self):
+        self.assertIn("nat on en0 inet6 from fd12::/64 to any -> (en0)",
+                      macnat._rule("100.64.0.0/10", "en0", "fd12::/64"))
+
 
 class TestMacNatLifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.state = os.path.join(self.tmp.name, "pf.json")
         self.forwarding = "0"
+        self.forwarding6 = "0"
         self.calls = []
         self.fail_on = None
         self.hook = True
@@ -47,8 +52,13 @@ class TestMacNatLifecycle(unittest.TestCase):
             out = "nat on en0 from any to any -> (en0)\n" if self.occupied else ""
         elif argv == ["sysctl", "-n", "net.inet.ip.forwarding"]:
             out = self.forwarding + "\n"
+        elif argv == ["sysctl", "-n", "net.inet6.ip6.forwarding"]:
+            out = self.forwarding6 + "\n"
         elif argv[:2] == ["sysctl", "-w"]:
-            self.forwarding = argv[-1].rsplit("=", 1)[1]
+            if argv[-1].startswith("net.inet6.ip6.forwarding="):
+                self.forwarding6 = argv[-1].rsplit("=", 1)[1]
+            else:
+                self.forwarding = argv[-1].rsplit("=", 1)[1]
             out = ""
         elif argv == ["pfctl", "-E"]:
             out = "Token : 12345\n"
@@ -56,8 +66,9 @@ class TestMacNatLifecycle(unittest.TestCase):
             out = ""
         return subprocess.CompletedProcess(argv, 0, out, "")
 
-    def _make(self):
-        return macnat.MacNat("100.64.0.0/10", "en0", "utun9", self.state)
+    def _make(self, cidr6=None):
+        return macnat.MacNat("100.64.0.0/10", "en0", "utun9", self.state,
+                             overlay_cidr6=cidr6)
 
     def _patches(self):
         return (mock.patch.object(macnat.sys, "platform", "darwin"),
@@ -91,6 +102,18 @@ class TestMacNatLifecycle(unittest.TestCase):
         self.assertIn(["pfctl", "-a", macnat.ANCHOR, "-F", "nat"], commands)
         self.assertEqual(self.forwarding, "0")
         self.assertFalse(os.path.exists(self.state))
+
+    def test_dual_stack_nat_restores_ipv6_forwarding(self):
+        platform, iface, run = self._patches()
+        with platform, iface, run:
+            gateway = self._make("fd12::/64").apply()
+            self.assertEqual((self.forwarding, self.forwarding6), ("1", "1"))
+            with open(self.state) as f:
+                self.assertEqual(json.load(f)["previous_forwarding6"], "0")
+            gateway.cleanup()
+        self.assertEqual((self.forwarding, self.forwarding6), ("0", "0"))
+        self.assertTrue(any(text and "inet6 from fd12::/64" in text
+                            for _, text in self.calls))
 
     def test_missing_nat_anchor_fails_before_changing_system_state(self):
         self.hook = False

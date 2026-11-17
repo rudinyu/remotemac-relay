@@ -9,6 +9,8 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
@@ -145,11 +147,30 @@ class TestRegistrationProof(unittest.TestCase):
 
 @unittest.skipUnless(_HAVE_CRYPTO, "cryptography not installed")
 class TestSubnetRouteHelpers(unittest.TestCase):
+    def test_ipv6_exit_flag_requires_exit_role(self):
+        args = SimpleNamespace(advertise_routes=None, accept_routes=False,
+                               accept_route=None, exit_node=None, lan_routes=None,
+                               exit_ipv6=True, exit=False, dns=False, tun=False)
+        with self.assertRaisesRegex(SystemExit, "requires --exit"):
+            mesh._cmd_up(args)
+
+    def test_windows_gateway_is_rejected_before_connecting(self):
+        args = SimpleNamespace(advertise_routes=None, accept_routes=False,
+                               accept_route=None, exit_node=None, lan_routes=None,
+                               exit_ipv6=False, exit=True, dns=False, tun=True,
+                               ping=None)
+        with mock.patch.object(mesh.sys, "platform", "win32"), \
+             mock.patch.object(mesh, "_has_tun_privilege", return_value=True):
+            with self.assertRaisesRegex(SystemExit, "Windows currently supports"):
+                mesh._cmd_up(args)
+
     def test_route_grants_require_a_full_key_and_cidr(self):
         key = mesh._b64(mesh.pub_bytes(X25519PrivateKey.generate()))
         self.assertEqual(mesh.parse_route_grants([key + ",10.20.1.5/16"]),
                          {key: {"10.20.0.0/16"}})
-        for bad in ("bad,10.20.0.0/16", key + ",not-a-cidr", key + ",::/0"):
+        self.assertEqual(mesh.parse_route_grants([key + ",2001:db8:2::1/64"]),
+                         {key: {"2001:db8:2::/64"}})
+        for bad in ("bad,10.20.0.0/16", key + ",not-a-cidr"):
             with self.assertRaises(ValueError):
                 mesh.parse_route_grants([bad])
 
@@ -157,6 +178,7 @@ class TestSubnetRouteHelpers(unittest.TestCase):
         self.assertEqual(mesh.parse_cidrs("192.168.1.0/24, 10.0.0.5/8"),
                          ["192.168.1.0/24", "10.0.0.0/8"])   # host bits masked off
         self.assertEqual(mesh.parse_cidrs("nonsense, 192.168.0.0/16"), ["192.168.0.0/16"])
+        self.assertEqual(mesh.parse_cidrs("2001:db8:1::5/64"), ["2001:db8:1::/64"])
         self.assertEqual(mesh.parse_cidrs(""), [])
 
     def test_route_is_safe_guards(self):
@@ -168,6 +190,13 @@ class TestSubnetRouteHelpers(unittest.TestCase):
         self.assertFalse(mesh.route_is_safe("203.0.113.0/24", None, ["203.0.113.7"]))
         # a private LAN unrelated to transport → safe
         self.assertTrue(mesh.route_is_safe("192.168.1.0/24", "198.51.100.9", ["203.0.113.7"]))
+        ula = "fd12:3456:789a::/64"
+        self.assertFalse(mesh.route_is_safe(ula, None, [], ula))
+        self.assertFalse(mesh.route_is_safe("::/0", None, [], ula))
+        self.assertFalse(mesh.route_is_safe("2001:db8:1::/64", None,
+                                            ["2001:db8:1::7"], ula))
+        self.assertTrue(mesh.route_is_safe("2001:db8:2::/64", None,
+                                           ["2001:db8:1::7"], ula))
 
     def test_build_table_longest_prefix_and_match(self):
         peers = {
@@ -248,9 +277,11 @@ class TestMeshEndToEnd(unittest.TestCase):
             pass
 
     def _node(self, name, advertise_routes=None, route_grants=None,
-              is_exit=False, exit_node=None, identity=None, advertise_ready=True):
+              is_exit=False, exit_node=None, identity=None, advertise_ready=True,
+              exit_ipv6=False):
         n = mesh.MeshNode(identity or X25519PrivateKey.generate(), name, is_exit=is_exit,
                           advertise_routes=advertise_routes)
+        n.is_exit_ipv6 = exit_ipv6
         n.advertise_ready = advertise_ready
         n.route_grants = route_grants or {}
         n.exit_node_key = exit_node
@@ -646,6 +677,19 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertEqual(client.peers[gw.pubkey_b64].get("routes"), ["192.168.9.0/24"])
         self.assertIsNone(client.route_for("192.168.9.5"))
 
+    def test_ipv6_subnet_route_requires_matching_grant(self):
+        cidr = "2001:db8:42::/64"
+        gw = self._node("v6-router", advertise_routes=[cidr])
+        client = self._node("v6-client", route_grants={gw.pubkey_b64: {cidr}})
+        self.assertTrue(self._wait(lambda: client.route_for("2001:db8:42::5")
+                                  == gw.pubkey_b64))
+        self.assertTrue(client.src_permitted(gw.pubkey_b64, "2001:db8:42::5"))
+        self.assertFalse(client.src_permitted(gw.pubkey_b64, "2001:db8:43::5"))
+
+        untrusted = self._node("v6-untrusted")
+        self.assertTrue(self._wait(lambda: gw.pubkey_b64 in untrusted.peers))
+        self.assertIsNone(untrusted.route_for("2001:db8:42::5"))
+
     def test_route_grant_cannot_be_claimed_by_another_peer(self):
         trusted = self._node("trusted-router", advertise_routes=["10.20.0.0/16"])
         rogue = self._node("rogue-router", advertise_routes=["10.20.0.0/16"])
@@ -672,6 +716,21 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertFalse(client.src_permitted("some-other-pk", "93.184.216.34"))
         self.assertIsNone(client.route_for("2001:4860:4860::8888"))
         self.assertFalse(client.src_permitted(ex.pubkey_b64, "2001:4860:4860::8888"))
+
+    def test_ipv6_exit_is_advertised_and_routes_public_ipv6(self):
+        ex = self._node("dual-exit", is_exit=True, exit_ipv6=True,
+                        advertise_ready=False)
+        client = self._node("dual-client", exit_node=ex.pubkey_b64)
+        self.assertTrue(self._wait(lambda: ex.pubkey_b64 in client.peers))
+        self.assertFalse(client.peers[ex.pubkey_b64]["exit6"])
+        ex.set_gateway_ready(True)
+        self.assertTrue(self._wait(lambda: client.exit_node_pk == ex.pubkey_b64
+                                  and client.peers[ex.pubkey_b64]["exit6"]))
+        self.assertEqual(client.route_for("2001:4860:4860::8888"), ex.pubkey_b64)
+        self.assertTrue(client.src_permitted(ex.pubkey_b64, "2001:4860:4860::8888"))
+        ex.set_gateway_ready(False)
+        self.assertTrue(self._wait(lambda: not client.peers[ex.pubkey_b64]["exit6"]))
+        self.assertIsNone(client.route_for("2001:4860:4860::8888"))
 
     def test_gateway_is_advertised_only_after_it_is_ready(self):
         gateway = self._node("deferred-gateway", is_exit=True,

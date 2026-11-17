@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import RemoteMacCore
 
@@ -23,8 +24,16 @@ final class Session {
     private let ioQueue = DispatchQueue(label: "remotemac.session.send")   // serialises all sends
     private var running = false
     private var pingTimer: DispatchSourceTimer?
+    private var clipboardTimer: DispatchSourceTimer?
+    private var lastClipboard: String?       // accessed only on the main queue
     private let stateLock = NSLock()
     private var finished = false
+
+    private var isRunning: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running
+    }
 
     /// Connect through the relay and authenticate, off the main thread. On success
     /// the receive loop starts; on failure `onDisconnect` fires with the message.
@@ -34,9 +43,16 @@ final class Session {
             do {
                 let sock = try RelayClient.connectViaRelay(host: relayHost, port: port, deviceId: deviceId)
                 let ch = try RelayClient.clientAuth(sock: sock, psk: Array(passphrase.utf8))
-                self.channel = ch
-                self.running = true
+                self.stateLock.lock()
+                let active = !self.finished
+                if active {
+                    self.channel = ch
+                    self.running = true
+                }
+                self.stateLock.unlock()
+                guard active else { ch.close(); return }
                 self.startPing()
+                DispatchQueue.main.async { [weak self] in self?.startClipboard() }
                 self.recvLoop(ch)
             } catch {
                 self.finish("\(error)")
@@ -55,17 +71,24 @@ final class Session {
         if finished { stateLock.unlock(); return }
         finished = true
         running = false
+        let ch = channel
+        channel = nil
+        let timer = pingTimer
+        pingTimer = nil
         stateLock.unlock()
-        pingTimer?.cancel(); pingTimer = nil
-        channel?.close()
-        DispatchQueue.main.async { [weak self] in self?.onDisconnect?(reason); self?.onDisconnect = nil }
+        timer?.cancel()
+        ch?.close()
+        DispatchQueue.main.async { [weak self] in
+            self?.clipboardTimer?.cancel(); self?.clipboardTimer = nil
+            self?.onDisconnect?(reason); self?.onDisconnect = nil
+        }
     }
 
     private func recvLoop(_ ch: SecureChannel) {
-        while running {
+        while isRunning {
             let frame: [UInt8]
             do { frame = try ch.recv() } catch {
-                if running { finish("\(error)") }
+                if isRunning { finish("\(error)") }
                 return
             }
             guard let type = frame.first else { continue }
@@ -77,8 +100,12 @@ final class Session {
                 DispatchQueue.main.async { [weak self] in self?.onFrame?(jpeg, w, h) }
             case Session.MSG_PING:
                 send([Session.MSG_PONG])
+            case ClipboardFrame.type:
+                if let text = ClipboardFrame.decode(frame) {
+                    DispatchQueue.main.async { [weak self] in self?.applyClipboard(text) }
+                }
             default:
-                break   // MSG_PONG / MSG_CLIP — ignored for now
+                break   // MSG_PONG or unknown message
             }
         }
     }
@@ -87,15 +114,47 @@ final class Session {
         let t = DispatchSource.makeTimerSource(queue: ioQueue)
         t.schedule(deadline: .now() + 30, repeating: 30)
         t.setEventHandler { [weak self] in self?.send([Session.MSG_PING]) }
-        pingTimer = t
+        stateLock.lock()
+        let active = running
+        if active { pingTimer = t }
+        stateLock.unlock()
         t.resume()
+        if !active { t.cancel() }
+    }
+
+    private func startClipboard() {
+        guard isRunning, clipboardTimer == nil else { return }
+        lastClipboard = NSPasteboard.general.string(forType: .string)
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 1, repeating: 1)
+        t.setEventHandler { [weak self] in self?.pollClipboard() }
+        clipboardTimer = t
+        t.resume()
+    }
+
+    private func pollClipboard() {
+        guard isRunning, let text = NSPasteboard.general.string(forType: .string),
+              text != lastClipboard, let frame = ClipboardFrame.encode(text) else { return }
+        lastClipboard = text
+        send(frame)
+    }
+
+    private func applyClipboard(_ text: String) {
+        guard isRunning else { return }
+        lastClipboard = text        // do not echo the remote change on the next poll
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     // ── outgoing frames ────────────────────────────────────────────────────────
 
     private func send(_ bytes: [UInt8]) {
         ioQueue.async { [weak self] in
-            guard let self = self, self.running, let ch = self.channel else { return }
+            guard let self = self else { return }
+            self.stateLock.lock()
+            let ch = self.running ? self.channel : nil
+            self.stateLock.unlock()
+            guard let ch = ch else { return }
             do { try ch.send(bytes) } catch { self.finish("send: \(error)") }
         }
     }

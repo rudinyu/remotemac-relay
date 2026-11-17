@@ -64,7 +64,35 @@ class TestFullTunnelSafety(unittest.TestCase):
                 self.ftr.install_split_default()
         self.assertFalse(self.ftr._split)
         self.assertEqual(len(adds), 2)
-        self.assertEqual(cleanups, [["ip", "route", "del", "0.0.0.0/1"]])
+        self.assertEqual(cleanups, [["ip", "route", "del", "0.0.0.0/1",
+                                     "dev", "remotemac0"]])
+
+    def test_ipv6_split_routes_are_installed_and_removed(self):
+        adds, cleanups = [], []
+        with mock.patch.object(netroute, "_run", side_effect=adds.append), \
+             mock.patch.object(netroute, "_cleanup", side_effect=cleanups.append):
+            self.ftr.install_split_default(ipv6=True)
+            self.assertTrue(self.ftr._split6)
+            self.ftr.teardown()
+        self.assertEqual(len(adds), 4)
+        self.assertIn(["ip", "-6", "route", "add", "::/1", "dev", "remotemac0"], adds)
+        self.assertIn(["ip", "-6", "route", "del", "8000::/1", "dev", "remotemac0"], cleanups)
+
+    def test_ipv6_route_failure_rolls_back_ipv4_and_ipv6(self):
+        adds, cleanups = [], []
+        def add(cmd):
+            adds.append(cmd)
+            if "8000::/1" in cmd:
+                raise netroute.RouteError("last route failed")
+        with mock.patch.object(netroute, "_run", side_effect=add), \
+             mock.patch.object(netroute, "_cleanup", side_effect=cleanups.append):
+            with self.assertRaises(netroute.RouteError):
+                self.ftr.install_split_default(ipv6=True)
+        self.assertFalse(self.ftr._split)
+        self.assertEqual(len(adds), 4)
+        self.assertEqual(cleanups[0], ["ip", "-6", "route", "del", "::/1",
+                                       "dev", "remotemac0"])
+        self.assertEqual(len(cleanups), 3)
 
     def test_transport_socket_binding_is_per_socket(self):
         sock = mock.Mock()

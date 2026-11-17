@@ -41,8 +41,8 @@ cd remotemac-relay
 ```
 
 Keep the checkout on mesh nodes, or copy its Python modules together: `mesh.py`
-imports `remote_desktop.py` and loads `tun.py`, `netroute.py`, `nat.py`,
-`macnat.py`, and `meshdns.py` for optional features. The coordinator needs
+imports `remote_desktop.py` and loads `tun.py`, `wintun.py` (Windows),
+`netroute.py`, `nat.py`, `macnat.py`, and `meshdns.py` for optional features. The coordinator needs
 `coordinator.py` and `remote_desktop.py`; `relay.py` runs on its own.
 
 ---
@@ -146,7 +146,7 @@ address from the coordinator's persisted per-mesh prefix. Both appear in the
 node log. `--name` defaults to the system hostname. The token must match the
 coordinator's.
 
-**VPN data plane** — reach peers by overlay IP with real apps (needs root):
+**VPN data plane** — reach peers by overlay IP with real apps (needs root or Windows Administrator):
 
 ```bash
 sudo python3 mesh.py up coord.example.com:21200 --token "…" --name laptop --tun
@@ -162,7 +162,10 @@ sudo python3 mesh.py up coord…:21200 --token "…" --name gw --tun --advertise
 sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --accept-route GW_PUBKEY,192.168.1.0/24
 ```
 
-**IPv4 exit node** — send IPv4 default traffic through a Linux or macOS exit (opt-in):
+The same commands accept IPv6 CIDRs. For example, advertise `fd20:1:2::/64`
+on the gateway and grant `GW_PUBKEY,fd20:1:2::/64` on the client.
+
+**Exit node** — send default traffic through a Linux or macOS exit (opt-in):
 
 ```bash
 # On exit, run `sudo python3 mesh.py key` and copy the full public key.
@@ -171,8 +174,10 @@ sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --exit-
 curl https://ifconfig.me   # shows the exit's public IP
 ```
 
-The IPv4 exit refuses to start when an IPv6 default route exists. Use
-`--allow-ipv6-bypass` only if direct IPv6 traffic is acceptable.
+Add `--exit-ipv6` to the exit command for IPv6 forwarding and NAT66; its egress
+interface needs working IPv6. The client then routes both IP families through
+the selected exit. An IPv4-only exit refuses to start on a client with an IPv6
+default route unless `--allow-ipv6-bypass` explicitly permits direct IPv6.
 Upgrade the coordinator before enabling a macOS gateway with this node version;
 macOS gateway status is published after forwarding and NAT setup succeeds.
 
@@ -182,11 +187,21 @@ macOS gateway status is published after forwarding and NAT setup succeeds.
 sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --dns
 ```
 
-Linux automatic setup uses systemd-resolved (`resolvectl`) for only the `.mesh`
-domain. If unavailable, the local DNS server still starts and prints a manual
-`dig @127.0.0.1` check; it does not rewrite `/etc/resolv.conf`.
+Linux prefers systemd-resolved (`resolvectl`) for only the `.mesh` domain. If
+unavailable and `/etc/resolv.conf` is a plain unmanaged file, the tool saves it,
+temporarily sends DNS through the local resolver, forwards non-mesh queries to
+the saved upstream, and restores the file on exit or on the next run after a
+crash. Managed resolver files are left to their manager.
 
-> `--tun` and the routing/DNS features need **root**. On Linux a subnet/exit node
+**Windows client:** install `cryptography`, download the architecture-matched
+official [Wintun DLL](https://www.wintun.net/), and place `wintun.dll` beside
+`wintun.py` (or set `REMOTEMAC_WINTUN_DLL` to its absolute path). In an
+Administrator terminal run `py -3 mesh.py up coord.example.com:21200 --token "…" --tun`.
+Windows supports overlay peers and accepted subnet routes;
+gateway NAT, full-tunnel exit, and automatic OS DNS setup remain macOS/Linux.
+
+> `--tun` and the routing/DNS features need **root** on macOS/Linux or an
+> **Administrator** terminal on Windows. On Linux a subnet/exit node
 > also needs `nftables` (or `iptables`) and IP forwarding — the tool sets these up.
 > In a container, a mesh node additionally needs `--cap-add=NET_ADMIN --device
 > /dev/net/tun`. macOS gateways use PF NAT. See the mesh section of the

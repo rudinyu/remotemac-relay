@@ -13,10 +13,12 @@ The OS resolver is pointed at it via ResolverConfig; for a quick manual check:
     dig @127.0.0.1 gw.mesh
 """
 import os
+import json
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -145,18 +147,96 @@ def macos_resolver_file(suffix: str) -> str:
 class ResolverConfig:
     """Route only the mesh DNS suffix to our loopback resolver.
 
-    macOS uses a per-domain resolver file. Linux uses systemd-resolved's
-    per-link DNS and route-only domain; other host DNS settings are untouched.
-    An unsupported Linux resolver requires manual configuration. Needs root."""
+    macOS uses a per-domain resolver file. Linux prefers systemd-resolved's
+    route-only domain. With a static resolv.conf, it uses a reversible global
+    resolver fallback; non-mesh questions are forwarded to the saved upstream.
+    Managed resolv.conf symlinks are never overwritten. Needs root."""
 
-    def __init__(self, suffix: str, dns_ip: str, upstream: str = None, interface: str = None):
+    def __init__(self, suffix: str, dns_ip: str, upstream: str = None, interface: str = None,
+                 resolv_path="/etc/resolv.conf", state_path="/run/remotemac-resolv.json"):
         self.suffix = suffix.strip(".").lower()
         self.dns_ip = dns_ip
         self.upstream = upstream
         self.interface = interface
+        self.resolv_path = resolv_path
+        self.state_path = state_path
         self._is_mac = (sys.platform == "darwin")
         self._applied = False
         self._path = None
+        self._backend = None
+
+    def _restore_file(self):
+        with open(self.state_path) as f:
+            state = json.load(f)
+        if not isinstance(state, dict) or not all(isinstance(state.get(k), str)
+                                                  for k in ("original", "installed")):
+            raise ResolverError("invalid saved resolver state")
+        if os.path.islink(self.resolv_path):
+            raise ResolverError("resolver path became a symlink; refusing to overwrite it")
+        with open(self.resolv_path) as f:
+            current = f.read()
+        if current == state["original"]:
+            # A prior run may have crashed after saving state but before the
+            # atomic resolver replacement. There is nothing to restore.
+            os.unlink(self.state_path)
+            return
+        if current != state["installed"]:
+            raise ResolverError("resolver changed while mesh was running; saved state kept")
+        self._replace_file(state["original"])
+        os.unlink(self.state_path)
+
+    def _replace_file(self, content):
+        st = os.stat(self.resolv_path)
+        fd, tmp = tempfile.mkstemp(prefix=".remotemac-resolv-",
+                                   dir=os.path.dirname(self.resolv_path) or ".")
+        try:
+            with os.fdopen(fd, "w") as f:
+                os.fchmod(f.fileno(), st.st_mode & 0o777)
+                os.fchown(f.fileno(), st.st_uid, st.st_gid)
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.resolv_path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+    def _apply_file(self):
+        if not self.upstream:
+            raise ResolverError("static resolver fallback needs a known upstream DNS server")
+        if self.upstream == self.dns_ip:
+            raise ResolverError("upstream DNS points to the local mesh resolver")
+        if os.path.islink(self.resolv_path):
+            raise ResolverError("managed resolv.conf symlink; cannot safely auto-configure DNS")
+        if os.path.exists(self.state_path):
+            self._restore_file()  # recover a crashed previous run first
+        with open(self.resolv_path) as f:
+            original = f.read()
+        if any(marker in original[:1024].lower()
+               for marker in ("networkmanager", "resolvconf", "systemd-resolved")):
+            raise ResolverError("resolv.conf is managed by another service; cannot safely replace it")
+        keep = [line for line in original.splitlines()
+                if line.startswith(("search ", "domain ", "options "))]
+        installed = ("# remotemac temporary DNS; non-mesh names use the saved upstream\n"
+                     f"nameserver {self.dns_ip}\n" +
+                     ("\n".join(keep) + "\n" if keep else ""))
+        fd = os.open(self.state_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"original": original, "installed": installed}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            self._replace_file(installed)
+        except Exception:
+            # If the resolver was not touched, discard the state so the next
+            # run can retry. Otherwise retain it for crash recovery.
+            with open(self.resolv_path) as f:
+                if f.read() == original:
+                    os.unlink(self.state_path)
+            raise
+        self._backend = "file"
 
     def apply(self):
         if self._is_mac:
@@ -164,6 +244,7 @@ class ResolverConfig:
             self._path = macos_resolver_file(self.suffix)
             with open(self._path, "x") as f:
                 f.write(f"nameserver {self.dns_ip}\n")
+            self._backend = "mac"
         elif sys.platform.startswith("linux"):
             if not self.interface:
                 raise ResolverError("Linux split-DNS needs a TUN interface")
@@ -172,13 +253,18 @@ class ResolverConfig:
                                check=True, capture_output=True, text=True)
                 subprocess.run(["resolvectl", "domain", self.interface, "~" + self.suffix],
                                check=True, capture_output=True, text=True)
+                self._backend = "resolvectl"
             except (OSError, subprocess.CalledProcessError) as exc:
                 try:
                     subprocess.run(["resolvectl", "revert", self.interface],
                                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except OSError:
                     pass
-                raise ResolverError(f"systemd-resolved could not configure .{self.suffix}: {exc}") from exc
+                try:
+                    self._apply_file()
+                except (OSError, ValueError, ResolverError) as fallback_exc:
+                    raise ResolverError(f"systemd-resolved failed ({exc}); "
+                                        f"static fallback failed ({fallback_exc})") from fallback_exc
         else:
             raise ResolverError(f"resolver auto-config is unsupported on {sys.platform}")
         self._applied = True
@@ -187,29 +273,38 @@ class ResolverConfig:
     def restore(self):
         if not self._applied:
             return
-        if self._is_mac:
+        if self._backend == "mac":
             try:
                 os.unlink(self._path)
             except OSError:
                 pass
-        elif sys.platform.startswith("linux") and self.interface:
+        elif self._backend == "file":
+            self._restore_file()
+        elif self._backend == "resolvectl" and self.interface:
             try:
                 subprocess.run(["resolvectl", "revert", self.interface],
                                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except OSError:
                 pass
         self._applied = False
+        self._backend = None
 
 
-def detect_upstream():
+def detect_upstream(resolv_path="/etc/resolv.conf", state_path="/run/remotemac-resolv.json"):
     """Best-effort: the system's current first upstream nameserver (or None).
     Read before we rewrite the resolver, so it captures the real upstream."""
     try:
         if sys.platform == "darwin":
             out = subprocess.run(["scutil", "--dns"], capture_output=True, text=True, timeout=3).stdout
             return _first_nameserver_scutil(out)
-        with open("/etc/resolv.conf") as f:
-            return _first_nameserver_resolvconf(f.read())
+        with open(resolv_path) as f:
+            current = f.read()
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                state = json.load(f)
+            if current == state.get("installed"):
+                return _first_nameserver_resolvconf(state["original"])
+        return _first_nameserver_resolvconf(current)
     except Exception:
         return None
 

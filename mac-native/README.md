@@ -18,7 +18,7 @@ SHAKE-256 are implemented from scratch here (`Scrypt.swift`, `SHAKE256.swift`) a
 ```bash
 cd mac-native
 swift build -c release            # builds the CLI + the GUI executable
-swift test                        # crypto vectors: SHAKE-256, HMAC, scrypt, XOF cipher
+swift test                        # crypto vectors + clipboard wire format
 ./interop-test.sh                 # live end-to-end auth + frames vs a real Python host
 ./build-app.sh                    # assemble "dist/RemoteMac Viewer.app" (add --run to launch)
 ```
@@ -40,6 +40,9 @@ On connect a window renders the host's screen (letterboxed, aspect-preserving).
 Mouse move/drag/click/scroll and keyboard (including modifiers) are forwarded to
 the host as the same `MSG_*` events the Python viewer sends. Closing the window
 ends the session and returns to the form.
+Plain-text clipboard changes are synchronized both ways every second, with
+the same 1 MiB frame limit as the Python viewer. Incoming changes are applied
+without echoing them back.
 
 Not code-signed for distribution — for sharing outside your machine, sign with a
 Developer ID and notarize.
@@ -66,6 +69,7 @@ process listings. Use the GUI and its Keychain option for regular use.
 | `Sources/RemoteMacCore/Crypto.swift` | HMAC-SHA256 (CryptoKit), helpers |
 | `Sources/RemoteMacCore/SecureChannel.swift` | XOF cipher + framed encrypted channel |
 | `Sources/RemoteMacCore/RelayClient.swift` | relay pairing + scrypt auth handshake |
+| `Sources/RemoteMacCore/ClipboardFrame.swift` | Python-compatible text clipboard frames |
 | `Sources/remotemac-viewer/` | CLI (`authtest`, `connect`) |
 | `Sources/RemoteMacViewerApp/` | AppKit GUI (form, `Session`, `RemoteView`, Keychain) |
 | `build-app.sh` | assemble the `.app` bundle |
@@ -88,4 +92,5 @@ is best confirmed against a live host on a real desktop session. Known rough edg
   Python viewer sends; exotic keys and `⌘`-equivalents may need tuning.
 - Scroll direction follows `scrollingDeltaY` sign — flip in `RemoteView.scrollWheel`
   if it feels inverted for your setup.
-- No clipboard sync yet (`MSG_CLIP` is received but ignored).
+- Clipboard protocol framing is covered by Swift tests; GUI clipboard behavior
+  still needs a live macOS host/viewer session check.

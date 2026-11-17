@@ -10,16 +10,16 @@ forward-secret handshake
 (X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305); the coordinator only ever
 relays ciphertext.
 
-Phases 1–9: identity + token-authenticated control channel + peer map; an
+The mesh includes identity + token-authenticated control channel + peer map; an
 encrypted data path that is **UDP peer-to-peer** where the network allows (NAT
 hole punching, Phase 2) and transparently falls back to a coordinator relay
 (DERP); a **TUN overlay** (Phase 3, `--tun`) so real apps reach peers by overlay
 IP; **subnet routing** (Phase 4, `--advertise-routes`/`--accept-route`) to reach
-LANs behind a trusted peer; an opt-in **IPv4 exit node** (Phase 5, `--exit` /
-`--exit-node`, with `--lan-routes`); and opt-in **split-DNS** (Phase 8, `--dns`)
-resolving `<name>.mesh` to overlay IPs; and IPv6 peer packets over the TUN
-(Phase 9). Only `--tun` and the routing/DNS features need root; everything else
-runs unprivileged.
+LANs behind a trusted peer; an opt-in **IPv4/IPv6 exit node** (`--exit` /
+`--exit-ipv6` / `--exit-node`, with `--lan-routes`); opt-in **split-DNS** (`--dns`)
+resolving `<name>.mesh` to overlay IPs; and IPv6 peer/subnet packets over the
+TUN. TUN and routing need root or Windows Administrator; everything else runs
+unprivileged. Windows currently supports overlay and accepted-subnet clients.
 
 Requires: pip install cryptography
 
@@ -59,7 +59,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "4.2.1"
+__version__ = "4.3.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
@@ -125,14 +125,23 @@ def _unb64(s: str) -> bytes:
 def _log(msg: str):
     print(f"[mesh] {msg}", file=sys.stderr, flush=True)
 
+
+def _has_tun_privilege():
+    if sys.platform == "win32":
+        import ctypes
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except (AttributeError, OSError):
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
 # ─── subnet routing (Phase 4) ────────────────────────────────────────────────────
 
 _OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 
 
-def parse_cidrs(spec):
-    """Parse a comma-separated CIDR list into normalized IPv4 network strings,
-    skipping malformed entries (with a warning). Used for --advertise-routes."""
+def parse_cidrs(spec, families=(4, 6)):
+    """Parse a comma-separated list of network CIDRs, skipping invalid entries."""
     out = []
     for part in (spec or "").split(","):
         part = part.strip()
@@ -143,8 +152,8 @@ def parse_cidrs(spec):
         except ValueError:
             _log(f"ignoring invalid route CIDR: {part!r}")
             continue
-        if net.version != 4:
-            _log(f"ignoring non-IPv4 route CIDR: {part!r}")
+        if net.version not in families:
+            _log(f"ignoring unsupported route CIDR: {part!r}")
             continue
         out.append(str(net))
     return out
@@ -162,24 +171,25 @@ def parse_route_grants(specs):
             if len(raw_key) != 32 or _b64(raw_key) != key:
                 raise ValueError("public key must be 32 bytes")
             net = ipaddress.ip_network(cidr, strict=False)
-            if net.version != 4:
-                raise ValueError("only IPv4 routes are supported")
         except (ValueError, binascii.Error) as exc:
             raise ValueError(f"invalid route grant {spec!r}: {exc}") from exc
         grants.setdefault(key, set()).add(str(net))
     return grants
 
 
-def route_is_safe(cidr, coord_ip, endpoint_ips):
-    """Whether a peer's advertised subnet route is safe to accept: IPv4, not
-    overlapping the overlay net, and not containing the coordinator IP or any
+def route_is_safe(cidr, coord_ip, endpoint_ips, overlay_cidr6=None):
+    """Whether a peer's advertised subnet route is safe to accept: not
+    overlapping either overlay net, and not containing the coordinator IP or any
     peer's UDP endpoint IP — otherwise mesh transport packets would be pulled
     back into the tunnel and loop."""
     try:
         net = ipaddress.ip_network(cidr, strict=False)
     except ValueError:
         return False
-    if net.version != 4 or net.overlaps(_OVERLAY_NET):
+    if net.version == 4 and net.overlaps(_OVERLAY_NET):
+        return False
+    if net.version == 6 and (not overlay_cidr6 or
+                             net.overlaps(ipaddress.ip_network(overlay_cidr6))):
         return False
     for ip in (coord_ip, *endpoint_ips):
         if not ip:
@@ -192,7 +202,7 @@ def route_is_safe(cidr, coord_ip, endpoint_ips):
     return True
 
 
-def build_route_table(peers, coord_ip):
+def build_route_table(peers, coord_ip, overlay_cidr6=None):
     """Return [(ip_network, pubkey)] for every safe advertised route in the peer
     map, sorted by prefix length descending (longest-prefix match wins)."""
     endpoint_ips = []
@@ -204,7 +214,7 @@ def build_route_table(peers, coord_ip):
     table = []
     for pk, info in peers.items():
         for cidr in info.get("routes", []):
-            if route_is_safe(cidr, coord_ip, endpoint_ips):
+            if route_is_safe(cidr, coord_ip, endpoint_ips, overlay_cidr6):
                 table.append((ipaddress.ip_network(cidr, strict=False), pk))
     table.sort(key=lambda t: t[0].prefixlen, reverse=True)
     return table
@@ -421,6 +431,7 @@ class MeshNode:
         self._bind_host = bind_host
         self._udp_port  = udp_port
         self.advertise_routes = list(advertise_routes or [])   # CIDRs I route to
+        self.is_exit_ipv6 = False
         self.advertise_ready = True       # macOS CLI defers this until TUN/PF setup
         self._advertise_ack = threading.Event()
         self._advertise_id = None
@@ -431,6 +442,7 @@ class MeshNode:
         self.transport_iface = None      # physical interface for bound transport sockets
         self.transport_gateway = None
         self.lan_routes = []              # extra local subnets to keep off the tunnel
+        self.allow_ipv6_bypass = False
         self.dns_enabled = False          # run the split-DNS resolver (--dns)
         self.dns_suffix = "mesh"          # names under this suffix resolve to peers
         self.dns_upstream = None          # forward non-mesh queries here (auto if None)
@@ -543,6 +555,7 @@ class MeshNode:
         self._send({"t": "register", "pubkey": self.pubkey_b64, "proof": proof,
                     "hostname": self.hostname,
                     "exit": self.is_exit if self.advertise_ready else False,
+                    "exit6": self.is_exit_ipv6 if self.advertise_ready else False,
                     "endpoints": endpoints,
                     "routes": self.advertise_routes if self.advertise_ready else []})
 
@@ -553,6 +566,7 @@ class MeshNode:
         self._advertise_ack.clear()
         self._send({"t": "advertise", "id": self._advertise_id,
                     "exit": self.is_exit if ready else False,
+                    "exit6": self.is_exit_ipv6 if ready else False,
                     "routes": self.advertise_routes if ready else []})
         if not self._advertise_ack.wait(timeout):
             self.advertise_ready = False
@@ -730,6 +744,7 @@ class MeshNode:
             peers[p["pubkey"]] = {"ip": p.get("ip"), "ip6": p.get("ip6"),
                                   "hostname": p.get("hostname"),
                                   "exit": p.get("exit", False),
+                                  "exit6": p.get("exit6", False),
                                   "endpoints": p.get("endpoints", []),
                                   "routes": p.get("routes", [])}
         with self._lock:
@@ -750,7 +765,8 @@ class MeshNode:
             return
         if self.exit_node_pk != pk:
             self.exit_node_pk = pk
-            _log(f"full-tunnel: routing IPv4 traffic through exit {pk[:16]}…")
+            families = "IPv4/IPv6" if (self.peers.get(pk) or {}).get("exit6") else "IPv4"
+            _log(f"full-tunnel: routing {families} traffic through exit {pk[:16]}…")
 
     def _refresh_routes(self):
         """Rebuild the accepted subnet-route table from the peer map and notify
@@ -769,7 +785,7 @@ class MeshNode:
             grants = self.route_grants.get(pk, set())
             routes = [r for r in info.get("routes", []) if r in grants]
             approved[pk] = dict(info, routes=routes)
-        self._route_table = build_route_table(approved, coord_ip)
+        self._route_table = build_route_table(approved, coord_ip, self.overlay_cidr6)
         new = {str(net) for net, _ in self._route_table}
         if self.on_routes_changed and old != new:
             self.on_routes_changed(new - old, old - new)
@@ -800,8 +816,10 @@ class MeshNode:
         if pk:
             return pk
         try:
-            if ipaddress.ip_address(dst_ip).version == 4:
-                return self.exit_node_pk    # full-tunnel exit is IPv4-only
+            family = ipaddress.ip_address(dst_ip).version
+            if family == 4 or (family == 6 and self.exit_node_pk and
+                               (self.peers.get(self.exit_node_pk) or {}).get("exit6")):
+                return self.exit_node_pk
         except (ValueError, TypeError):
             pass
         return None
@@ -818,8 +836,10 @@ class MeshNode:
             addr = ipaddress.ip_address(src_ip)
         except ValueError:
             return False
-        if src_pk == self.exit_node_pk and addr.version == 4:
-            return True
+        if src_pk == self.exit_node_pk:
+            if addr.version == 4 or (addr.version == 6 and
+                                     (self.peers.get(src_pk) or {}).get("exit6")):
+                return True
         info = self.peers.get(src_pk) or {}
         if str(addr) == info.get("ip") or str(addr) == info.get("ip6"):
             return True
@@ -1254,7 +1274,7 @@ def _run_tun(node, mtu, name, egress=None):
     try:
         dev.configure(node.overlay_ip, overlay_ip6=node.overlay_ip6,
                       cidr6=node.overlay_cidr6)
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (tun.TunError, OSError, subprocess.CalledProcessError) as exc:
         dev.close()                            # don't leak the interface/socket
         sys.exit(f"error: could not configure TUN {dev.name}: {exc}")
     v6_note = f"  ip6={node.overlay_ip6} ({node.overlay_cidr6})" if node.overlay_ip6 else ""
@@ -1267,11 +1287,18 @@ def _run_tun(node, mtu, name, egress=None):
     # advertised subnets.
     snat = None
     if node.advertise_routes or node.is_exit:
+        need_v6 = node.is_exit_ipv6 or any(ipaddress.ip_network(r).version == 6
+                                          for r in node.advertise_routes)
+        if need_v6 and not node.overlay_cidr6:
+            dev.close()
+            sys.exit("error: IPv6 gateway needs an upgraded coordinator with an IPv6 overlay")
+        nat_cidr6 = node.overlay_cidr6 if need_v6 else None
         role = "exit node" if node.is_exit else "subnet router"
         if sys.platform.startswith("linux"):
             import nat
             try:
-                snat = nat.SubnetNat(tun.OVERLAY_CIDR, egress).apply()
+                snat = nat.SubnetNat(tun.OVERLAY_CIDR, egress,
+                                    overlay_cidr6=nat_cidr6).apply()
             except nat.NatError as exc:
                 dev.close()
                 sys.exit(f"error: {role} NAT setup failed: {exc}")
@@ -1282,7 +1309,7 @@ def _run_tun(node, mtu, name, egress=None):
             import macnat
             try:
                 snat = macnat.MacNat(tun.OVERLAY_CIDR, egress,
-                                    tun_name=dev.name).apply()
+                                    tun_name=dev.name, overlay_cidr6=nat_cidr6).apply()
             except macnat.MacNatError as exc:
                 dev.close()
                 sys.exit(f"error: {role} NAT setup failed: {exc}")
@@ -1329,7 +1356,13 @@ def _run_tun(node, mtu, name, egress=None):
 
     def _from_tun():
         while not node._done.is_set():
-            pkt = dev.read()                   # bounded wait; b"" on timeout
+            try:
+                pkt = dev.read()               # bounded wait; b"" on timeout
+            except (OSError, tun.TunError) as exc:
+                if not node._done.is_set():
+                    _warn(f"TUN read failed: {exc}")
+                    time.sleep(0.5)
+                continue
             if not pkt:
                 continue
             dst = tun.parse_ip_dst(pkt)
@@ -1372,13 +1405,21 @@ def _run_tun(node, mtu, name, egress=None):
                 time.sleep(0.1)
             if not node.exit_node_pk:
                 sys.exit(f"error: exit node {node.exit_node_key[:16]}… not found or not advertising as an exit")
+            exit6 = bool((node.peers.get(node.exit_node_pk) or {}).get("exit6"))
+            if exit6 and not node.overlay_ip6:
+                sys.exit("error: IPv6 exit requires an IPv6 overlay address")
             try:
+                if (not exit6 and netroute.ipv6_default_route_present()
+                        and not node.allow_ipv6_bypass):
+                    sys.exit("error: IPv6 has a default route but this exit does not support IPv6; "
+                             "use --allow-ipv6-bypass to permit direct IPv6 traffic")
                 if node.lan_routes:                    # keep extra local subnets off the tunnel
                     ftr.install_lan_routes(node.lan_routes)
-                ftr.install_split_default()            # default → TUN → exit
+                ftr.install_split_default(ipv6=exit6)  # default → TUN → exit
             except netroute.RouteError as exc:
                 sys.exit(f"error: full-tunnel route setup failed: {exc}")
-            _log(f"full-tunnel: IPv4 default route → exit {node.exit_node_key[:16]}… via {dev.name} "
+            families = "IPv4/IPv6" if exit6 else "IPv4"
+            _log(f"full-tunnel: {families} default route → exit {node.exit_node_key[:16]}… via {dev.name} "
                  f"(mesh transport bound to {node.transport_iface})")
 
         # split-DNS: resolve <name>.<suffix> to overlay IPs, forward the rest.
@@ -1419,7 +1460,10 @@ def _run_tun(node, mtu, name, egress=None):
         node.close()                               # sets _done → reader unblocks
         reader.join(timeout=2)                     # let it exit before we close the fd
         if resolver_cfg:
-            resolver_cfg.restore()                 # stop pointing the OS resolver at us
+            try:
+                resolver_cfg.restore()             # stop pointing the OS resolver at us
+            except (meshdns.ResolverError, OSError) as exc:
+                _log(f"warning: resolver cleanup failed: {exc}")
         if dns_server:
             dns_server.stop()
         if ftr:
@@ -1442,7 +1486,9 @@ def _cmd_up(args):
     except ValueError as exc:
         sys.exit(f"error: {exc}")
     exit_node = getattr(args, "exit_node", None)
-    lan_routes = parse_cidrs(getattr(args, "lan_routes", None))
+    lan_routes = parse_cidrs(getattr(args, "lan_routes", None), families=(4,))
+    if getattr(args, "exit_ipv6", False) and not args.exit:
+        sys.exit("error: --exit-ipv6 requires --exit")
     if exit_node and advertise:
         sys.exit("error: --exit-node and --advertise-routes are mutually exclusive")
     if lan_routes and not exit_node:
@@ -1454,10 +1500,13 @@ def _cmd_up(args):
         if args.ping:
             sys.exit("error: --tun and --ping are mutually exclusive")
         # Fail fast, before any token prompt / coordinator join, if not root.
-        if not hasattr(os, "geteuid") or os.geteuid() != 0:
-            sys.exit("error: --tun needs root (creates a virtual interface + routes). Re-run with sudo.")
+        if not _has_tun_privilege():
+            sys.exit("error: --tun needs root or a Windows Administrator terminal")
     elif advertise or route_grants or exit_node or args.exit:
         sys.exit("error: --advertise-routes / --accept-route / --exit / --exit-node require --tun")
+    if sys.platform == "win32" and (advertise or args.exit or exit_node):
+        sys.exit("error: Windows currently supports overlay and accepted subnet routes, "
+                 "not gateway NAT or full-tunnel exit")
 
     gateway = iface = None
     if exit_node:
@@ -1471,12 +1520,6 @@ def _cmd_up(args):
         gateway, iface = netroute.default_route()
         if not gateway or not iface:
             sys.exit("error: could not detect the physical default route for full-tunnel")
-        try:
-            if netroute.ipv6_default_route_present() and not getattr(args, "allow_ipv6_bypass", False):
-                sys.exit("error: IPv6 has a default route and this exit tunnel is IPv4-only; "
-                         "use --allow-ipv6-bypass to permit direct IPv6 traffic")
-        except netroute.RouteError as exc:
-            sys.exit(f"error: {exc}")
 
     token = args.token or os.environ.get("REMOTEMAC_MESH_TOKEN")
     if not token:
@@ -1488,13 +1531,17 @@ def _cmd_up(args):
     node = MeshNode(identity, name, is_exit=args.exit,
                     bind_host=args.bind, udp_port=args.udp_port,
                     advertise_routes=advertise)
-    if sys.platform == "darwin" and (args.exit or advertise):
+    node.is_exit_ipv6 = getattr(args, "exit_ipv6", False)
+    if (args.exit or advertise) and (sys.platform == "darwin" or
+                                      node.is_exit_ipv6 or
+                                      any(ipaddress.ip_network(r).version == 6 for r in advertise)):
         node.advertise_ready = False
     node.route_grants = route_grants
     node.exit_node_key = exit_node
     node.transport_gateway = gateway
     node.transport_iface = iface
     node.lan_routes = lan_routes
+    node.allow_ipv6_bypass = getattr(args, "allow_ipv6_bypass", False)
     node.dns_enabled = dns_enabled
     node.dns_suffix = (getattr(args, "dns_suffix", None) or "mesh").strip(".").lower()
     node.dns_upstream = getattr(args, "dns_upstream", None)
@@ -1578,23 +1625,25 @@ def main():
     up.add_argument("--name", help="hostname to advertise (default: system hostname)")
     up.add_argument("--exit", action="store_true",
                     help="advertise as an IPv4 exit node (with --tun: forwarding + NAT on Linux/macOS)")
+    up.add_argument("--exit-ipv6", action="store_true",
+                    help="also provide IPv6 internet exit with NAT66 (requires --exit and --tun)")
     up.add_argument("--bind", default="0.0.0.0", help="UDP data-plane bind address (default 0.0.0.0)")
     up.add_argument("--udp-port", type=int, default=0, help="UDP data-plane port (default: random)")
     up.add_argument("--ping", metavar="PEER", help="ping a peer (name or overlay IP) then exit")
     up.add_argument("--tun", action="store_true",
-                    help="bring up a TUN overlay interface so real apps reach peers by overlay IP (needs root)")
+                    help="bring up a TUN overlay interface (needs root or Windows Administrator)")
     up.add_argument("--tun-mtu", type=int, default=1280, help="TUN interface MTU (default 1280)")
     up.add_argument("--tun-name", default="remotemac0",
-                    help="TUN interface name on Linux (default remotemac0; ignored on macOS)")
+                    help="TUN interface name on Linux/Windows (default remotemac0; ignored on macOS)")
     up.add_argument("--advertise-routes", metavar="CIDR[,CIDR…]",
                     help="act as a subnet router for these CIDRs (needs --tun; NAT on Linux/macOS)")
     up.add_argument("--accept-route", action="append", metavar="PUBKEY,CIDR",
                     help="accept this CIDR only from the pinned peer key (repeatable; needs --tun)")
     up.add_argument("--accept-routes", action="store_true", help=argparse.SUPPRESS)
     up.add_argument("--exit-node", metavar="PUBKEY",
-                    help="route IPv4 through the exit peer with this full public key (needs --tun)")
+                    help="route internet traffic through this exit peer (IPv6 if supported; needs --tun)")
     up.add_argument("--allow-ipv6-bypass", action="store_true",
-                    help="permit direct IPv6 traffic while the IPv4 exit tunnel is active")
+                    help="permit direct IPv6 traffic when the chosen exit lacks IPv6 support")
     up.add_argument("--lan-routes", metavar="CIDR[,CIDR…]",
                     help="full-tunnel: keep these extra local subnets on the physical gateway (needs --exit-node)")
     up.add_argument("--dns", action="store_true",
@@ -1602,7 +1651,7 @@ def main():
     up.add_argument("--dns-suffix", default="mesh", help="DNS suffix for mesh names (default: mesh)")
     up.add_argument("--dns-upstream", metavar="IP", help="upstream resolver for non-mesh queries (auto-detected if omitted)")
     up.add_argument("--egress", metavar="IFACE",
-                    help="egress interface for subnet NAT (default: the system default route's device)")
+                    help="egress interface for gateway NAT (default: the system default route's device)")
     up.set_defaults(func=_cmd_up)
 
     args = p.parse_args()

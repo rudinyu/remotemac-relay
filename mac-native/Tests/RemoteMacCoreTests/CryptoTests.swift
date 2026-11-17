@@ -36,3 +36,14 @@ extension CryptoTests {
         XCTAssertEqual(hex(c.crypt([UInt8](repeating: 0, count: 16))), "891b47647ca41af1c88d0b4c22aa9156")
     }
 }
+
+extension CryptoTests {
+    func testClipboardFrameMatchesPythonFormat() {
+        let frame = ClipboardFrame.encode("hi 🌐")!
+        XCTAssertEqual(Array(frame.prefix(5)), [0x06, 0, 0, 0, 7])
+        XCTAssertEqual(ClipboardFrame.decode(frame), "hi 🌐")
+        XCTAssertNil(ClipboardFrame.decode([0x06, 0, 0, 0, 8] + Array("hi 🌐".utf8)))
+        XCTAssertNil(ClipboardFrame.decode([0x06, 0, 0, 0, 1, 0xff]))
+        XCTAssertNil(ClipboardFrame.encode(String(repeating: "a", count: ClipboardFrame.maxBytes + 1)))
+    }
+}

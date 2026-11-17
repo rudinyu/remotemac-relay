@@ -32,7 +32,7 @@ cd remotemac-relay
 ```
 
 Mesh 節點建議保留整份 checkout；若手動複製，`mesh.py` 需要同目錄的
-`remote_desktop.py`，選用功能還會載入 `tun.py`、`netroute.py`、`nat.py`、
+`remote_desktop.py`，選用功能還會載入 `tun.py`、`wintun.py`(Windows)、`netroute.py`、`nat.py`、
 `macnat.py` 與 `meshdns.py`。coordinator 需 `coordinator.py` 和
 `remote_desktop.py`；`relay.py` 可獨立執行。
 
@@ -121,7 +121,7 @@ python3 mesh.py up coord.example.com:21200 --token "your-strong-secret" --ping g
 
 每個節點從 `100.64.0.0/10` 拿到穩定的 IPv4 位址,並從 coordinator 持久保存的每 mesh ULA 網段拿到 IPv6 位址;兩者都會顯示在節點 log。`--name` 預設用系統主機名。token 要跟 coordinator 一致。
 
-**VPN 資料面** —— 讓真實 app 用 overlay IP 連 peer(需 root):
+**VPN 資料面** —— 讓真實 app 用 overlay IP 連 peer(需 root 或 Windows 系統管理員):
 
 ```bash
 sudo python3 mesh.py up coord.example.com:21200 --token "…" --name laptop --tun
@@ -137,7 +137,10 @@ sudo python3 mesh.py up coord…:21200 --token "…" --name gw --tun --advertise
 sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --accept-route GW_PUBKEY,192.168.1.0/24
 ```
 
-**IPv4 出口節點** —— 讓 IPv4 預設流量繞經某台 Linux 或 macOS 出口(opt-in):
+IPv6 子網使用相同指令；例如 gateway 宣告 `fd20:1:2::/64`，client 授權
+`GW_PUBKEY,fd20:1:2::/64`。
+
+**出口節點** —— 讓預設流量繞經某台 Linux 或 macOS 出口(opt-in):
 
 ```bash
 # 在 exit 執行 `sudo python3 mesh.py key` 取得完整公鑰
@@ -146,7 +149,7 @@ sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --exit-
 curl https://ifconfig.me   # 顯示出口的公網 IP
 ```
 
-此出口僅支援 IPv4。已有 IPv6 預設路由時會拒絕啟動;若接受 IPv6 直連,可明確加入 `--allow-ipv6-bypass`。
+出口指令可加入 `--exit-ipv6`，同時啟用 IPv6 轉送與 NAT66；出口的實體介面需有可用 IPv6。client 隨即將 IPv4/IPv6 都導向出口。若出口只有 IPv4，client 已有 IPv6 預設路由時會拒絕啟動；接受 IPv6 直連才明確加入 `--allow-ipv6-bypass`。
 新版 macOS gateway 節點需先升級 coordinator;節點會等 TUN 與 NAT 就緒後才宣告出口。
 
 **split-DNS** —— 用名字連 peer(`ssh laptop.mesh`):
@@ -155,9 +158,11 @@ curl https://ifconfig.me   # 顯示出口的公網 IP
 sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --dns
 ```
 
-Linux 自動設定只支援 systemd-resolved(`resolvectl`),只導向 `.mesh` 網域;不改寫 `/etc/resolv.conf`。其他 Linux DNS 設定需手動處理。
+Linux 優先用 systemd-resolved(`resolvectl`)只導向 `.mesh`。若不可用而 `/etc/resolv.conf` 是未受管理的普通檔案,會先保存原內容、暫時讓 DNS 經本機 resolver,把非 mesh 名稱轉送到原上游；結束或下次啟動時還原。其他服務管理的 resolver 檔案不會覆寫。
 
-> `--tun` 與路由/DNS 功能需要 **root**。Linux 上的 subnet/exit 節點還需要 `nftables`(或 `iptables`)與 IP forwarding;macOS 使用 PF NAT。工具會幫你設定。在容器裡跑 mesh 節點另外需要 `--cap-add=NET_ADMIN --device /dev/net/tun`。細節見 [README](README.zh-TW.md) 的 mesh 章節。
+**Windows client**：安裝 `cryptography`,下載對應架構的官方 [Wintun DLL](https://www.wintun.net/),把 `wintun.dll` 放在 `wintun.py` 旁(或將 `REMOTEMAC_WINTUN_DLL` 設成絕對路徑)。在系統管理員終端機執行 `py -3 mesh.py up coord.example.com:21200 --token "…" --tun`。Windows 目前支援 overlay 與已授權子網路由；gateway NAT、全流量出口與自動 OS DNS 設定仍需 macOS/Linux。
+
+> `--tun` 與路由/DNS 功能在 macOS/Linux 需要 **root**,Windows 需要**系統管理員**終端機。Linux 上的 subnet/exit 節點還需要 `nftables`(或 `iptables`)與 IP forwarding;macOS 使用 PF NAT。工具會幫你設定。在容器裡跑 mesh 節點另外需要 `--cap-add=NET_ADMIN --device /dev/net/tun`。細節見 [README](README.zh-TW.md) 的 mesh 章節。
 
 ---
 

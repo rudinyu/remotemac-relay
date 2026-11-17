@@ -5,6 +5,17 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [4.3.0] - 2026-11-17
+
+### Added
+- IPv6 subnet advertisements and explicit route grants, plus optional IPv6
+  internet exit routing (`--exit-ipv6`) with scoped NAT66 on Linux and macOS.
+- Bidirectional plain-text clipboard sync in the native macOS viewer.
+- Automatic reversible DNS configuration for static, unmanaged Linux
+  `/etc/resolv.conf` when systemd-resolved is unavailable.
+- Windows Wintun overlay and accepted-subnet client support; the official DLL
+  is supplied separately. Added driver-free Windows tests to CI.
+
 ## [4.2.1] - 2026-11-17
 
 ### Fixed
