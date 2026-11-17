@@ -5,6 +5,25 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-11-17
+
+**Breaking mesh CLI release.** `relay.py` is version 2.1.0.
+
+### Security and reliability
+- Exit routing now checks route command failures, rolls back partial setup, and
+  binds mesh transport sockets to the physical interface instead of installing
+  destination-wide endpoint bypass routes. IPv6 default routes require an
+  explicit `--allow-ipv6-bypass` opt-in because the exit supports IPv4 only.
+- Subnet routes require explicit `--accept-route PUBKEY,CIDR` grants; exit selection
+  requires the peer's full public key. The old `--accept-routes` and named
+  `--exit-node` forms are no longer accepted. `mesh.py key` prints a node's key.
+- Linux split DNS uses systemd-resolved's route-only domain when available,
+  without rewriting `/etc/resolv.conf`; DNS forwarding is concurrent.
+- The relay can optionally authenticate Python host registration with
+  `REMOTEMAC_RELAY_HOST_TOKEN`. Legacy Mac/iPad hosts remain on the old protocol.
+- The native viewer uses Security.framework for Keychain access. CI now runs
+  Swift tests and Python interoperability checks on macOS.
+
 ## [3.0.0] - 2026-11-10
 
 **Breaking release.** The mesh node handshake format changed; upgrade all

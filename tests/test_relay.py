@@ -1,13 +1,18 @@
 """Unit tests for the relay pairing/bridging logic in relay.py."""
 
 import asyncio
+import hashlib
+import hmac
+import os
 import socket
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
 import relay
+import remote_desktop
 
 DEVICE_ID = b"testdev1"
 
@@ -16,6 +21,8 @@ class RelayTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         relay.hosts.clear()
         relay.conns_per_ip.clear()
+        self._host_token = relay.HOST_TOKEN
+        relay.HOST_TOKEN = None
         self._tasks = []
         self._writers = []
 
@@ -30,6 +37,7 @@ class RelayTest(unittest.IsolatedAsyncioTestCase):
                 pass
         relay.hosts.clear()
         relay.conns_per_ip.clear()
+        relay.HOST_TOKEN = self._host_token
 
     async def _connect(self, ip, entry=relay._dispatch, **kwargs):
         """Simulate one inbound connection; returns the test-side (reader, writer)."""
@@ -57,11 +65,18 @@ class RelayTest(unittest.IsolatedAsyncioTestCase):
         except (ConnectionResetError, BrokenPipeError):
             return b""
 
-    async def _register_host(self, ip="10.0.0.1", rid=DEVICE_ID):
+    async def _register_host(self, ip="10.0.0.1", rid=DEVICE_ID, token=None):
         r, w = await self._connect(ip)
         w.write(b"H" + rid)
         await w.drain()
-        self.assertEqual(await self._read(r), b"R")
+        response = await self._read(r)
+        if token is not None:
+            self.assertEqual(response, b"A")
+            nonce = await self._read(r, 32)
+            w.write(hmac.new(token, b"host-register" + rid + nonce, hashlib.sha256).digest())
+            await w.drain()
+            response = await self._read(r)
+        self.assertEqual(response, b"R")
         return r, w
 
     async def test_host_registers(self):
@@ -101,6 +116,49 @@ class RelayTest(unittest.IsolatedAsyncioTestCase):
         await w2.drain()
         self.assertEqual(await self._read(r2), b"D")
         self.assertEqual(await self._read_eof(r2), b"")
+
+    async def test_protected_registration_rejects_unproved_host(self):
+        token = b"relay-host-secret"
+        relay.HOST_TOKEN = token
+        r, w = await self._connect("10.0.0.9")
+        w.write(b"H" + DEVICE_ID)
+        await w.drain()
+        self.assertEqual(await self._read(r), b"A")
+        await self._read(r, 32)
+        w.write(b"\0" * 32)
+        await w.drain()
+        self.assertEqual(await self._read_eof(r), b"")
+        self.assertNotIn(DEVICE_ID, relay.hosts)
+        await self._register_host(token=token)
+        self.assertIn(DEVICE_ID, relay.hosts)
+
+    async def test_python_host_interoperates_with_protected_relay(self):
+        relay.HOST_TOKEN = b"relay-host-secret"
+        server = await asyncio.start_server(relay.handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            with mock.patch.dict(os.environ, {"REMOTEMAC_RELAY_HOST_TOKEN": "relay-host-secret"}):
+                loop = asyncio.get_running_loop()
+                host = loop.run_in_executor(None, remote_desktop._relay_connect,
+                                            f"127.0.0.1:{port}", "testdev1", True)
+                for _ in range(100):
+                    if DEVICE_ID in relay.hosts:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertIn(DEVICE_ID, relay.hosts)
+                cr, cw = await asyncio.open_connection("127.0.0.1", port)
+                try:
+                    cw.write(b"C" + DEVICE_ID)
+                    await cw.drain()
+                    self.assertEqual(await asyncio.wait_for(cr.readexactly(1), 2), b"P")
+                    hs = await asyncio.wait_for(host, 2)
+                    hs.close()
+                finally:
+                    cw.close()
+                    await cw.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
 
     async def test_same_ip_reconnect_evicts_old(self):
         r1, w1 = await self._register_host(ip="10.0.0.1")

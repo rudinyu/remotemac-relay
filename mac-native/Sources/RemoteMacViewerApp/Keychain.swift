@@ -1,35 +1,39 @@
 import Foundation
+import Security
 
-/// Minimal passphrase storage in the login keychain via the `security` CLI.
-/// One generic-password item per device id, under a fixed service name.
+/// Passphrase storage in the login Keychain. Secrets never enter process arguments.
 enum Keychain {
     private static let service = "remotemac-relay-viewer"
 
-    @discardableResult
-    private static func run(_ args: [String], input: String? = nil) -> (Int32, String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = args
-        let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return (-1, "") }
-        p.waitUntilExit()
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    private static func query(for account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
     }
 
-    static func save(passphrase: String, for account: String) {
-        // -U updates in place if the item already exists.
-        run(["add-generic-password", "-U", "-a", account, "-s", service, "-w", passphrase])
+    @discardableResult
+    static func save(passphrase: String, for account: String) -> Bool {
+        let data = Data(passphrase.utf8)
+        let status = SecItemUpdate(query(for: account) as CFDictionary,
+                                   [kSecValueData as String: data] as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
+        var item = query(for: account)
+        item[kSecValueData as String] = data
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
     }
 
     static func load(for account: String) -> String? {
-        let (status, out) = run(["find-generic-password", "-a", account, "-s", service, "-w"])
-        guard status == 0 else { return nil }
-        let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        var item = query(for: account)
+        item[kSecReturnData as String] = true
+        item[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(item as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     static func delete(for account: String) {
-        run(["delete-generic-password", "-a", account, "-s", service])
+        SecItemDelete(query(for: account) as CFDictionary)
     }
 }

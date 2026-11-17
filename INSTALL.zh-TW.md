@@ -124,24 +124,30 @@ ping 100.64.0.3        # 另一節點的 overlay IP;log 顯示 [direct] 或 [der
 **子網路由** —— 把某台 Linux 節點背後的 LAN 開放給 mesh:
 
 ```bash
+# 在 gw 執行 `sudo python3 mesh.py key` 取得完整公鑰
 sudo python3 mesh.py up coord…:21200 --token "…" --name gw --tun --advertise-routes 192.168.1.0/24
 # 在 client:
-sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --accept-routes
+sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --accept-route GW_PUBKEY,192.168.1.0/24
 ```
 
-**Full-tunnel 出口節點** —— 全流量繞經某台 Linux 出口(opt-in):
+**IPv4 出口節點** —— 讓 IPv4 預設流量繞經某台 Linux 出口(opt-in):
 
 ```bash
+# 在 exit 執行 `sudo python3 mesh.py key` 取得完整公鑰
 sudo python3 mesh.py up coord…:21200 --token "…" --name exit   --tun --exit
-sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --exit-node exit
+sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --exit-node EXIT_PUBKEY
 curl https://ifconfig.me   # 顯示出口的公網 IP
 ```
+
+此出口僅支援 IPv4。已有 IPv6 預設路由時會拒絕啟動;若接受 IPv6 直連,可明確加入 `--allow-ipv6-bypass`。
 
 **split-DNS** —— 用名字連 peer(`ssh laptop.mesh`):
 
 ```bash
 sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --dns
 ```
+
+Linux 自動設定只支援 systemd-resolved(`resolvectl`),只導向 `.mesh` 網域;不改寫 `/etc/resolv.conf`。其他 Linux DNS 設定需手動處理。
 
 > `--tun` 與路由/DNS 功能需要 **root**。Linux 上的 subnet/exit 節點還需要 `nftables`(或 `iptables`)與 IP forwarding —— 工具會幫你設好。在容器裡跑 mesh 節點另外需要 `--cap-add=NET_ADMIN --device /dev/net/tun`。細節見 [README](README.zh-TW.md) 的 mesh 章節。
 
@@ -159,6 +165,8 @@ python3 remote_desktop.py viewer relay.example.com:21118 mydevice --psk "strong-
 ```
 
 macOS host 需要**螢幕錄製** + **輔助使用**權限。建議用 `REMOTEMAC_PSK` 而非 `--psk`,才不會在 `ps` 看到密碼。`gateway` / `socks` / `pipe` 模式見 [README](README.zh-TW.md#三使用-remote_desktoppy)。
+
+Python host 可在 relay 與 host 設定相同的強密鑰 `REMOTEMAC_RELAY_HOST_TOKEN`,讓 relay 驗證 host 後才保留裝置 ID。Docker 可在 `.env` 設定;systemd 可在 `/etc/remotemac/relay.env`(權限 `0600`)寫入 `REMOTEMAC_RELAY_HOST_TOKEN=<密鑰>` 並重新啟動 relay。現有 Mac/iPad host app 仍用舊協議,使用它時不要設定此變數。
 
 ---
 

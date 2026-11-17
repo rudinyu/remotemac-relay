@@ -23,11 +23,13 @@ each connection first sends  [1 byte role 'H'|'C'][8 byte device-id]
 """
 import asyncio
 import hashlib
+import hmac
+import os
 import socket
 import sys
 from collections import defaultdict
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 HOST = "0.0.0.0"
 DEFAULT_PORT = 21118
@@ -35,6 +37,7 @@ DEFAULT_PORT = 21118
 # Safety limits — prevent resource exhaustion from abusive clients.
 MAX_CONNS_PER_IP = 5   # simultaneous connections from one IP
 MAX_HOSTS = 10_000     # total registered hosts in memory at once
+HOST_TOKEN = os.environ.get("REMOTEMAC_RELAY_HOST_TOKEN", "").encode() or None
 
 hosts = {}          # device-id (bytes) -> (reader, writer, ip)
 conns_per_ip = defaultdict(int)
@@ -88,6 +91,22 @@ async def _dispatch(reader, writer, ip):
     lid = _log_id(rid)
 
     if role == b"H":
+        if HOST_TOKEN:
+            # Authenticate the host before it can reserve a device ID. The fresh
+            # nonce prevents a captured registration proof from being replayed.
+            nonce = os.urandom(32)
+            try:
+                writer.write(b"A" + nonce)
+                await writer.drain()
+                proof = await asyncio.wait_for(reader.readexactly(32), timeout=15)
+                expected = hmac.new(HOST_TOKEN, b"host-register" + rid + nonce,
+                                    hashlib.sha256).digest()
+                if not hmac.compare_digest(proof, expected):
+                    writer.close()
+                    return
+            except Exception:
+                writer.close()
+                return
         # Refuse if the hosts table is full and this is a brand-new ID.
         if len(hosts) >= MAX_HOSTS and rid not in hosts:
             writer.close()
@@ -184,7 +203,8 @@ async def handle(reader, writer):
 
 async def main(port: int):
     server = await asyncio.start_server(handle, HOST, port)
-    print(f"RemoteMac relay listening on {HOST}:{port}", flush=True)
+    auth = "host registration authentication enabled" if HOST_TOKEN else "legacy host registration"
+    print(f"RemoteMac relay listening on {HOST}:{port} ({auth})", flush=True)
     async with server:
         await server.serve_forever()
 

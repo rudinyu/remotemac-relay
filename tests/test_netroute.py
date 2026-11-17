@@ -1,11 +1,13 @@
 """Root-free unit tests for the full-tunnel route manager (Phase 5).
 
 Applying real routes needs root, so that's manual-verified; here we cover the
-default-route parsers and the host-route pin diff logic.
+default-route parsers, failure rollback, and per-socket transport binding.
 """
 
+import subprocess
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
@@ -37,38 +39,60 @@ class TestDefaultRouteParsers(unittest.TestCase):
         self.assertEqual(netroute.parse_macos_default("route to: default\n"), (None, None))
 
 
-class TestPinDiff(unittest.TestCase):
+class TestFullTunnelSafety(unittest.TestCase):
     def setUp(self):
-        # Force a known platform and stub the actual route commands so no privilege
-        # is needed; we only assert the tracked pin set converges to `desired`.
         self.ftr = netroute.FullTunnelRoutes("remotemac0", "10.0.0.1", "eth0")
-        self.pinned_calls = []
-        self.unpinned_calls = []
-        self.ftr._pin = lambda ip: self.pinned_calls.append(ip)
-        self.ftr._unpin = lambda ip: self.unpinned_calls.append(ip)
+        self.ftr._is_mac = False
 
-    def test_sync_adds_and_removes_incrementally(self):
-        self.ftr.sync_pins({"1.1.1.1", "2.2.2.2"})
-        self.assertEqual(sorted(self.pinned_calls), ["1.1.1.1", "2.2.2.2"])
-        self.assertEqual(self.ftr._pinned, {"1.1.1.1", "2.2.2.2"})
+    def test_command_failure_is_reported(self):
+        failed = subprocess.CompletedProcess([], 1, "", "permission denied")
+        with mock.patch.object(netroute.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(netroute.RouteError, "permission denied"):
+                netroute._run(["ip", "route", "add", "0.0.0.0/1"])
 
-        # A second sync only touches the delta: drop 2.2.2.2, add 3.3.3.3.
-        self.pinned_calls.clear()
-        self.ftr.sync_pins({"1.1.1.1", "3.3.3.3"})
-        self.assertEqual(self.pinned_calls, ["3.3.3.3"])
-        self.assertEqual(self.unpinned_calls, ["2.2.2.2"])
-        self.assertEqual(self.ftr._pinned, {"1.1.1.1", "3.3.3.3"})
+    def test_partial_default_route_is_rolled_back(self):
+        adds, cleanups = [], []
 
-    def test_sync_skips_falsy_ips(self):
-        self.ftr.sync_pins({"1.1.1.1", "", None})
-        self.assertEqual(self.ftr._pinned, {"1.1.1.1"})
+        def add(cmd):
+            adds.append(cmd)
+            if "128.0.0.0/1" in cmd:
+                raise netroute.RouteError("second route failed")
 
-    def test_teardown_unpins_all(self):
-        self.ftr.sync_pins({"1.1.1.1", "2.2.2.2"})
-        self.unpinned_calls.clear()
-        self.ftr.teardown()
-        self.assertEqual(sorted(self.unpinned_calls), ["1.1.1.1", "2.2.2.2"])
-        self.assertEqual(self.ftr._pinned, set())
+        with mock.patch.object(netroute, "_run", side_effect=add), \
+             mock.patch.object(netroute, "_cleanup", side_effect=cleanups.append):
+            with self.assertRaises(netroute.RouteError):
+                self.ftr.install_split_default()
+        self.assertFalse(self.ftr._split)
+        self.assertEqual(len(adds), 2)
+        self.assertEqual(cleanups, [["ip", "route", "del", "0.0.0.0/1"]])
+
+    def test_transport_socket_binding_is_per_socket(self):
+        sock = mock.Mock()
+        with mock.patch.object(netroute.sys, "platform", "linux"), \
+             mock.patch.object(netroute.socket, "SO_BINDTODEVICE", 25, create=True):
+            netroute.bind_socket(sock, "eth0")
+        sock.setsockopt.assert_called_once_with(netroute.socket.SOL_SOCKET, 25, b"eth0\0")
+
+    def test_ipv6_default_is_detected(self):
+        with mock.patch.object(netroute.sys, "platform", "linux"), \
+             mock.patch.object(netroute.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, "default via fe80::1", "")):
+            self.assertTrue(netroute.ipv6_default_route_present())
+
+    def test_macos_ipv6_route_check_fails_closed(self):
+        with mock.patch.object(netroute.sys, "platform", "darwin"), \
+             mock.patch.object(netroute.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 1, "", "permission denied")):
+            with self.assertRaisesRegex(netroute.RouteError, "permission denied"):
+                netroute.ipv6_default_route_present()
+
+    def test_macos_ipv6_default_from_routing_table(self):
+        table = "Routing tables\nInternet6:\nDestination Gateway Flags Netif\n" \
+                "default fe80::%en0 UGc en0\n::1 ::1 UHL lo0\n"
+        with mock.patch.object(netroute.sys, "platform", "darwin"), \
+             mock.patch.object(netroute.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, table, "")):
+            self.assertTrue(netroute.ipv6_default_route_present())
 
 
 class TestLanRoutes(unittest.TestCase):
@@ -76,11 +100,14 @@ class TestLanRoutes(unittest.TestCase):
         self.ftr = netroute.FullTunnelRoutes("remotemac0", "10.0.0.1", "eth0")
         self.cmds = []
         # Capture the raw route commands without running them (no privilege).
-        netroute._run = lambda cmd: self.cmds.append(cmd)
+        self.add_patch = mock.patch.object(netroute, "_run", side_effect=self.cmds.append)
+        self.cleanup_patch = mock.patch.object(netroute, "_cleanup", side_effect=self.cmds.append)
+        self.add_patch.start()
+        self.cleanup_patch.start()
 
     def tearDown(self):
-        import importlib
-        importlib.reload(netroute)   # restore the real _run for other tests
+        self.add_patch.stop()
+        self.cleanup_patch.stop()
 
     def test_install_is_idempotent_and_tracked(self):
         self.ftr.install_lan_routes(["10.0.0.0/8", "172.16.0.0/12"])

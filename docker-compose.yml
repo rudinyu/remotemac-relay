@@ -11,6 +11,8 @@ services:
       dockerfile: docker/Dockerfile.relay
     image: remotemac-relay
     restart: unless-stopped
+    environment:
+      REMOTEMAC_RELAY_HOST_TOKEN: ${REMOTEMAC_RELAY_HOST_TOKEN:-}
     ports:
       - "21118:21118"
     healthcheck:

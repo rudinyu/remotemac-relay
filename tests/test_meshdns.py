@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
@@ -83,15 +84,18 @@ class TestUpstreamParsers(unittest.TestCase):
 
 
 class TestResolverConfigHelpers(unittest.TestCase):
-    def test_linux_resolvconf_keeps_upstream_as_fallback(self):
-        body = meshdns.linux_resolvconf("100.64.0.2", "192.168.0.1")
-        self.assertEqual(body, "nameserver 100.64.0.2\nnameserver 192.168.0.1\n")
-
-    def test_linux_resolvconf_dedupes_and_handles_missing_upstream(self):
-        self.assertEqual(meshdns.linux_resolvconf("100.64.0.2", None), "nameserver 100.64.0.2\n")
-        # upstream == our IP would be a pointless (and looping) fallback → dropped
-        self.assertEqual(meshdns.linux_resolvconf("100.64.0.2", "100.64.0.2"),
-                         "nameserver 100.64.0.2\n")
+    def test_linux_uses_route_only_domain_without_rewriting_resolv_conf(self):
+        with mock.patch.object(meshdns.sys, "platform", "linux"), \
+             mock.patch.object(meshdns.subprocess, "run") as run:
+            cfg = meshdns.ResolverConfig("mesh", "127.0.0.1", interface="remotemac0")
+            cfg.apply()
+            cfg.restore()
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands, [
+            ["resolvectl", "dns", "remotemac0", "127.0.0.1"],
+            ["resolvectl", "domain", "remotemac0", "~mesh"],
+            ["resolvectl", "revert", "remotemac0"],
+        ])
 
     def test_macos_resolver_path(self):
         self.assertEqual(meshdns.macos_resolver_file("mesh"), "/etc/resolver/mesh")
@@ -145,6 +149,29 @@ class TestServerIntegration(unittest.TestCase):
 
     def test_other_name_forwarded_to_upstream(self):
         self.assertEqual(_answer_ip(self._ask("example.com")), "9.9.9.9")
+
+    def test_slow_query_does_not_block_other_queries(self):
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.server._handle
+
+        def delayed(data, addr):
+            if meshdns.parse_query(data)[1] == "laptop.mesh":
+                entered.set()
+                release.wait(2)
+            original(data, addr)
+
+        self.server._handle = delayed
+        slow = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            slow.sendto(_query("laptop.mesh"), self.server.address)
+            self.assertTrue(entered.wait(1))
+            started = time.monotonic()
+            self.assertEqual(_answer_ip(self._ask("gw.mesh")), "100.64.0.9")
+            self.assertLess(time.monotonic() - started, 1.5)
+        finally:
+            release.set()
+            slow.close()
 
     def test_no_self_forward_loop(self):
         # An upstream equal to our own address (host+port) must NOT be forwarded

@@ -144,6 +144,14 @@ class TestRegistrationProof(unittest.TestCase):
 
 @unittest.skipUnless(_HAVE_CRYPTO, "cryptography not installed")
 class TestSubnetRouteHelpers(unittest.TestCase):
+    def test_route_grants_require_a_full_key_and_cidr(self):
+        key = mesh._b64(mesh.pub_bytes(X25519PrivateKey.generate()))
+        self.assertEqual(mesh.parse_route_grants([key + ",10.20.1.5/16"]),
+                         {key: {"10.20.0.0/16"}})
+        for bad in ("bad,10.20.0.0/16", key + ",not-a-cidr", key + ",::/0"):
+            with self.assertRaises(ValueError):
+                mesh.parse_route_grants([bad])
+
     def test_parse_cidrs_normalizes_and_skips_bad(self):
         self.assertEqual(mesh.parse_cidrs("192.168.1.0/24, 10.0.0.5/8"),
                          ["192.168.1.0/24", "10.0.0.0/8"])   # host bits masked off
@@ -225,12 +233,12 @@ class TestMeshEndToEnd(unittest.TestCase):
         except OSError:
             pass
 
-    def _node(self, name, advertise_routes=None, accept_routes=False,
+    def _node(self, name, advertise_routes=None, route_grants=None,
               is_exit=False, exit_node=None, identity=None):
         n = mesh.MeshNode(identity or X25519PrivateKey.generate(), name, is_exit=is_exit,
                           advertise_routes=advertise_routes)
-        n.accept_routes = accept_routes
-        n.exit_node_name = exit_node
+        n.route_grants = route_grants or {}
+        n.exit_node_key = exit_node
         n.connect(f"127.0.0.1:{self.port}", self.token)
         threading.Thread(target=n.run, daemon=True).start()
         self.nodes.append(n)
@@ -595,13 +603,13 @@ class TestMeshEndToEnd(unittest.TestCase):
         # it (via the coordinator), routes matching packets to that peer, and
         # accepts LAN-sourced replies from it (anti-spoof widened for routers).
         gw = self._node("gw", advertise_routes=["192.168.1.0/24"])
-        client = self._node("laptop", accept_routes=True)
+        client = self._node("laptop", route_grants={gw.pubkey_b64: {"192.168.1.0/24"}})
 
         self.assertTrue(self._wait(
             lambda: gw.pubkey_b64 in client.peers
             and client.peers[gw.pubkey_b64].get("routes") == ["192.168.1.0/24"]),
             "client did not learn the advertised route via the coordinator")
-        # The route table is rebuilt from the map when accept_routes is on.
+        # The route table is rebuilt only from explicitly trusted claims.
         self.assertTrue(self._wait(lambda: client.route_for("192.168.1.50") == gw.pubkey_b64))
         # A non-advertised destination stays unroutable.
         self.assertIsNone(client.route_for("8.8.8.8"))
@@ -613,17 +621,26 @@ class TestMeshEndToEnd(unittest.TestCase):
 
     def test_routes_ignored_without_accept(self):
         gw = self._node("gw2", advertise_routes=["192.168.9.0/24"])
-        client = self._node("laptop2")            # accept_routes defaults off
+        client = self._node("laptop2")            # no route grants
         self.assertTrue(self._wait(lambda: gw.pubkey_b64 in client.peers))
         # Learned in the map, but not installed as a route (no opt-in).
         self.assertEqual(client.peers[gw.pubkey_b64].get("routes"), ["192.168.9.0/24"])
         self.assertIsNone(client.route_for("192.168.9.5"))
 
+    def test_route_grant_cannot_be_claimed_by_another_peer(self):
+        trusted = self._node("trusted-router", advertise_routes=["10.20.0.0/16"])
+        rogue = self._node("rogue-router", advertise_routes=["10.20.0.0/16"])
+        client = self._node("route-client",
+                            route_grants={trusted.pubkey_b64: {"10.20.0.0/16"}})
+        self.assertTrue(self._wait(lambda: rogue.pubkey_b64 in client.peers))
+        self.assertTrue(self._wait(lambda: client.route_for("10.20.1.2") == trusted.pubkey_b64))
+        self.assertFalse(client.src_permitted(rogue.pubkey_b64, "10.20.1.2"))
+
     def test_exit_node_full_tunnel_routing(self):
         # A client with --exit-node routes all non-overlay/non-subnet traffic to
         # the exit peer, and accepts replies from it sourced from any address.
         ex = self._node("exit", is_exit=True)
-        client = self._node("laptop3", exit_node="exit")
+        client = self._node("laptop3", exit_node=ex.pubkey_b64)
 
         self.assertTrue(self._wait(lambda: client.exit_node_pk == ex.pubkey_b64),
                         "client did not resolve the exit node")
@@ -643,10 +660,10 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertIsNone(a.route_for("8.8.8.8"))
 
     def test_exit_node_ignored_if_peer_not_advertising_exit(self):
-        # Naming a peer that isn't an exit must not enable full-tunnel: exit_node_pk
+        # Pinning a peer that isn't an exit must not enable full-tunnel: exit_node_pk
         # stays unresolved and internet traffic stays unrouted.
         plain = self._node("not-an-exit")
-        client = self._node("laptop4", exit_node="not-an-exit")
+        client = self._node("laptop4", exit_node=plain.pubkey_b64)
         self.assertTrue(self._wait(lambda: plain.pubkey_b64 in client.peers))
         # Give the map a moment; the non-exit peer must never resolve as the exit.
         time.sleep(0.3)
@@ -668,31 +685,21 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertIsNone(imp.overlay_ip, "imposter was admitted despite a bad proof")
         self.assertNotIn(imp.pubkey_b64, good.peers)
 
-    def test_transport_ips_scoped_to_connected_peers(self):
-        # transport_ips() must only pin the coordinator + peers we actually have a
-        # connection to (+ the exit), not every advertised endpoint in the map.
-        a = self._node("ti-a")
-        b = self._node("ti-b")
-        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers))
-        coord_ip = a._coord_udp[0]
-
-        # b advertises an endpoint but a has NOT connected to it yet → not pinned.
-        with a._lock:
-            a.peers[b.pubkey_b64]["endpoints"] = ["203.0.113.9:41000"]
-        self.assertEqual(a.transport_ips(), {coord_ip})
-
-        # After a talks to b, b's endpoint IS pinned.
-        a.send(a.resolve("ti-b"), mesh.MESH_PING, b"x")
-        self.assertTrue(self._wait(lambda: "203.0.113.9" in a.transport_ips()
-                                   or b.pubkey_b64 in a._conns))
-        self.assertIn("203.0.113.9", a.transport_ips())
-
     def test_resolve_by_overlay_ip(self):
         a = self._node("alice2")
         b = self._node("bob2")
         self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers))
         bob_ip = a.peers[b.pubkey_b64]["ip"]
         self.assertEqual(a.resolve(bob_ip), b.pubkey_b64)
+
+    def test_duplicate_hostnames_fail_closed(self):
+        n = mesh.MeshNode(X25519PrivateKey.generate(), "client")
+        n.peers = {
+            "first": {"hostname": "same", "ip": "100.64.0.2"},
+            "second": {"hostname": "same", "ip": "100.64.0.3"},
+        }
+        self.assertIsNone(n.resolve("same"))
+        self.assertIsNone(n.dns_lookup("same"))
 
 
 if __name__ == "__main__":

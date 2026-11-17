@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 QTYPE_A = 1
 QTYPE_AAAA = 28
@@ -130,54 +131,48 @@ def _first_nameserver_scutil(text: str):
     return None
 
 
-def linux_resolvconf(dns_ip: str, upstream: str) -> str:
-    """The /etc/resolv.conf body: our resolver first, the real upstream kept as a
-    fallback so a crash degrades (timeout → upstream) rather than breaking DNS."""
-    lines = [f"nameserver {dns_ip}\n"]
-    if upstream and upstream != dns_ip:
-        lines.append(f"nameserver {upstream}\n")
-    return "".join(lines)
-
-
 def macos_resolver_file(suffix: str) -> str:
     """Path of the macOS per-domain resolver file for `suffix`."""
     return f"/etc/resolver/{suffix}"
 
 
 class ResolverConfig:
-    """Point the OS resolver at our split-DNS server and restore it on exit.
+    """Route only the mesh DNS suffix to our loopback resolver.
 
-    macOS uses a per-domain `/etc/resolver/<suffix>` file, so ONLY `.<suffix>`
-    queries go to us and the global resolver is untouched. Linux rewrites
-    `/etc/resolv.conf` (our server first, the real upstream as a fallback),
-    backing up the original. (On a systemd-resolved / NetworkManager host,
-    `/etc/resolv.conf` may be re-managed; the original bytes are restored on a
-    clean exit.) Needs root."""
+    macOS uses a per-domain resolver file. Linux uses systemd-resolved's
+    per-link DNS and route-only domain; other host DNS settings are untouched.
+    An unsupported Linux resolver requires manual configuration. Needs root."""
 
-    def __init__(self, suffix: str, dns_ip: str, upstream: str = None):
+    def __init__(self, suffix: str, dns_ip: str, upstream: str = None, interface: str = None):
         self.suffix = suffix.strip(".").lower()
         self.dns_ip = dns_ip
         self.upstream = upstream
+        self.interface = interface
         self._is_mac = (sys.platform == "darwin")
         self._applied = False
-        self._backup = None            # Linux: original resolv.conf bytes
         self._path = None
 
     def apply(self):
         if self._is_mac:
             os.makedirs("/etc/resolver", exist_ok=True)
             self._path = macos_resolver_file(self.suffix)
-            with open(self._path, "w") as f:
+            with open(self._path, "x") as f:
                 f.write(f"nameserver {self.dns_ip}\n")
         elif sys.platform.startswith("linux"):
-            self._path = "/etc/resolv.conf"
+            if not self.interface:
+                raise ResolverError("Linux split-DNS needs a TUN interface")
             try:
-                with open(self._path, "rb") as f:
-                    self._backup = f.read()
-            except OSError:
-                self._backup = None
-            with open(self._path, "w") as f:
-                f.write(linux_resolvconf(self.dns_ip, self.upstream))
+                subprocess.run(["resolvectl", "dns", self.interface, self.dns_ip],
+                               check=True, capture_output=True, text=True)
+                subprocess.run(["resolvectl", "domain", self.interface, "~" + self.suffix],
+                               check=True, capture_output=True, text=True)
+            except (OSError, subprocess.CalledProcessError) as exc:
+                try:
+                    subprocess.run(["resolvectl", "revert", self.interface],
+                                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except OSError:
+                    pass
+                raise ResolverError(f"systemd-resolved could not configure .{self.suffix}: {exc}") from exc
         else:
             raise ResolverError(f"resolver auto-config is unsupported on {sys.platform}")
         self._applied = True
@@ -191,10 +186,10 @@ class ResolverConfig:
                 os.unlink(self._path)
             except OSError:
                 pass
-        elif self._backup is not None:
+        elif sys.platform.startswith("linux") and self.interface:
             try:
-                with open(self._path, "wb") as f:
-                    f.write(self._backup)
+                subprocess.run(["resolvectl", "revert", self.interface],
+                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except OSError:
                 pass
         self._applied = False
@@ -229,11 +224,14 @@ class MeshDNSServer:
         self.udp = None
         self._done = threading.Event()
         self._thread = None
+        self._workers = None
+        self._slots = threading.BoundedSemaphore(64)
 
     def start(self):
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.udp.bind((self.bind_ip, self.port))
+        self._workers = ThreadPoolExecutor(max_workers=16, thread_name_prefix="meshdns")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
@@ -250,10 +248,20 @@ class MeshDNSServer:
                 if self._done.is_set():
                     return
                 continue
-            try:
-                self._handle(data, addr)
-            except Exception:
-                pass
+            if self._slots.acquire(blocking=False):
+                try:
+                    self._workers.submit(self._handle_safely, data, addr)
+                except RuntimeError:
+                    self._slots.release()  # stop() shut down the executor
+                    return
+
+    def _handle_safely(self, data, addr):
+        try:
+            self._handle(data, addr)
+        except Exception:
+            pass
+        finally:
+            self._slots.release()
 
     def _handle(self, data, addr):
         try:
@@ -292,3 +300,5 @@ class MeshDNSServer:
                 pass
         if self._thread:
             self._thread.join(timeout=2)
+        if self._workers:
+            self._workers.shutdown(wait=True)

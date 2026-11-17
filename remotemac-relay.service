@@ -8,6 +8,7 @@ Description=RemoteMac rendezvous relay
 After=network.target
 
 [Service]
+EnvironmentFile=-/etc/remotemac/relay.env
 ExecStart=/usr/bin/python3 /opt/remotemac/relay.py 21118
 Restart=always
 RestartSec=2

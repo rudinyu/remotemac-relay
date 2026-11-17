@@ -96,6 +96,7 @@ Description=RemoteMac rendezvous relay
 After=network.target
 
 [Service]
+EnvironmentFile=-$ENV_DIR/relay.env
 ExecStart=$PY $PREFIX/relay.py $RELAY_PORT
 Restart=always
 RestartSec=2

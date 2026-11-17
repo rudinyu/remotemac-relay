@@ -145,24 +145,33 @@ ping 100.64.0.3        # another node's overlay IP; log shows [direct] or [derp]
 **Subnet router** — expose a LAN behind a Linux node:
 
 ```bash
+# On gw, run `sudo python3 mesh.py key` and copy the full public key.
 sudo python3 mesh.py up coord…:21200 --token "…" --name gw --tun --advertise-routes 192.168.1.0/24
 # on a client:
-sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --accept-routes
+sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --accept-route GW_PUBKEY,192.168.1.0/24
 ```
 
-**Full-tunnel exit node** — send all traffic through a Linux exit (opt-in):
+**IPv4 exit node** — send IPv4 default traffic through a Linux exit (opt-in):
 
 ```bash
+# On exit, run `sudo python3 mesh.py key` and copy the full public key.
 sudo python3 mesh.py up coord…:21200 --token "…" --name exit   --tun --exit
-sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --exit-node exit
+sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --exit-node EXIT_PUBKEY
 curl https://ifconfig.me   # shows the exit's public IP
 ```
+
+The IPv4 exit refuses to start when an IPv6 default route exists. Use
+`--allow-ipv6-bypass` only if direct IPv6 traffic is acceptable.
 
 **split-DNS** — reach peers by name (`ssh laptop.mesh`):
 
 ```bash
 sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --dns
 ```
+
+Linux automatic setup uses systemd-resolved (`resolvectl`) for only the `.mesh`
+domain. If unavailable, the local DNS server still starts and prints a manual
+`dig @127.0.0.1` check; it does not rewrite `/etc/resolv.conf`.
 
 > `--tun` and the routing/DNS features need **root**. On Linux a subnet/exit node
 > also needs `nftables` (or `iptables`) and IP forwarding — the tool sets these up.
@@ -181,6 +190,14 @@ python3 remote_desktop.py host relay.example.com:21118 mydevice --psk "strong-pa
 # on the controlling machine (viewer)
 python3 remote_desktop.py viewer relay.example.com:21118 mydevice --psk "strong-passphrase"
 ```
+
+For Python hosts, set the same strong `REMOTEMAC_RELAY_HOST_TOKEN` on the relay
+and host before starting them. The relay then authenticates host registrations
+before reserving device IDs. The existing Mac/iPad host app uses the legacy relay
+protocol, so leave this variable unset when using that app.
+For Docker, set it in `.env`; for systemd, put
+`REMOTEMAC_RELAY_HOST_TOKEN=<strong secret>` in `/etc/remotemac/relay.env`
+(mode `0600`) and restart the relay. Set it in the Python host's environment too.
 
 macOS host needs **Screen Recording** + **Accessibility** permissions. Prefer
 `REMOTEMAC_PSK` over `--psk` so the secret isn't visible in `ps`. See the

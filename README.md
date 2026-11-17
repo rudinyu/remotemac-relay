@@ -45,6 +45,12 @@ The relay does exactly one thing: pair two outbound TCP connections and forward 
 - Runs as `nobody` (the systemd unit is preconfigured)
 - Built-in DoS protection: max 5 concurrent connections per IP, max 10,000 registered hosts
 
+For Python hosts, set `REMOTEMAC_RELAY_HOST_TOKEN` to the same strong secret on
+the relay and each host. The relay then challenges a host before reserving its
+device ID. Legacy Mac/iPad hosts do not implement this registration extension;
+leave the variable unset when using them. In legacy mode, anyone who knows a
+device ID can occupy its relay slot until that connection closes.
+
 ### remote_desktop.py — encrypted channel + remote desktop
 
 Once the relay has bridged the two connections, `remote_desktop.py` runs a **mutually authenticated + encrypted** protocol on top:
@@ -462,27 +468,28 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 - **Subnet routing (Phase 4).** A node can be a **subnet router**: with
   `--advertise-routes 192.168.1.0/24` it announces LAN CIDRs it can reach and (on
   Linux) sets up IP forwarding + nftables masquerade, so other nodes reach hosts
-  *behind* it. A client opts in with `--accept-routes`, installs routes for the
-  advertised CIDRs via its TUN, and sends matching traffic to that peer. Only the
+  *behind* it. A client explicitly grants one CIDR to one peer public key with
+  `--accept-route PUBKEY,CIDR`, installs that route via its TUN, and sends matching
+  traffic to that peer. Only the
   named subnets go through the mesh — the default route is untouched. Advertised
   CIDRs that overlap the overlay or contain the coordinator / a peer endpoint are
   refused (so mesh transport can't loop), and a subnet router may source replies
   from within the routes you accepted (anti-spoof stays enforced otherwise).
-- **Full-tunnel exit node (Phase 5, opt-in).** A client can route **all** its
-  outbound traffic through a chosen exit node with `--exit-node NAME`, so its
+- **IPv4 exit node (Phase 5, opt-in).** A client can route its IPv4 default
+  traffic through a pinned exit node with `--exit-node PUBKEY`, so its IPv4
   public IP becomes the exit's (like a commercial VPN's server picker). The exit
   node is a Linux node started with `--exit` (reuses the same IP-forwarding +
-  masquerade). The client pins mesh transport (coordinator + peer endpoints) to
-  its physical gateway, then routes `0.0.0.0/1`+`128.0.0.0/1` through the TUN — so
-  the default route is overridden without breaking the mesh's own transport. This
+  masquerade). The client binds its mesh transport sockets to the physical
+  interface, then routes `0.0.0.0/1`+`128.0.0.0/1` through the TUN. Route setup
+  errors abort startup; peer endpoint IPs do not get destination-wide bypass routes. This
   is **off by default**; without `--exit-node` the default route is untouched.
 - **split-DNS (Phase 8, opt-in).** With `--dns`, a node runs a tiny resolver that
   answers `<name>.mesh` with the peer's overlay IP and forwards everything else to
   your existing upstream — so `ssh laptop.mesh` works instead of memorizing overlay
-  IPs. It binds `127.0.0.1:53` (local-only) and points the OS resolver at itself:
-  macOS via a per-domain `/etc/resolver/mesh` file (global DNS untouched); Linux by
-  rewriting `/etc/resolv.conf` (our server first, the real upstream kept as a
-  fallback), restored on exit.
+  IPs. It binds `127.0.0.1:53` (local-only) and routes only `.mesh` queries to
+  itself: macOS uses `/etc/resolver/mesh`; Linux uses `resolvectl` on the TUN
+  interface when systemd-resolved is available. Other DNS settings stay intact.
+  On other Linux resolver setups, the server runs but OS DNS must be configured manually.
 
 ```bash
 # Overlay only: full data plane on two machines (root); use overlay IPs directly:
@@ -490,14 +497,14 @@ sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name 
 sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name b --tun
 ping 100.64.0.3      # a → b over the overlay; the mesh log shows [direct] or [derp]
 
-# Subnet router: a Linux node exposes its LAN to the mesh; a client accepts it:
+# Subnet router: on gw, run `sudo python3 mesh.py key` and copy its full public key:
 sudo python3 mesh.py up coord…:21200 --token … --name gw     --tun --advertise-routes 192.168.1.0/24
-sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --accept-routes
+sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --accept-route GW_PUBKEY,192.168.1.0/24
 ping 192.168.1.1     # laptop reaches the LAN behind gw, through the mesh
 
-# Full-tunnel: a Linux exit node, and a client that sends all traffic through it:
+# IPv4 exit: on exit, run `sudo python3 mesh.py key` and copy its full public key:
 sudo python3 mesh.py up coord…:21200 --token … --name exit   --tun --exit
-sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --exit-node exit
+sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --exit-node EXIT_PUBKEY
 curl https://ifconfig.me      # shows the exit node's public IP, not the client's
 
 # split-DNS: reach peers by name
@@ -517,10 +524,11 @@ drops (coordinator restart, network change, or a dead connection — detected af
 (1 s → 30 s) and keeps its overlay IP; established direct sessions keep working
 meanwhile. `--tun` enables the VPN interface; `--tun-mtu`
 (default 1280) and `--tun-name` (Linux interface name, default `remotemac0`) tune it.
-`--advertise-routes CIDR,…` / `--accept-routes` enable subnet routing; `--exit`
-advertises a full-tunnel exit node and `--exit-node NAME` routes all traffic through
+`--advertise-routes CIDR,…` / repeatable `--accept-route PUBKEY,CIDR` enable subnet routing; `--exit`
+advertises an exit node and `--exit-node PUBKEY` routes IPv4 default traffic through
 one (all need `--tun`); `--lan-routes CIDR,…` keeps extra local subnets off the tunnel
-(see below); `--dns` runs split-DNS (`--dns-suffix`, `--dns-upstream` to tune);
+(see below); `--allow-ipv6-bypass` explicitly permits direct IPv6 when an IPv6
+default route exists; `--dns` runs split-DNS (`--dns-suffix`, `--dns-upstream` to tune);
 `--egress IFACE` overrides the NAT egress interface. (A host with a restrictive
 FORWARD firewall policy needs a manual allow rule for the overlay net.)
 
@@ -531,6 +539,9 @@ FORWARD firewall policy needs a manual allow rule for the overlay net.)
 > specific than the `0.0.0.0/1`+`128.0.0.0/1` split); only traffic that would have used
 > the default gateway is tunneled. To also keep *other* local subnets reachable via
 > your LAN router, list them with `--lan-routes 10.0.0.0/8,172.16.0.0/12`.
+> The exit is IPv4-only. Startup refuses an existing IPv6 default route unless
+> you explicitly use `--allow-ipv6-bypass`, which sends IPv6 traffic directly.
+> A new IPv6 route appearing after startup is outside this check.
 
 **Status / roadmap.** Phase 1 delivered the control plane, per-node identity, host
 pool + selection, and a relayed encrypted data path. Phase 2 added UDP P2P with NAT
@@ -587,6 +598,6 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 | `mesh.py` | Mesh node — X25519 identity, UDP P2P data plane with NAT hole punching + direct↔DERP failover, TUN overlay (`--tun`). Needs `cryptography` |
 | `tun.py` | TUN virtual interface for the overlay (macOS `utun` / Linux `/dev/net/tun`) — used by `mesh.py --tun`. Needs root |
 | `nat.py` | Linux NAT egress for a subnet router / exit node (`--advertise-routes` / `--exit`) — IP forwarding + masquerade (nftables, or iptables fallback). Needs root |
-| `netroute.py` | Full-tunnel route manager (`--exit-node`) — default-route redirect + transport pinning, macOS + Linux. Needs root |
-| `meshdns.py` | split-DNS resolver (`--dns`) — answers `<name>.mesh`, forwards the rest; auto-configures the OS resolver (macOS `/etc/resolver`, Linux `resolv.conf`). Needs root |
+| `netroute.py` | IPv4 exit route manager (`--exit-node`) — checked default-route redirect + per-socket transport binding, macOS + Linux. Needs root |
+| `meshdns.py` | split-DNS resolver (`--dns`) — answers `<name>.mesh`, forwards the rest; configures only the mesh suffix (macOS `/etc/resolver`, Linux `resolvectl`). Needs root |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |

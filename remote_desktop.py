@@ -68,7 +68,7 @@ import sys
 import threading
 import time
 
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 
 # ─── tunables ────────────────────────────────────────────────────────────────
 
@@ -226,6 +226,14 @@ def _relay_connect(relay_addr: str, device_id: str, is_host: bool) -> socket.soc
 
     resp = _read_exactly(sock, 1)
     if is_host:
+        if resp == b"A":
+            token = os.environ.get("REMOTEMAC_RELAY_HOST_TOKEN")
+            if not token:
+                sock.close()
+                raise ConnectionError("relay requires REMOTEMAC_RELAY_HOST_TOKEN for host registration")
+            nonce = _read_exactly(sock, 32)
+            sock.sendall(_hmac(token.encode(), b"host-register" + rid + nonce))
+            resp = _read_exactly(sock, 1)
         if resp != b"R":
             sock.close()
             raise ConnectionError(f"relay rejected host registration: {resp!r}")

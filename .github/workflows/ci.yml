@@ -27,3 +27,18 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v
+
+  swift:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install interoperability dependency
+        run: python -m pip install cryptography
+      - name: Test native viewer and Python interoperability
+        run: |
+          cd mac-native
+          swift test
+          ./interop-test.sh
