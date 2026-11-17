@@ -144,7 +144,7 @@ sudo python3 mesh.py up coord.example.com:21200 --token "…" --name laptop --tu
 ping 100.64.0.3        # another node's overlay IP; log shows [direct] or [derp]
 ```
 
-**Subnet router** — expose a LAN behind a Linux node:
+**Subnet router** — expose a LAN behind a Linux or macOS node:
 
 ```bash
 # On gw, run `sudo python3 mesh.py key` and copy the full public key.
@@ -153,7 +153,7 @@ sudo python3 mesh.py up coord…:21200 --token "…" --name gw --tun --advertise
 sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --accept-route GW_PUBKEY,192.168.1.0/24
 ```
 
-**IPv4 exit node** — send IPv4 default traffic through a Linux exit (opt-in):
+**IPv4 exit node** — send IPv4 default traffic through a Linux or macOS exit (opt-in):
 
 ```bash
 # On exit, run `sudo python3 mesh.py key` and copy the full public key.
@@ -164,6 +164,8 @@ curl https://ifconfig.me   # shows the exit's public IP
 
 The IPv4 exit refuses to start when an IPv6 default route exists. Use
 `--allow-ipv6-bypass` only if direct IPv6 traffic is acceptable.
+Upgrade the coordinator before enabling a macOS gateway with this node version;
+macOS gateway status is published after forwarding and NAT setup succeeds.
 
 **split-DNS** — reach peers by name (`ssh laptop.mesh`):
 

@@ -121,7 +121,7 @@ sudo python3 mesh.py up coord.example.com:21200 --token "…" --name laptop --tu
 ping 100.64.0.3        # 另一節點的 overlay IP;log 顯示 [direct] 或 [derp]
 ```
 
-**子網路由** —— 把某台 Linux 節點背後的 LAN 開放給 mesh:
+**子網路由** —— 把某台 Linux 或 macOS 節點背後的 LAN 開放給 mesh:
 
 ```bash
 # 在 gw 執行 `sudo python3 mesh.py key` 取得完整公鑰
@@ -130,7 +130,7 @@ sudo python3 mesh.py up coord…:21200 --token "…" --name gw --tun --advertise
 sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --accept-route GW_PUBKEY,192.168.1.0/24
 ```
 
-**IPv4 出口節點** —— 讓 IPv4 預設流量繞經某台 Linux 出口(opt-in):
+**IPv4 出口節點** —— 讓 IPv4 預設流量繞經某台 Linux 或 macOS 出口(opt-in):
 
 ```bash
 # 在 exit 執行 `sudo python3 mesh.py key` 取得完整公鑰
@@ -140,6 +140,7 @@ curl https://ifconfig.me   # 顯示出口的公網 IP
 ```
 
 此出口僅支援 IPv4。已有 IPv6 預設路由時會拒絕啟動;若接受 IPv6 直連,可明確加入 `--allow-ipv6-bypass`。
+新版 macOS gateway 節點需先升級 coordinator;節點會等 TUN 與 NAT 就緒後才宣告出口。
 
 **split-DNS** —— 用名字連 peer(`ssh laptop.mesh`):
 
@@ -149,7 +150,7 @@ sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --dns
 
 Linux 自動設定只支援 systemd-resolved(`resolvectl`),只導向 `.mesh` 網域;不改寫 `/etc/resolv.conf`。其他 Linux DNS 設定需手動處理。
 
-> `--tun` 與路由/DNS 功能需要 **root**。Linux 上的 subnet/exit 節點還需要 `nftables`(或 `iptables`)與 IP forwarding —— 工具會幫你設好。在容器裡跑 mesh 節點另外需要 `--cap-add=NET_ADMIN --device /dev/net/tun`。細節見 [README](README.zh-TW.md) 的 mesh 章節。
+> `--tun` 與路由/DNS 功能需要 **root**。Linux 上的 subnet/exit 節點還需要 `nftables`(或 `iptables`)與 IP forwarding;macOS 使用 PF NAT。工具會幫你設定。在容器裡跑 mesh 節點另外需要 `--cap-add=NET_ADMIN --device /dev/net/tun`。細節見 [README](README.zh-TW.md) 的 mesh 章節。
 
 ---
 

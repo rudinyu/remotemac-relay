@@ -248,9 +248,10 @@ class TestMeshEndToEnd(unittest.TestCase):
             pass
 
     def _node(self, name, advertise_routes=None, route_grants=None,
-              is_exit=False, exit_node=None, identity=None):
+              is_exit=False, exit_node=None, identity=None, advertise_ready=True):
         n = mesh.MeshNode(identity or X25519PrivateKey.generate(), name, is_exit=is_exit,
                           advertise_routes=advertise_routes)
+        n.advertise_ready = advertise_ready
         n.route_grants = route_grants or {}
         n.exit_node_key = exit_node
         n.connect(f"127.0.0.1:{self.port}", self.token)
@@ -403,6 +404,9 @@ class TestMeshEndToEnd(unittest.TestCase):
         # independent (the designated initiator re-punches once it can reach us).
         db = b.resolve("rc-a")
         real_a_eps, real_b_eps = a._peer_endpoints, b._peer_endpoints
+        real_a_udp, real_b_udp = a._on_udp, b._on_udp
+        a._on_udp = lambda data, addr: None
+        b._on_udp = lambda data, addr: None
         a._peer_endpoints = lambda pk: []
         b._peer_endpoints = lambda pk: []
         for n in (a, b):
@@ -416,6 +420,7 @@ class TestMeshEndToEnd(unittest.TestCase):
                         "did not fail over to DERP")
 
         # Reachability returns → the periodic re-punch must restore a direct path.
+        a._on_udp, b._on_udp = real_a_udp, real_b_udp
         a._peer_endpoints, b._peer_endpoints = real_a_eps, real_b_eps
         self.assertTrue(self._wait(lambda: a._conns[da].transport == "direct", 8),
                         "did not recover a direct path after reachability returned")
@@ -667,6 +672,23 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertFalse(client.src_permitted("some-other-pk", "93.184.216.34"))
         self.assertIsNone(client.route_for("2001:4860:4860::8888"))
         self.assertFalse(client.src_permitted(ex.pubkey_b64, "2001:4860:4860::8888"))
+
+    def test_gateway_is_advertised_only_after_it_is_ready(self):
+        gateway = self._node("deferred-gateway", is_exit=True,
+                             advertise_routes=["192.168.4.0/24"], advertise_ready=False)
+        client = self._node("deferred-client")
+        self.assertTrue(self._wait(lambda: gateway.pubkey_b64 in client.peers))
+        self.assertFalse(client.peers[gateway.pubkey_b64]["exit"])
+        self.assertEqual(client.peers[gateway.pubkey_b64]["routes"], [])
+
+        gateway.set_gateway_ready(True)
+        self.assertTrue(self._wait(lambda: client.peers[gateway.pubkey_b64]["exit"]
+                                  and client.peers[gateway.pubkey_b64]["routes"]
+                                  == ["192.168.4.0/24"]))
+
+        gateway.set_gateway_ready(False)
+        self.assertTrue(self._wait(lambda: not client.peers[gateway.pubkey_b64]["exit"]
+                                  and client.peers[gateway.pubkey_b64]["routes"] == []))
 
     def test_no_exit_node_leaves_internet_unrouted(self):
         # Without --exit-node, internet destinations stay unroutable (dropped).

@@ -59,7 +59,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
@@ -421,6 +421,9 @@ class MeshNode:
         self._bind_host = bind_host
         self._udp_port  = udp_port
         self.advertise_routes = list(advertise_routes or [])   # CIDRs I route to
+        self.advertise_ready = True       # macOS CLI defers this until TUN/PF setup
+        self._advertise_ack = threading.Event()
+        self._advertise_id = None
         self.route_grants = {}            # pubkey -> set of approved CIDRs
         self._route_table = []            # [(ip_network, pubkey)], longest-prefix first
         self.exit_node_key = None         # pinned peer public key for full-tunnel
@@ -538,9 +541,23 @@ class MeshNode:
         with self._lock:
             endpoints = list(self.local_endpoints)
         self._send({"t": "register", "pubkey": self.pubkey_b64, "proof": proof,
-                    "hostname": self.hostname, "exit": self.is_exit,
+                    "hostname": self.hostname,
+                    "exit": self.is_exit if self.advertise_ready else False,
                     "endpoints": endpoints,
-                    "routes": self.advertise_routes})
+                    "routes": self.advertise_routes if self.advertise_ready else []})
+
+    def set_gateway_ready(self, ready: bool, timeout: float = 5.0):
+        """Publish or withdraw gateway routes after local forwarding changes."""
+        self.advertise_ready = ready
+        self._advertise_id = os.urandom(8).hex()
+        self._advertise_ack.clear()
+        self._send({"t": "advertise", "id": self._advertise_id,
+                    "exit": self.is_exit if ready else False,
+                    "routes": self.advertise_routes if ready else []})
+        if not self._advertise_ack.wait(timeout):
+            self.advertise_ready = False
+            raise RuntimeError("coordinator did not acknowledge gateway advertisement; "
+                               "upgrade the coordinator")
 
     def _reconnect(self) -> bool:
         """Reopen a lost control channel, backing off between attempts. Returns
@@ -700,6 +717,8 @@ class MeshNode:
             self._on_map(msg)
         elif t == "from":
             self._on_from(msg)
+        elif t == "advertise" and msg.get("id") == self._advertise_id:
+            self._advertise_ack.set()
 
     def _on_map(self, msg: dict):
         self_info = msg.get("self") or {}
@@ -1259,9 +1278,18 @@ def _run_tun(node, mtu, name, egress=None):
             extra = (f" for routes {','.join(node.advertise_routes)}"
                      if node.advertise_routes else " (full-tunnel)")
             _log(f"{role}: masquerading {tun.OVERLAY_CIDR} out {snat.egress}{extra}")
+        elif sys.platform == "darwin":
+            import macnat
+            try:
+                snat = macnat.MacNat(tun.OVERLAY_CIDR, egress,
+                                    tun_name=dev.name).apply()
+            except macnat.MacNatError as exc:
+                dev.close()
+                sys.exit(f"error: {role} NAT setup failed: {exc}")
+            _log(f"{role}: PF masquerading {tun.OVERLAY_CIDR} out {snat.egress}")
         else:
-            _log(f"note: running as {role}, but NAT egress is Linux-only — "
-                 f"traffic won't be forwarded on {sys.platform}")
+            dev.close()
+            sys.exit(f"error: {role} NAT egress is unsupported on {sys.platform}")
 
     _last_warn = [0.0]
     def _warn(msg):
@@ -1320,7 +1348,14 @@ def _run_tun(node, mtu, name, egress=None):
     ftr = None
     dns_server = None
     resolver_cfg = None
+    gateway_ready = False
     try:
+        if (node.is_exit or node.advertise_routes) and not node.advertise_ready:
+            try:
+                node.set_gateway_ready(True)
+            except (OSError, RuntimeError) as exc:
+                sys.exit(f"error: could not advertise gateway: {exc}")
+            gateway_ready = True
         # The TCP and UDP transport sockets were bound to the physical interface
         # before connecting; no destination-wide route exceptions are needed.
         if node.exit_node_key:
@@ -1376,6 +1411,11 @@ def _run_tun(node, mtu, name, egress=None):
     except KeyboardInterrupt:
         pass
     finally:
+        if gateway_ready:
+            try:
+                node.set_gateway_ready(False, timeout=3)
+            except (OSError, RuntimeError) as exc:
+                _log(f"warning: could not withdraw gateway advertisement: {exc}")
         node.close()                               # sets _done → reader unblocks
         reader.join(timeout=2)                     # let it exit before we close the fd
         if resolver_cfg:
@@ -1385,7 +1425,10 @@ def _run_tun(node, mtu, name, egress=None):
         if ftr:
             ftr.teardown()                         # restore default route
         if snat:
-            snat.cleanup()
+            try:
+                snat.cleanup()
+            except Exception as exc:
+                _log(f"warning: gateway NAT cleanup failed: {exc}")
         dev.close()
         _log("TUN down")
 
@@ -1413,8 +1456,8 @@ def _cmd_up(args):
         # Fail fast, before any token prompt / coordinator join, if not root.
         if not hasattr(os, "geteuid") or os.geteuid() != 0:
             sys.exit("error: --tun needs root (creates a virtual interface + routes). Re-run with sudo.")
-    elif advertise or route_grants or exit_node:
-        sys.exit("error: --advertise-routes / --accept-route / --exit-node require --tun")
+    elif advertise or route_grants or exit_node or args.exit:
+        sys.exit("error: --advertise-routes / --accept-route / --exit / --exit-node require --tun")
 
     gateway = iface = None
     if exit_node:
@@ -1445,6 +1488,8 @@ def _cmd_up(args):
     node = MeshNode(identity, name, is_exit=args.exit,
                     bind_host=args.bind, udp_port=args.udp_port,
                     advertise_routes=advertise)
+    if sys.platform == "darwin" and (args.exit or advertise):
+        node.advertise_ready = False
     node.route_grants = route_grants
     node.exit_node_key = exit_node
     node.transport_gateway = gateway
@@ -1503,7 +1548,10 @@ def _cmd_up(args):
         return
 
     if getattr(args, "tun", False):
-        _run_tun(node, args.tun_mtu, args.tun_name, egress=getattr(args, "egress", None))
+        try:
+            _run_tun(node, args.tun_mtu, args.tun_name, egress=getattr(args, "egress", None))
+        finally:
+            node.close()
         return
 
     _log("running — Ctrl-C to leave the mesh")
@@ -1529,7 +1577,7 @@ def main():
     up.add_argument("--token", help="network join token (or set REMOTEMAC_MESH_TOKEN)")
     up.add_argument("--name", help="hostname to advertise (default: system hostname)")
     up.add_argument("--exit", action="store_true",
-                    help="advertise as a full-tunnel exit node (with --tun on Linux: IP forwarding + NAT)")
+                    help="advertise as an IPv4 exit node (with --tun: forwarding + NAT on Linux/macOS)")
     up.add_argument("--bind", default="0.0.0.0", help="UDP data-plane bind address (default 0.0.0.0)")
     up.add_argument("--udp-port", type=int, default=0, help="UDP data-plane port (default: random)")
     up.add_argument("--ping", metavar="PEER", help="ping a peer (name or overlay IP) then exit")
@@ -1539,7 +1587,7 @@ def main():
     up.add_argument("--tun-name", default="remotemac0",
                     help="TUN interface name on Linux (default remotemac0; ignored on macOS)")
     up.add_argument("--advertise-routes", metavar="CIDR[,CIDR…]",
-                    help="act as a subnet router for these CIDRs (needs --tun; NAT egress on Linux)")
+                    help="act as a subnet router for these CIDRs (needs --tun; NAT on Linux/macOS)")
     up.add_argument("--accept-route", action="append", metavar="PUBKEY,CIDR",
                     help="accept this CIDR only from the pinned peer key (repeatable; needs --tun)")
     up.add_argument("--accept-routes", action="store_true", help=argparse.SUPPRESS)

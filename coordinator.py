@@ -49,7 +49,7 @@ try:
 except ImportError:
     sys.exit("coordinator requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 
 OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 MAX_NODES = 1024
@@ -389,6 +389,16 @@ class Coordinator:
                         if self._nodes.get(pk) is record:
                             record["endpoints"] = eps
                     self._push_all()
+                elif mt == "advertise":
+                    routes = [str(r)[:64] for r in (msg.get("routes") or [])][:32]
+                    with self._lock:
+                        current = self._nodes.get(pk) is record
+                        if current:
+                            record["exit"] = bool(msg.get("exit"))
+                            record["routes"] = routes
+                    if current:
+                        record["outbox"].put({"t": "advertise", "id": msg.get("id")})
+                        self._push_all()
                 # unknown control types are ignored
         except Exception:
             pass

@@ -422,7 +422,7 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
-## 4. Mesh overlay (experimental — Phase 9)
+## 4. Mesh overlay (experimental — Phase 10)
 
 Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
 into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
@@ -468,8 +468,8 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   `/dev/net/tun`. A peer may only inject packets sourced from its own overlay IP
   (anti-spoof).
 - **Subnet routing (Phase 4).** A node can be a **subnet router**: with
-  `--advertise-routes 192.168.1.0/24` it announces LAN CIDRs it can reach and (on
-  Linux) sets up IP forwarding + nftables masquerade, so other nodes reach hosts
+  `--advertise-routes 192.168.1.0/24` it announces LAN CIDRs it can reach and sets
+  up IP forwarding + masquerade on Linux or macOS, so other nodes reach hosts
   *behind* it. A client explicitly grants one CIDR to one peer public key with
   `--accept-route PUBKEY,CIDR`, installs that route via its TUN, and sends matching
   traffic to that peer. Only the
@@ -480,7 +480,7 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 - **IPv4 exit node (Phase 5, opt-in).** A client can route its IPv4 default
   traffic through a pinned exit node with `--exit-node PUBKEY`, so its IPv4
   public IP becomes the exit's (like a commercial VPN's server picker). The exit
-  node is a Linux node started with `--exit` (reuses the same IP-forwarding +
+  node is a Linux or macOS node started with `--exit` (reuses the same IP-forwarding +
   masquerade). The client binds its mesh transport sockets to the physical
   interface, then routes `0.0.0.0/1`+`128.0.0.0/1` through the TUN. Route setup
   errors abort startup; peer endpoint IPs do not get destination-wide bypass routes. This
@@ -496,6 +496,14 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   IPv6 packets through the same encrypted TUN data path. Direct UDP and
   coordinator relay transport still use IPv4. IPv6 subnet routing and public
   IPv6 exit traffic are not enabled.
+- **macOS gateway (Phase 10).** macOS uses a scoped PF NAT anchor for IPv4 subnet
+  routing and exit traffic. A macOS gateway advertises its routes or exit status only
+  after TUN and NAT setup succeeds. Upgrade the coordinator before enabling
+  `--exit` or `--advertise-routes` on macOS with this node version. A custom PF ruleset
+  must retain the `com.apple/*` NAT anchor; existing firewall policy still
+  controls whether forwarded packets pass. Apple treats PF as an administrator
+  facility, not a supported API for widely distributed VPN products
+  ([TN3165](https://developer.apple.com/documentation/technotes/tn3165-packet-filter-is-not-api)).
 
 ```bash
 # Overlay only: full data plane on two machines (root); use overlay IPs directly:
@@ -557,7 +565,8 @@ Phase 4 added subnet routing. Phase 5 added the opt-in full-tunnel exit node.
 Phase 6 added `--lan-routes` and corrected the LAN-reachability docs. Phase 7 added
 an iptables fallback for NAT egress. Phase 8 added opt-in split-DNS (`--dns`).
 **Phase 9** adds IPv6 overlay addresses, TUN packet transport, and AAAA DNS.
-Still to come: IPv6 subnets and exit, macOS exit (pf). Data-plane throughput is
+**Phase 10** adds macOS PF gateway NAT and delayed gateway advertisement.
+Still to come: IPv6 subnets and exit. Data-plane throughput is
 modest (pure-Python), fine for typical use.
 
 ---
@@ -606,6 +615,7 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 | `mesh.py` | Mesh node — X25519 identity, UDP P2P data plane with NAT hole punching + direct↔DERP failover, TUN overlay (`--tun`). Needs `cryptography` |
 | `tun.py` | TUN virtual interface for the overlay (macOS `utun` / Linux `/dev/net/tun`) — used by `mesh.py --tun`. Needs root |
 | `nat.py` | Linux NAT egress for a subnet router / exit node (`--advertise-routes` / `--exit`) — IP forwarding + masquerade (nftables, or iptables fallback). Needs root |
+| `macnat.py` | macOS PF NAT egress for a subnet router / exit node — scoped anchor, IP forwarding, and crash recovery. Needs root |
 | `netroute.py` | IPv4 exit route manager (`--exit-node`) — checked default-route redirect + per-socket transport binding, macOS + Linux. Needs root |
 | `meshdns.py` | split-DNS resolver (`--dns`) — answers `<name>.mesh`, forwards the rest; configures only the mesh suffix (macOS `/etc/resolver`, Linux `resolvectl`). Needs root |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |

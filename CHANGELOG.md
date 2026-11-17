@@ -5,6 +5,15 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [4.2.0] - 2026-11-17
+
+### Added
+- **macOS gateway NAT (Phase 10).** macOS subnet routers and IPv4 exit nodes
+  now use a scoped PF anchor and IPv4 forwarding. Gateway routes and exit status
+  on macOS are advertised only after forwarding is ready, then withdrawn before
+  teardown. The coordinator acknowledges these updates; upgrade it before
+  enabling a macOS gateway. The PF token is persisted for later crash recovery.
+
 ## [4.1.0] - 2026-11-17
 
 ### Added

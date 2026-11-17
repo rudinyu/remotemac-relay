@@ -8,8 +8,8 @@ to the router's own address rather than to the (unroutable, unknown) overlay
 source. This module enables IP forwarding and installs an nftables masquerade
 rule set in a dedicated table (`remotemac`) so teardown is a single delete.
 
-Linux only (nftables), needs root. NAT egress on macOS (pf) and an iptables
-fallback are deferred to a later phase.
+Linux only (nftables or iptables), needs root. macOS PF egress lives in
+``macnat.py``.
 """
 import shutil
 import subprocess
