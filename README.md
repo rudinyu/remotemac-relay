@@ -2,7 +2,9 @@
 
 # RemoteMac self-hosted relay
 
-Two Python scripts that together form a complete remote-control system — with no need to open any inbound port on the machine being controlled.
+Self-hosted remote desktop, encrypted proxy, and an experimental mesh VPN. The
+remote desktop and proxy connect through a relay, so the controlled machine
+needs no inbound port.
 
 > **Just want to get it running?** See **[INSTALL.md](INSTALL.md)** — a step-by-step install & deploy guide (Docker or manual).
 
@@ -10,6 +12,11 @@ Two Python scripts that together form a complete remote-control system — with 
 |---|---|---|
 | `relay.py` | Rendezvous server (blind pipe) | A VPS / home box you control |
 | `remote_desktop.py` | Encrypted transport + remote desktop + SOCKS5 proxy (five modes) | Mac / Linux |
+| `coordinator.py` | Mesh control plane and STUN responder | A reachable VPS / home box |
+| `mesh.py` | Encrypted mesh node, optional TUN and gateway | Mac / Linux |
+| `mac-native/` | Native Swift viewer for a Python remote-desktop host | macOS |
+
+Remote desktop / proxy connection:
 
 ```
  Machine A  ──outbound──►  YOUR RELAY  ◄──outbound──  Machine B
@@ -101,7 +108,10 @@ Once the relay has bridged the two connections, `remote_desktop.py` runs a **mut
 
 ## Requirements
 
-- Python 3.8+ (no pip packages required for the relay / pipe / gateway / socks modes)
+- Python 3.8+ for the Python components. The relay and `pipe` / `gateway` /
+  `socks` modes need no pip packages; the mesh needs `cryptography`.
+- Python desktop `host` / `viewer` modes need `mss Pillow pynput` / `Pillow`
+  respectively. The native viewer needs macOS and a Swift toolchain to build.
 - The relay server must be reachable from the internet (a VPS, or a home box with port forwarding)
 
 ---
@@ -174,7 +184,8 @@ journalctl -u remotemac-relay -f
 Without systemd (Alpine / container / WSL):
 
 ```bash
-nohup python3 /opt/remotemac/relay.py 21118 > /var/log/remotemac-relay.log 2>&1 &
+mkdir -p ~/.local/state/remotemac
+nohup python3 /opt/remotemac/relay.py 21118 > ~/.local/state/remotemac/relay.log 2>&1 &
 ```
 
 To change the port: edit `ExecStart=` in `/etc/systemd/system/remotemac-relay.service`, then:
@@ -263,6 +274,10 @@ docker compose down                  # stop; add -v to also drop the state volum
 
 ## 2. Configure the RemoteMac app (Mac + iPad)
 
+This section applies if you already have the separate legacy Mac and iPad apps;
+their source and binaries are not included in this repository. For the Python
+host and viewer or the Swift viewer built here, use section 3.
+
 ### On the Mac
 
 ```bash
@@ -303,9 +318,14 @@ The relay log should show: `host registered id=...`
 pip install mss Pillow pynput
 ```
 
-> **macOS native client:** [`mac-native/`](mac-native/) is a pure-Swift port of the
-> viewer's encrypted transport (scrypt + SHAKE-256 + HMAC), verified byte-compatible
-> with Python (`./mac-native/interop-test.sh`) — the foundation for a native app.
+### macOS native viewer
+
+[`mac-native/`](mac-native/) includes an AppKit viewer for `remote_desktop.py host`.
+On macOS, run `./mac-native/build-app.sh` to create
+`mac-native/dist/RemoteMac Viewer.app`. Its encrypted transport passes Swift and
+Python interoperability tests; live screen and input interaction still needs
+testing with a real host. Clipboard sync is not implemented yet. See the
+[native viewer guide](mac-native/README.md) for build and connection details.
 
 ### macOS permissions
 
@@ -352,10 +372,10 @@ The viewer opens a window showing the host's screen; your mouse and keyboard inp
 
 ```bash
 # High quality (needs a good network)
-python3 remote_desktop.py host relay.example.com:21118 myid "pw" --fps 30 --quality 85
+python3 remote_desktop.py host relay.example.com:21118 myid --psk "pw" --fps 30 --quality 85
 
 # Save bandwidth
-python3 remote_desktop.py host relay.example.com:21118 myid "pw" --fps 10 --quality 60
+python3 remote_desktop.py host relay.example.com:21118 myid --psk "pw" --fps 10 --quality 60
 ```
 
 ### Supported input
@@ -501,7 +521,8 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   after TUN and NAT setup succeeds. Upgrade the coordinator before enabling
   `--exit` or `--advertise-routes` on macOS with this node version. A custom PF ruleset
   must retain the `com.apple/*` NAT anchor; existing firewall policy still
-  controls whether forwarded packets pass. Apple treats PF as an administrator
+  controls whether forwarded packets pass. Live forwarding on macOS has not yet
+  been verified on a real network. Apple treats PF as an administrator
   facility, not a supported API for widely distributed VPN products
   ([TN3165](https://developer.apple.com/documentation/technotes/tn3165-packet-filter-is-not-api)).
 
@@ -618,4 +639,5 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 | `macnat.py` | macOS PF NAT egress for a subnet router / exit node — scoped anchor, IP forwarding, and crash recovery. Needs root |
 | `netroute.py` | IPv4 exit route manager (`--exit-node`) — checked default-route redirect + per-socket transport binding, macOS + Linux. Needs root |
 | `meshdns.py` | split-DNS resolver (`--dns`) — answers `<name>.mesh`, forwards the rest; configures only the mesh suffix (macOS `/etc/resolver`, Linux `resolvectl`). Needs root |
+| `mac-native/` | Swift macOS viewer app and headless interoperability client; connects to a Python `remote_desktop.py host` |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |

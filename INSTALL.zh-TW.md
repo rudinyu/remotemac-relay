@@ -16,9 +16,10 @@
 
 ## 1. 需求
 
-- 每台機器 **Python 3.8+**(`python3 --version`)。
+- 執行 Python 元件的機器需 **Python 3.8+**(`python3 --version`)；Swift 原生 viewer
+  則需 macOS 與 Swift 工具鏈才能編譯。
 - **relay/coordinator 主機**必須從網際網路可達 —— VPS,或家用主機有做轉埠。
-- **mesh 節點與 coordinator** 需要 `pip install cryptography`(coordinator 用 X25519 做註冊的持有性證明)。relay 與遠端桌面的 `pipe`/`gateway`/`socks` 模式是**純 stdlib**(免 pip)。遠端桌面 `host`/`viewer` 需要 `pip install mss Pillow pynput`。(Docker 映像與 `scripts/install-linux.sh` 會自動幫你裝。)
+- **mesh 節點與 coordinator** 需要 `pip install cryptography`(coordinator 用 X25519 做註冊的持有性證明)。relay 與遠端桌面的 `pipe`/`gateway`/`socks` 模式是**純 stdlib**(免 pip)。遠端桌面 `host` 需 `mss Pillow pynput`，`viewer` 需 `Pillow` 與 tkinter；請在各自機器安裝。Docker 映像與 `scripts/install-linux.sh` 只會替 coordinator 安裝 `cryptography`，不會安裝桌面相依套件。
 - **Docker**(選用):一鍵部署伺服器,需要 Docker Engine + Compose plugin。
 
 ---
@@ -30,7 +31,10 @@ git clone https://github.com/rudinyu/remotemac-relay.git
 cd remotemac-relay
 ```
 
-(或把個別 `.py` 檔複製到需要的地方 —— 它們沒有共用的套件結構。)
+Mesh 節點建議保留整份 checkout；若手動複製，`mesh.py` 需要同目錄的
+`remote_desktop.py`，選用功能還會載入 `tun.py`、`netroute.py`、`nat.py`、
+`macnat.py` 與 `meshdns.py`。coordinator 需 `coordinator.py` 和
+`remote_desktop.py`；`relay.py` 可獨立執行。
 
 ---
 
@@ -65,7 +69,7 @@ sudo ./scripts/install-linux.sh --relay-only           # 只裝 relay
 sudo ./scripts/install-linux.sh --coord-only --open-firewall
 ```
 
-它會把程式碼複製到 `/opt/remotemac`、寫入 systemd unit(relay 以 `nobody` 執行;coordinator 用 `StateDirectory` 存 overlay-IP 狀態、token 放在只有 root 讀得到的 `EnvironmentFile`)、啟用並啟動,並在加 `--open-firewall` 時用 ufw/firewalld 開埠。重跑即可更新。`--help` 列出所有參數(`--relay-port`、`--coord-port`、`--token`、`--prefix`)。若不給 token,它會自動產生並印出來 —— 把那個值給每個節點用。
+它會把程式碼複製到 `/opt/remotemac`、寫入 systemd unit(relay 以 `nobody` 執行;coordinator 用 `StateDirectory` 存 overlay-IP 狀態、token 放在只有 root 讀得到的 `EnvironmentFile`)、啟用並啟動,並在加 `--open-firewall` 時用 ufw/firewalld 開埠。重跑可更新，但須再次提供原本的 mesh token，避免節點失去存取權。`--help` 列出所有參數(`--relay-port`、`--coord-port`、`--token`、`--prefix`)。若不給 token,它會自動產生並印出來 —— 把那個值給每個節點用。
 
 ### 方式 C —— 手動
 
@@ -91,14 +95,17 @@ REMOTEMAC_MESH_TOKEN="your-strong-secret" python3 coordinator.py 21200
 
 # 或當背景服務(範例)
 sudo cp coordinator.py remote_desktop.py /opt/remotemac/
+mkdir -p ~/.local/state/remotemac
 REMOTEMAC_MESH_TOKEN="your-strong-secret" \
   nohup python3 /opt/remotemac/coordinator.py 21200 \
-  --state /opt/remotemac/coordinator-state.json > /var/log/remotemac-coord.log 2>&1 &
+  --state ~/.local/state/remotemac/coordinator-state.json \
+  > ~/.local/state/remotemac/coordinator.log 2>&1 &
 ```
 
 token 可用 `--token` 或 `REMOTEMAC_MESH_TOKEN`;建議用環境變數,才不會在 `ps` 看到。`--state PATH` 持久化 overlay IP 配發。
 
-沒有 systemd(Alpine / container / WSL)時 relay 一樣可跑:`nohup python3 /opt/remotemac/relay.py 21118 > /var/log/remotemac-relay.log 2>&1 &`。
+沒有 systemd(Alpine / container / WSL)時，先執行 `mkdir -p ~/.local/state/remotemac`，再用一般使用者可寫的日誌路徑啟動 relay：
+`nohup python3 /opt/remotemac/relay.py 21118 > ~/.local/state/remotemac/relay.log 2>&1 &`。
 
 ---
 
@@ -166,6 +173,9 @@ python3 remote_desktop.py viewer relay.example.com:21118 mydevice --psk "strong-
 ```
 
 macOS host 需要**螢幕錄製** + **輔助使用**權限。建議用 `REMOTEMAC_PSK` 而非 `--psk`,才不會在 `ps` 看到密碼。`gateway` / `socks` / `pipe` 模式見 [README](README.zh-TW.md#三使用-remote_desktoppy)。
+macOS 另有 Swift 原生 viewer：執行 `./mac-native/build-app.sh` 可產生
+`mac-native/dist/RemoteMac Viewer.app`，用來連接 Python host。現有限制見
+[原生 viewer 指南](mac-native/README.md)。
 
 Python host 可在 relay 與 host 設定相同的強密鑰 `REMOTEMAC_RELAY_HOST_TOKEN`,讓 relay 驗證 host 後才保留裝置 ID。Docker 可在 `.env` 設定;systemd 可在 `/etc/remotemac/relay.env`(權限 `0600`)寫入 `REMOTEMAC_RELAY_HOST_TOKEN=<密鑰>` 並重新啟動 relay。現有 Mac/iPad host app 仍用舊協議,使用它時不要設定此變數。
 
@@ -181,7 +191,7 @@ nc -vz YOUR_RELAY_IP 21118            # succeeded / open
 nc -vz YOUR_COORD_IP  21200
 
 # mesh 路徑通
-python3 mesh.py up coord…:21200 --token "…" --ping <peer>   # "pong … [direct: …]" 或 "[derp…]"
+python3 mesh.py up coord.example.com:21200 --token "…" --ping PEER_NAME   # "pong … [direct: …]" 或 "[derp…]"
 ```
 
 Docker:`docker compose ps` 顯示兩個服務 `healthy`。

@@ -48,11 +48,14 @@ Developer ID and notarize.
 
 ```bash
 # raw auth + one frame each way against a host (no relay) — used by interop-test.sh
-.build/release/remotemac-viewer authtest <host> <port> <passphrase>
+.build/release/remotemac-viewer authtest HOST PORT "PASSPHRASE"
 
 # the real path: via the relay, then print incoming screen frames
-.build/release/remotemac-viewer connect <relay-host> <port> <device-id> <passphrase>
+.build/release/remotemac-viewer connect RELAY_HOST PORT DEVICE_ID "PASSPHRASE"
 ```
+
+The headless CLI takes the passphrase as an argument, which can be visible in
+process listings. Use the GUI and its Keychain option for regular use.
 
 ## Layout
 

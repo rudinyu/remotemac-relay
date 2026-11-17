@@ -1,6 +1,6 @@
 <svg width="680" viewBox="0 0 680 400" role="img" xmlns="http://www.w3.org/2000/svg">
 <title>remotemac deployment topology</title>
-<desc>A reachable host runs relay.py (:21118/tcp) and coordinator.py (:21200 tcp+udp), via docker compose or scripts/install-linux.sh. Nodes behind NAT and a public Linux exit node connect outbound to the coordinator; nodes talk directly by UDP P2P; a client routes via the exit which NAT-masquerades to the internet. Overlay 100.64.0.0/10.</desc>
+<desc>A reachable host runs relay.py (:21118/tcp) and coordinator.py (:21200 tcp+udp), via docker compose or scripts/install-linux.sh. Nodes behind NAT and a Linux or macOS exit node connect outbound to the coordinator; nodes talk directly by UDP P2P; a client routes via the exit which NAT-masquerades to the internet. Overlay 100.64.0.0/10.</desc>
 <style>
 .t{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-weight:500;font-size:14px;fill:#181818}
 .ts{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-weight:400;font-size:12px;fill:#6b6b6b}
@@ -39,7 +39,7 @@
 <text class="ts" x="340" y="288" text-anchor="middle">behind NAT</text>
 <rect class="amber" x="490" y="248" width="150" height="52" rx="8"/>
 <text class="t" x="565" y="271" text-anchor="middle">exit node</text>
-<text class="ts" x="565" y="288" text-anchor="middle">Linux · public</text>
+<text class="ts" x="565" y="288" text-anchor="middle">Linux / macOS</text>
 
 <line class="ln" x1="190" y1="274" x2="265" y2="274" stroke-width="1.6" marker-end="url(#a3)" marker-start="url(#a3s)"/>
 <text class="ts" x="227" y="267" text-anchor="middle">UDP P2P</text>

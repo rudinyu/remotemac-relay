@@ -2,7 +2,8 @@
 
 # RemoteMac self-hosted relay
 
-兩個 Python 腳本，組成一套完整的遠端控制系統，完全不需要在受控機上開任何 inbound port。
+本專案提供自架遠端桌面、加密 proxy 與實驗性 mesh VPN。遠端桌面與 proxy
+透過 relay 連線，受控機不需要開放 inbound port。
 
 > **只想快點跑起來?** 看 **[INSTALL.zh-TW.md](INSTALL.zh-TW.md)** —— 一步步的安裝與部署指南(Docker 或手動)。
 
@@ -10,6 +11,11 @@
 |---|---|---|
 | `relay.py` | 中繼伺服器（盲管道）| 你控制的 VPS / 家用主機 |
 | `remote_desktop.py` | 加密傳輸層 + 遠端桌面 + SOCKS5 proxy（五種模式）| Mac / Linux |
+| `coordinator.py` | Mesh 控制平面與 STUN 回應器 | 對外可達的 VPS / 家用主機 |
+| `mesh.py` | 加密 mesh 節點，可選用 TUN 與 gateway | Mac / Linux |
+| `mac-native/` | 對應 Python 遠端桌面 host 的 Swift 原生 viewer | macOS |
+
+遠端桌面 / proxy 連線：
 
 ```
  Machine A  ──outbound──►  YOUR RELAY  ◄──outbound──  Machine B
@@ -96,7 +102,10 @@ Python host 可在 relay 和 host 設定相同的強密鑰 `REMOTEMAC_RELAY_HOST
 
 ## 需求
 
-- Python 3.8+ （不需要 pip 安裝任何套件）
+- Python 元件需 Python 3.8+。relay 與 `pipe` / `gateway` / `socks` 模式免 pip 套件；
+  mesh 需安裝 `cryptography`。
+- Python 桌面 `host` / `viewer` 模式分別需要 `mss Pillow pynput` / `Pillow`；
+  原生 viewer 需 macOS 與 Swift 工具鏈才能編譯。
 - Relay 伺服器必須從網際網路可以連到（VPS，或家用主機有做 port forwarding）
 
 ---
@@ -169,7 +178,8 @@ journalctl -u remotemac-relay -f
 沒有 systemd（Alpine / container / WSL）：
 
 ```bash
-nohup python3 /opt/remotemac/relay.py 21118 > /var/log/remotemac-relay.log 2>&1 &
+mkdir -p ~/.local/state/remotemac
+nohup python3 /opt/remotemac/relay.py 21118 > ~/.local/state/remotemac/relay.log 2>&1 &
 ```
 
 換 port：編輯 `/etc/systemd/system/remotemac-relay.service` 的 `ExecStart=`，然後：
@@ -251,6 +261,9 @@ docker compose down                  # 停止;加 -v 連 state volume 一起刪
 
 ## 二、設定 RemoteMac app（Mac + iPad）
 
+本節適用於已持有舊版 Mac 與 iPad app 的使用者；本 repo 不包含這兩個 app
+的原始碼或執行檔。使用此 repo 的 Python host/viewer 或 Swift viewer 請看第三節。
+
 ### Mac 端
 
 ```bash
@@ -291,7 +304,13 @@ Relay log 應出現：`host registered id=...`
 pip install mss Pillow pynput
 ```
 
-> **macOS 原生 client:** [`mac-native/`](mac-native/) 是 viewer 加密傳輸(scrypt + SHAKE-256 + HMAC)的**純 Swift 移植**,已驗證與 Python **byte 相容**(`./mac-native/interop-test.sh`)—— 原生 app 的基礎。
+### macOS 原生 viewer
+
+[`mac-native/`](mac-native/) 已包含對應 `remote_desktop.py host` 的 AppKit viewer。
+在 macOS 執行 `./mac-native/build-app.sh` 會產生
+`mac-native/dist/RemoteMac Viewer.app`。Swift 與 Python 的加密傳輸互通測試已通過；
+畫面與輸入操作仍需搭配真實 host 實測。剪貼簿同步尚未實作。編譯及連線方式見
+[原生 viewer 指南](mac-native/README.md)。
 
 ### macOS 權限設定
 
@@ -338,10 +357,10 @@ Viewer 端會開啟視窗顯示 host 的螢幕，你的滑鼠鍵盤操作即時�
 
 ```bash
 # 高畫質（需較好的網路）
-python3 remote_desktop.py host relay.example.com:21118 myid "pw" --fps 30 --quality 85
+python3 remote_desktop.py host relay.example.com:21118 myid --psk "pw" --fps 30 --quality 85
 
 # 省頻寬
-python3 remote_desktop.py host relay.example.com:21118 myid "pw" --fps 10 --quality 60
+python3 remote_desktop.py host relay.example.com:21118 myid --psk "pw" --fps 10 --quality 60
 ```
 
 ### 支援的輸入
@@ -432,7 +451,7 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 - **IPv4 出口節點(Phase 5,opt-in)**:Linux 或 macOS 出口用 `--exit` 啟動;client 用 `--exit-node PUBKEY` 指定完整公鑰。mesh TCP/UDP 傳輸 socket 綁定實體介面,其他 IPv4 預設流量經 `0.0.0.0/1` 與 `128.0.0.0/1` 走 TUN。路由安裝失敗會中止啟動。此功能不處理 IPv6;若已有 IPv6 預設路由,需明確使用 `--allow-ipv6-bypass` 才允許 IPv6 直連。
 - **split-DNS(Phase 8,opt-in)**:加上 `--dns` 後,本機解析器在 `127.0.0.1:53` 回答 `<name>.mesh` 的 A 與 AAAA 記錄。macOS 使用 `/etc/resolver/mesh`;Linux 若有 systemd-resolved,用 `resolvectl` 只把 `.mesh` 查詢導向 TUN 的 DNS 伺服器。其他 DNS 設定不變;無 systemd-resolved 時需手動設定。
 - **IPv6 overlay(Phase 9)**:節點取得穩定的 ULA 位址,IPv6 封包與 IPv4 一樣透過加密 TUN 資料路徑傳送。UDP 直連及 coordinator relay 傳輸仍使用 IPv4;IPv6 子網路由與公網 IPv6 出口尚未啟用。
-- **macOS gateway(Phase 10)**:macOS 使用獨立的 PF NAT anchor 處理 IPv4 子網與出口流量。TUN 與 NAT 就緒後才向 coordinator 宣告路由或出口;使用新版 gateway 節點前需先升級 coordinator。
+- **macOS gateway(Phase 10)**:macOS 使用獨立的 PF NAT anchor 處理 IPv4 子網與出口流量。TUN 與 NAT 就緒後才向 coordinator 宣告路由或出口;使用新版 gateway 節點前需先升級 coordinator。macOS 真實網路上的轉送尚未實測。
 
 ```bash
 # 只做 overlay:兩台機器開完整資料面(root),直接用 overlay IP:
@@ -512,4 +531,5 @@ ssh user@gw.mesh              # 解析成 gw 的 overlay IP;example.com 照常
 | `macnat.py` | macOS PF NAT egress — 獨立 anchor、IP forwarding、崩潰後復原。需 root |
 | `netroute.py` | IPv4 出口路由管理(`--exit-node`)—— 檢查路由安裝結果、socket 綁定實體介面。需 root |
 | `meshdns.py` | split-DNS 解析器(`--dns`)—— 只設定 mesh 網域(macOS `/etc/resolver`、Linux `resolvectl`)。需 root |
+| `mac-native/` | Swift macOS viewer app 與無介面的互通測試 client；連接 Python `remote_desktop.py host` |
 | `remotemac-relay.service` | systemd unit，讓 relay.py 開機自動啟動 |

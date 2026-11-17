@@ -17,14 +17,17 @@ Everything else (mesh nodes, remote desktop) connects *outbound* to them.
 
 ## 1. Prerequisites
 
-- **Python 3.8+** on every machine (`python3 --version`).
+- **Python 3.8+** wherever a Python component runs (`python3 --version`). The
+  Swift native viewer instead needs macOS and a Swift toolchain to build.
 - The **relay/coordinator host** must be reachable from the internet — a VPS, or a
   home box with the port forwarded.
 - **Mesh nodes and the coordinator** need `pip install cryptography` (the coordinator
   uses X25519 for the registration proof-of-possession). The relay and the
   remote-desktop `pipe`/`gateway`/`socks` modes are **pure stdlib** (no pip). The
-  remote-desktop `host`/`viewer` modes need `pip install mss Pillow pynput`. (The
-  Docker images and `scripts/install-linux.sh` handle this for you.)
+  remote-desktop `host` needs `mss Pillow pynput`, while `viewer` needs `Pillow`
+  and tkinter. Install these on their respective machines. Docker and
+  `scripts/install-linux.sh` install the coordinator's
+  `cryptography` dependency; they do not install desktop dependencies.
 - **Docker** (optional) for the one-command server deploy: Docker Engine + the
   Compose plugin.
 
@@ -37,8 +40,10 @@ git clone https://github.com/rudinyu/remotemac-relay.git
 cd remotemac-relay
 ```
 
-(Or copy the individual `.py` files to where you need them — they have no shared
-package layout.)
+Keep the checkout on mesh nodes, or copy its Python modules together: `mesh.py`
+imports `remote_desktop.py` and loads `tun.py`, `netroute.py`, `nat.py`,
+`macnat.py`, and `meshdns.py` for optional features. The coordinator needs
+`coordinator.py` and `remote_desktop.py`; `relay.py` runs on its own.
 
 ---
 
@@ -80,7 +85,8 @@ sudo ./scripts/install-linux.sh --coord-only --open-firewall
 It copies the code to `/opt/remotemac`, writes systemd units (relay as `nobody`;
 coordinator with a `StateDirectory` for its overlay-IP state and the token in a
 root-only `EnvironmentFile`), enables + starts them, and — with `--open-firewall`
-— opens the ports via ufw/firewalld. Re-run it to update. `--help` lists all flags
+— opens the ports via ufw/firewalld. Re-run it to update, passing the existing
+mesh token again so nodes keep access. `--help` lists all flags
 (`--relay-port`, `--coord-port`, `--token`, `--prefix`). If you don't pass a token,
 it generates one and prints it — give that same value to every node.
 
@@ -109,16 +115,19 @@ REMOTEMAC_MESH_TOKEN="your-strong-secret" python3 coordinator.py 21200
 
 # or as a background service (example)
 sudo cp coordinator.py remote_desktop.py /opt/remotemac/
+mkdir -p ~/.local/state/remotemac
 REMOTEMAC_MESH_TOKEN="your-strong-secret" \
   nohup python3 /opt/remotemac/coordinator.py 21200 \
-  --state /opt/remotemac/coordinator-state.json > /var/log/remotemac-coord.log 2>&1 &
+  --state ~/.local/state/remotemac/coordinator-state.json \
+  > ~/.local/state/remotemac/coordinator.log 2>&1 &
 ```
 
 The token can come from `--token` or `REMOTEMAC_MESH_TOKEN`; prefer the env var so
 it isn't visible in `ps`. `--state PATH` persists overlay-IP assignments.
 
-Without systemd (Alpine / container / WSL) the relay runs the same way:
-`nohup python3 /opt/remotemac/relay.py 21118 > /var/log/remotemac-relay.log 2>&1 &`.
+Without systemd (Alpine / container / WSL), run the relay with a log path your
+user can write: `mkdir -p ~/.local/state/remotemac` then
+`nohup python3 /opt/remotemac/relay.py 21118 > ~/.local/state/remotemac/relay.log 2>&1 &`.
 
 ---
 
@@ -180,7 +189,8 @@ domain. If unavailable, the local DNS server still starts and prints a manual
 > `--tun` and the routing/DNS features need **root**. On Linux a subnet/exit node
 > also needs `nftables` (or `iptables`) and IP forwarding — the tool sets these up.
 > In a container, a mesh node additionally needs `--cap-add=NET_ADMIN --device
-> /dev/net/tun`. See the mesh section of the [README](README.md#4-mesh-overlay-experimental--phase-8).
+> /dev/net/tun`. macOS gateways use PF NAT. See the mesh section of the
+> [README](README.md#4-mesh-overlay-experimental--phase-10).
 
 ---
 
@@ -206,6 +216,9 @@ For Docker, set it in `.env`; for systemd, put
 macOS host needs **Screen Recording** + **Accessibility** permissions. Prefer
 `REMOTEMAC_PSK` over `--psk` so the secret isn't visible in `ps`. See the
 [README](README.md#3-using-remote_desktoppy) for `gateway` / `socks` / `pipe` modes.
+On macOS, a native Swift viewer is also available: run `./mac-native/build-app.sh`
+to build `mac-native/dist/RemoteMac Viewer.app`. It connects to the Python host;
+see the [native viewer guide](mac-native/README.md) for current limitations.
 
 ---
 
@@ -219,7 +232,7 @@ nc -vz YOUR_RELAY_IP 21118            # succeeded / open
 nc -vz YOUR_COORD_IP  21200
 
 # mesh path works
-python3 mesh.py up coord…:21200 --token "…" --ping <peer>   # "pong … [direct: …]" or "[derp…]"
+python3 mesh.py up coord.example.com:21200 --token "…" --ping PEER_NAME   # "pong … [direct: …]" or "[derp…]"
 ```
 
 Docker: `docker compose ps` shows both services `healthy`.

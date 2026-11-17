@@ -5,6 +5,13 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [4.2.1] - 2026-11-17
+
+### Fixed
+- Corrected the English and Traditional Chinese feature and install guides:
+  required companion modules and dependencies, writable manual-service paths,
+  runnable CLI examples, the Swift viewer status, and the macOS gateway caveat.
+
 ## [4.2.0] - 2026-11-17
 
 ### Added
