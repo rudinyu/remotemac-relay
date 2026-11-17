@@ -1,6 +1,7 @@
 """Tests for the mesh control plane + node crypto (Phase 1)."""
 
 import os
+import ipaddress
 import socket
 import struct
 import sys
@@ -207,6 +208,19 @@ class TestAllocator(unittest.TestCase):
         b = coordinator.IPAllocator(self.tmp.name)       # reload from disk
         self.assertEqual(b.get("pkA"), ip1)              # persisted across restarts
         self.assertEqual(b.get("pkB"), ip2)
+
+    def test_ipv6_ula_is_stable_and_unique(self):
+        a = coordinator.IPAllocator(self.tmp.name)
+        ip6a = a.get6("pkA")
+        ip6b = a.get6("pkB")
+        prefix = a.network6
+        self.assertNotEqual(ip6a, ip6b)
+        self.assertTrue(ip6a.startswith("fd"))
+        self.assertIn(ipaddress.IPv6Address(ip6a), ipaddress.IPv6Network(prefix))
+        b = coordinator.IPAllocator(self.tmp.name)
+        self.assertEqual(b.network6, prefix)
+        self.assertEqual(b.get6("pkA"), ip6a)
+        self.assertEqual(b.get6("pkB"), ip6b)
 
 
 @unittest.skipUnless(_HAVE_CRYPTO, "cryptography not installed")
@@ -651,6 +665,8 @@ class TestMeshEndToEnd(unittest.TestCase):
         # Anti-spoof: the exit may source anything; a non-exit peer may not.
         self.assertTrue(client.src_permitted(ex.pubkey_b64, "93.184.216.34"))
         self.assertFalse(client.src_permitted("some-other-pk", "93.184.216.34"))
+        self.assertIsNone(client.route_for("2001:4860:4860::8888"))
+        self.assertFalse(client.src_permitted(ex.pubkey_b64, "2001:4860:4860::8888"))
 
     def test_no_exit_node_leaves_internet_unrouted(self):
         # Without --exit-node, internet destinations stay unroutable (dropped).
@@ -691,6 +707,21 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers))
         bob_ip = a.peers[b.pubkey_b64]["ip"]
         self.assertEqual(a.resolve(bob_ip), b.pubkey_b64)
+
+    def test_ipv6_overlay_map_route_and_spoof_check(self):
+        a = self._node("v6-alice")
+        b = self._node("v6-bob")
+        self.assertTrue(self._wait(lambda: b.pubkey_b64 in a.peers and b.overlay_ip6))
+        bob6 = a.peers[b.pubkey_b64]["ip6"]
+        self.assertEqual(bob6, b.overlay_ip6)
+        self.assertIn(ipaddress.IPv6Address(bob6),
+                      ipaddress.IPv6Network(a.overlay_cidr6))
+        self.assertEqual(a.resolve(bob6), b.pubkey_b64)
+        self.assertEqual(a.route_for(bob6), b.pubkey_b64)
+        self.assertTrue(a.src_permitted(b.pubkey_b64, bob6))
+        self.assertFalse(a.src_permitted(b.pubkey_b64, a.overlay_ip6))
+        self.assertIsNone(a.route_for("2001:db8::1234"))
+        self.assertEqual(a.dns_lookup_v6("v6-bob"), bob6)
 
     def test_duplicate_hostnames_fail_closed(self):
         n = mesh.MeshNode(X25519PrivateKey.generate(), "client")

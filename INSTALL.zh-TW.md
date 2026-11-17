@@ -112,7 +112,7 @@ python3 mesh.py up coord.example.com:21200 --token "your-strong-secret" --name l
 python3 mesh.py up coord.example.com:21200 --token "your-strong-secret" --ping gw
 ```
 
-每個節點從 `100.64.0.0/10` 拿到穩定的 overlay IP。`--name` 預設用系統主機名。token 要跟 coordinator 一致。
+每個節點從 `100.64.0.0/10` 拿到穩定的 IPv4 位址,並從 coordinator 持久保存的每 mesh ULA 網段拿到 IPv6 位址;兩者都會顯示在節點 log。`--name` 預設用系統主機名。token 要跟 coordinator 一致。
 
 **VPN 資料面** —— 讓真實 app 用 overlay IP 連 peer(需 root):
 

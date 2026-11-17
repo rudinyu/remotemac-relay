@@ -2,7 +2,7 @@
 """
 meshdns.py — a tiny split-DNS resolver for the remotemac mesh (Phase 8).
 
-Answers `<name>.<suffix>` (default `<name>.mesh`) with the peer's overlay IP and
+Answers `<name>.<suffix>` (default `<name>.mesh`) with the peer's overlay IPs and
 forwards every other query to the real upstream resolver, so mesh hosts can be
 reached by name (`ssh laptop.mesh`) instead of overlay IP. Pure stdlib.
 
@@ -76,7 +76,7 @@ def _encode_name(name: str) -> bytes:
 
 
 def build_response(qid: bytes, qname: str, qtype: int, ip: str = None, rcode: int = 0) -> bytes:
-    """Build a response to a query. With `ip`, an A answer; else a no-answer
+    """Build a response to a query. With `ip`, an A or AAAA answer; else a no-answer
     response with the given RCODE (0 = NODATA, 3 = NXDOMAIN). The query's EDNS
     OPT record, if any, is intentionally dropped."""
     flags = 0x8580 | (rcode & 0x0F)         # QR=1, AA=1, RD=1, RA=1
@@ -85,18 +85,21 @@ def build_response(qid: bytes, qname: str, qtype: int, ip: str = None, rcode: in
     question = _encode_name(qname) + struct.pack(">HH", qtype, _QCLASS_IN)
     answer = b""
     if ip:
+        family = socket.AF_INET6 if qtype == QTYPE_AAAA else socket.AF_INET
+        packed = socket.inet_pton(family, ip)
         answer = (b"\xc0\x0c"               # pointer to the question name at offset 12
-                  + struct.pack(">HHIH", QTYPE_A, _QCLASS_IN, 60, 4)
-                  + socket.inet_aton(ip))
+                  + struct.pack(">HHIH", qtype, _QCLASS_IN, 60, len(packed))
+                  + packed)
     return header + question + answer
 
 
-def answer_for(qid, qname, qtype, suffix, lookup):
+def answer_for(qid, qname, qtype, suffix, lookup, lookup_v6=None):
     """Response bytes for a mesh query, or None meaning 'forward this upstream'.
 
     A `.suffix` name resolves via `lookup(host)`:
       • qtype A + hit → A answer with the overlay IP;
-      • hit but non-A (e.g. AAAA) → NOERROR/NODATA (don't stall the client);
+      • qtype AAAA + IPv6 hit → AAAA answer;
+      • hit but no record of the requested type → NOERROR/NODATA;
       • miss → NXDOMAIN.
     Anything not under `suffix` returns None (forward)."""
     dotted = "." + suffix
@@ -104,9 +107,12 @@ def answer_for(qid, qname, qtype, suffix, lookup):
         return None
     host = qname[:-len(dotted)] if qname.endswith(dotted) else ""
     ip = lookup(host) if host else None
+    ip6 = lookup_v6(host) if host and lookup_v6 else None
     if qtype == QTYPE_A and ip:
         return build_response(qid, qname, qtype, ip=ip)
-    if ip:
+    if qtype == QTYPE_AAAA and ip6:
+        return build_response(qid, qname, qtype, ip=ip6)
+    if ip or ip6:
         return build_response(qid, qname, qtype)            # NODATA
     return build_response(qid, qname, qtype, rcode=3)       # NXDOMAIN
 
@@ -214,11 +220,13 @@ class MeshDNSServer:
     """UDP DNS server: answers `.suffix` names from `lookup`, forwards the rest to
     `upstream`. Runs on a daemon thread until stop()."""
 
-    def __init__(self, bind_ip, port, suffix, lookup, upstream=None, upstream_port=53):
+    def __init__(self, bind_ip, port, suffix, lookup, upstream=None, upstream_port=53,
+                 lookup_v6=None):
         self.bind_ip = bind_ip
         self.port = port
         self.suffix = suffix.strip(".").lower()
         self.lookup = lookup
+        self.lookup_v6 = lookup_v6
         self.upstream = upstream
         self.upstream_port = upstream_port
         self.udp = None
@@ -268,7 +276,7 @@ class MeshDNSServer:
             qid, qname, qtype = parse_query(data)
         except DNSError:
             return                          # ignore malformed queries
-        resp = answer_for(qid, qname, qtype, self.suffix, self.lookup)
+        resp = answer_for(qid, qname, qtype, self.suffix, self.lookup, self.lookup_v6)
         if resp is not None:
             self.udp.sendto(resp, addr)
         else:
@@ -283,7 +291,8 @@ class MeshDNSServer:
         try:
             # Context manager closes the socket on every path, incl. timeouts
             # (socket.timeout is an OSError → the old close() was being skipped).
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+            family = socket.AF_INET6 if ":" in self.upstream else socket.AF_INET
+            with socket.socket(family, socket.SOCK_DGRAM) as u:
                 u.settimeout(3)
                 u.sendto(data, (self.upstream, self.upstream_port))
                 resp, _ = u.recvfrom(65535)

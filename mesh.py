@@ -4,20 +4,22 @@ mesh.py — a node in the remotemac mesh (Tailscale-lite).
 
 Each node has a persistent X25519 identity key. It connects to the coordinator
 (`coordinator.py`) over a token-authenticated encrypted control channel, is
-assigned a stable overlay IP, and learns the other nodes. Node-to-node traffic
-is end-to-end encrypted with a mutually authenticated, forward-secret handshake
+assigned stable IPv4 and IPv6 overlay addresses, and learns the other nodes.
+Node-to-node traffic is end-to-end encrypted with a mutually authenticated,
+forward-secret handshake
 (X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305); the coordinator only ever
 relays ciphertext.
 
-Phases 1–8: identity + token-authenticated control channel + peer map; an
+Phases 1–9: identity + token-authenticated control channel + peer map; an
 encrypted data path that is **UDP peer-to-peer** where the network allows (NAT
 hole punching, Phase 2) and transparently falls back to a coordinator relay
 (DERP); a **TUN overlay** (Phase 3, `--tun`) so real apps reach peers by overlay
 IP; **subnet routing** (Phase 4, `--advertise-routes`/`--accept-route`) to reach
 LANs behind a trusted peer; an opt-in **IPv4 exit node** (Phase 5, `--exit` /
 `--exit-node`, with `--lan-routes`); and opt-in **split-DNS** (Phase 8, `--dns`)
-resolving `<name>.mesh` to overlay IPs. Only `--tun` and the routing/DNS features
-need root; everything else runs unprivileged.
+resolving `<name>.mesh` to overlay IPs; and IPv6 peer packets over the TUN
+(Phase 9). Only `--tun` and the routing/DNS features need root; everything else
+runs unprivileged.
 
 Requires: pip install cryptography
 
@@ -57,7 +59,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
@@ -435,6 +437,8 @@ class MeshNode:
         self._stun_done = threading.Event()
         self.local_endpoints = []
         self.overlay_ip = None
+        self.overlay_ip6 = None
+        self.overlay_cidr6 = None
         self.peers    = {}         # pubkey_b64 -> {ip, hostname, exit, endpoints}
         self._conns   = {}         # pubkey_b64 -> PeerConn
         self._by_index = {}        # local_index (int) -> PeerConn  (UDP DATA demux)
@@ -698,10 +702,14 @@ class MeshNode:
             self._on_from(msg)
 
     def _on_map(self, msg: dict):
-        self.overlay_ip = (msg.get("self") or {}).get("ip") or self.overlay_ip
+        self_info = msg.get("self") or {}
+        self.overlay_ip = self_info.get("ip") or self.overlay_ip
+        self.overlay_ip6 = self_info.get("ip6")
+        self.overlay_cidr6 = self_info.get("cidr6")
         peers = {}
         for p in msg.get("peers", []):
-            peers[p["pubkey"]] = {"ip": p.get("ip"), "hostname": p.get("hostname"),
+            peers[p["pubkey"]] = {"ip": p.get("ip"), "ip6": p.get("ip6"),
+                                  "hostname": p.get("hostname"),
                                   "exit": p.get("exit", False),
                                   "endpoints": p.get("endpoints", []),
                                   "routes": p.get("routes", [])}
@@ -751,9 +759,14 @@ class MeshNode:
 
     def resolve(self, name_or_ip: str):
         """Return a peer by overlay IP or unambiguous hostname, or None."""
+        try:
+            address = str(ipaddress.ip_address(name_or_ip))
+        except (ValueError, TypeError):
+            address = name_or_ip
         with self._lock:
             matches = [pk for pk, info in self.peers.items()
-                       if info.get("hostname") == name_or_ip or info.get("ip") == name_or_ip]
+                       if info.get("hostname") == name_or_ip
+                       or info.get("ip") == address or info.get("ip6") == address]
         return matches[0] if len(matches) == 1 else None
 
     def route_for(self, dst_ip: str):
@@ -767,25 +780,30 @@ class MeshNode:
         pk = match_route(self._route_table, dst_ip)
         if pk:
             return pk
-        return self.exit_node_pk        # None unless --exit-node is in effect
+        try:
+            if ipaddress.ip_address(dst_ip).version == 4:
+                return self.exit_node_pk    # full-tunnel exit is IPv4-only
+        except (ValueError, TypeError):
+            pass
+        return None
 
     def src_permitted(self, src_pk: str, src_ip: str) -> bool:
         """Anti-spoof for an inbound tunnelled packet: a peer may source its own
         overlay IP, or — if it is a subnet router whose route we accepted — any
         IP within one of those accepted routes (so LAN-sourced replies pass). Our
         selected exit node may source anything (it relays the whole internet).
-        Non-IPv4 or unparseable packets are rejected."""
+        Unparseable packets are rejected."""
         if src_ip is None:
             return False
-        if src_pk == self.exit_node_pk:
-            return True
-        info = self.peers.get(src_pk) or {}
-        if src_ip == info.get("ip"):
-            return True
         try:
             addr = ipaddress.ip_address(src_ip)
         except ValueError:
             return False
+        if src_pk == self.exit_node_pk and addr.version == 4:
+            return True
+        info = self.peers.get(src_pk) or {}
+        if str(addr) == info.get("ip") or str(addr) == info.get("ip6"):
+            return True
         for net, pk in self._route_table:
             if pk == src_pk and addr in net:
                 return True
@@ -794,14 +812,22 @@ class MeshNode:
     def dns_lookup(self, name: str):
         """Overlay IP for a mesh hostname (this node or a peer), or None. Used by
         the split-DNS resolver to answer `<name>.<suffix>`."""
+        return self._dns_lookup(name, "ip")
+
+    def dns_lookup_v6(self, name: str):
+        """IPv6 overlay address for a mesh hostname, or None."""
+        return self._dns_lookup(name, "ip6")
+
+    def _dns_lookup(self, name: str, field: str):
         name = (name or "").lower()
         if not name:
             return None
         with self._lock:
-            matches = [info.get("ip") for info in self.peers.values()
+            matches = [info.get(field) for info in self.peers.values()
                        if (info.get("hostname") or "").lower() == name]
         if name == (self.hostname or "").lower():
-            return self.overlay_ip if not matches else None
+            own_ip = self.overlay_ip6 if field == "ip6" else self.overlay_ip
+            return own_ip if not matches else None
         return matches[0] if len(matches) == 1 else None
 
     def _peer_static(self, pk_b64: str) -> bytes:
@@ -1207,11 +1233,14 @@ def _run_tun(node, mtu, name, egress=None):
     except (tun.TunError, OSError) as exc:
         sys.exit(f"error: could not open TUN: {exc}")
     try:
-        dev.configure(node.overlay_ip)
+        dev.configure(node.overlay_ip, overlay_ip6=node.overlay_ip6,
+                      cidr6=node.overlay_cidr6)
     except (OSError, subprocess.CalledProcessError) as exc:
         dev.close()                            # don't leak the interface/socket
         sys.exit(f"error: could not configure TUN {dev.name}: {exc}")
-    _log(f"TUN up: {dev.name}  ip={node.overlay_ip}  mtu={mtu}  (overlay {tun.OVERLAY_CIDR})")
+    v6_note = f"  ip6={node.overlay_ip6} ({node.overlay_cidr6})" if node.overlay_ip6 else ""
+    _log(f"TUN up: {dev.name}  ip={node.overlay_ip}{v6_note}  mtu={mtu}  "
+         f"(overlay {tun.OVERLAY_CIDR})")
 
     # Subnet router OR exit node: enable IP forwarding + NAT masquerade so
     # forwarded traffic egresses. The masquerade rule (overlay saddr → egress) is
@@ -1242,10 +1271,10 @@ def _run_tun(node, mtu, name, egress=None):
             _log(msg)
 
     def _to_tun(src_pk, pkt):
-        # Anti-spoof: a peer may only inject packets whose IPv4 source is its own
+        # Anti-spoof: a peer may only inject packets whose IP source is its own
         # overlay IP, or (for an accepted subnet router) an IP within a route we
         # accepted from it. Stops a peer forging traffic as another identity.
-        src = tun.parse_ipv4_src(pkt)
+        src = tun.parse_ip_src(pkt)
         if src is None or not node.src_permitted(src_pk, src):
             _warn(f"drop spoofed packet: src {src} not permitted for {src_pk[:12]}…")
             return
@@ -1275,9 +1304,9 @@ def _run_tun(node, mtu, name, egress=None):
             pkt = dev.read()                   # bounded wait; b"" on timeout
             if not pkt:
                 continue
-            dst = tun.parse_ipv4_dst(pkt)
+            dst = tun.parse_ip_dst(pkt)
             if not dst:
-                continue                       # non-IPv4 / truncated → drop
+                continue                       # malformed / truncated → drop
             pk = node.route_for(dst)           # overlay peer, or accepted subnet router
             if pk:
                 node.send(pk, MESH_IP, pkt)
@@ -1326,7 +1355,8 @@ def _run_tun(node, mtu, name, egress=None):
             upstream = node.dns_upstream or meshdns.detect_upstream()
             try:
                 dns_server = meshdns.MeshDNSServer(dns_ip, 53, node.dns_suffix,
-                                                   node.dns_lookup, upstream).start()
+                                                   node.dns_lookup, upstream,
+                                                   lookup_v6=node.dns_lookup_v6).start()
             except OSError as exc:                 # opt-in — keep the tunnel up on failure
                 _log(f"warning: could not start split-DNS on {dns_ip}:53: {exc}")
             else:
@@ -1441,14 +1471,17 @@ def _cmd_up(args):
     threading.Thread(target=node.run, daemon=True).start()
     time.sleep(1.0)   # let the first map arrive
 
-    _log(f"joined as {name}  overlay_ip={node.overlay_ip}  pubkey={node.pubkey_b64[:16]}…")
+    v6_note = f"  overlay_ip6={node.overlay_ip6}" if node.overlay_ip6 else ""
+    _log(f"joined as {name}  overlay_ip={node.overlay_ip}{v6_note}  "
+         f"pubkey={node.pubkey_b64[:16]}…")
     with node._lock:
         peers = list(node.peers.items())
     if peers:
         _log("peers:")
         for pk, info in peers:
             tag = " (exit)" if info.get("exit") else ""
-            _log(f"  {info.get('ip'):<15} {info.get('hostname')}{tag}  {pk[:16]}…")
+            v6_note = f"  {info['ip6']}" if info.get("ip6") else ""
+            _log(f"  {info.get('ip'):<15}{v6_note}  {info.get('hostname')}{tag}  {pk[:16]}…")
     else:
         _log("peers: (none yet)")
 

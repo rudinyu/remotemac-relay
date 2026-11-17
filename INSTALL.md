@@ -132,8 +132,10 @@ python3 mesh.py up coord.example.com:21200 --token "your-strong-secret" --name l
 python3 mesh.py up coord.example.com:21200 --token "your-strong-secret" --ping gw
 ```
 
-Each node gets a stable overlay IP from `100.64.0.0/10`. `--name` defaults to the
-system hostname. The token must match the coordinator's.
+Each node gets a stable IPv4 overlay IP from `100.64.0.0/10` and an IPv6 ULA
+address from the coordinator's persisted per-mesh prefix. Both appear in the
+node log. `--name` defaults to the system hostname. The token must match the
+coordinator's.
 
 **VPN data plane** — reach peers by overlay IP with real apps (needs root):
 

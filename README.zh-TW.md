@@ -408,7 +408,7 @@ ALL_PROXY=socks5h://127.0.0.1:1080 curl https://example.com
 
 ---
 
-## 四、Mesh overlay（實驗性 — Phase 8）
+## 四、Mesh overlay（實驗性 — Phase 9）
 
 除了 1:1 遠端桌面,`coordinator.py` + `mesh.py` 把系統擴充成 **mesh**(自架的簡化版 Tailscale):多個節點加入同一張網,各自拿到穩定的 overlay IP,節點之間端到端加密,而且在網路允許時**走 UDP P2P 直連**而非繞經 coordinator。需要 `cryptography`(`pip install cryptography`)。
 
@@ -424,19 +424,21 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --name mac
 python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 ```
 
-- 每個節點有持久的 X25519 身份(`~/.config/remotemac/mesh/key`,可用 `$REMOTEMAC_MESH_KEY` 覆寫);coordinator 從 `100.64.0.0/10` 配發 overlay IP。
+- 每個節點有持久的 X25519 身份(`~/.config/remotemac/mesh/key`,可用 `$REMOTEMAC_MESH_KEY` 覆寫);coordinator 從 `100.64.0.0/10` 配發 IPv4 位址,並從每個 mesh 專屬且持久保存的 ULA `/64` 配發 IPv6 位址。
 - 節點間握手是雙向認證 + 前向保密(X25519 triple-DH → HKDF-SHA256 → ChaCha20-Poly1305)。INIT 本身經過認證並帶時間戳(偽造或重放的握手一律丟棄),RESP 帶金鑰確認;session 每 2 分鐘換鑰,peer 重啟後可自動恢復;直連路徑只會因「已認證且非重放的資料封包」而變更。
 - **P2P 直連(Phase 2)**:節點透過向 coordinator 做 STUN-lite 探測得知自己的公網端點,互換候選端點後**同時打洞建立 UDP 直連**(以 pubkey 定序避免握手 glare)。之後資料在兩節點間直送。若數秒內打不通(例如雙方對稱 NAT),流量會**透明回退到 coordinator relay(DERP)** —— relay 全程只看得到密文。keepalive 維持 NAT 映射;直連靜默會回退 DERP,並週期性重新打洞,連通恢復時再升級回直連。
-- **TUN overlay(Phase 3)**:加上 `--tun`(需 root)後,節點會開一個虛擬網卡、綁上自己的 overlay IP、並把 `100.64.0.0/10` 路由過去 —— 讓**真實 app 直接用 overlay IP 連 peer**(`ping 100.64.0.x`、`ssh`、http),不再只有內建 `--ping`。核心的 IP 封包走同一條加密 P2P/DERP 資料路徑。macOS 用 `utun`(免 kext),Linux 用 `/dev/net/tun`。peer 只能送出「來源是自己 overlay IP」的封包(anti-spoof)。
+- **TUN overlay(Phase 3)**:加上 `--tun`(需 root)後,節點會開一個虛擬網卡、綁上自己的 overlay IPv4/IPv6 位址,並把兩個 overlay 網段路由過去 —— 讓**真實 app 直接用 overlay IP 連 peer**(`ping 100.64.0.x`、`ssh`、http),不再只有內建 `--ping`。核心的 IP 封包走同一條加密 P2P/DERP 資料路徑。macOS 用 `utun`(免 kext),Linux 用 `/dev/net/tun`。peer 只能送出「來源是自己 overlay IP」的封包(anti-spoof)。
 - **子網路由(Phase 4)**:節點用 `--advertise-routes 192.168.1.0/24` 宣告 LAN 網段;Linux 上會設定 IP forwarding 與 NAT。client 必須用 `--accept-route PUBKEY,CIDR` 明確信任特定公鑰與網段,才會把路由裝到 TUN。只接受已授權且不與 overlay、coordinator 或 peer endpoint 衝突的路由。
 - **IPv4 出口節點(Phase 5,opt-in)**:Linux 出口用 `--exit` 啟動;client 用 `--exit-node PUBKEY` 指定完整公鑰。mesh TCP/UDP 傳輸 socket 綁定實體介面,其他 IPv4 預設流量經 `0.0.0.0/1` 與 `128.0.0.0/1` 走 TUN。路由安裝失敗會中止啟動。此功能不處理 IPv6;若已有 IPv6 預設路由,需明確使用 `--allow-ipv6-bypass` 才允許 IPv6 直連。
-- **split-DNS(Phase 8,opt-in)**:加上 `--dns` 後,本機解析器在 `127.0.0.1:53` 回答 `<name>.mesh`。macOS 使用 `/etc/resolver/mesh`;Linux 若有 systemd-resolved,用 `resolvectl` 只把 `.mesh` 查詢導向 TUN 的 DNS 伺服器。其他 DNS 設定不變;無 systemd-resolved 時需手動設定。
+- **split-DNS(Phase 8,opt-in)**:加上 `--dns` 後,本機解析器在 `127.0.0.1:53` 回答 `<name>.mesh` 的 A 與 AAAA 記錄。macOS 使用 `/etc/resolver/mesh`;Linux 若有 systemd-resolved,用 `resolvectl` 只把 `.mesh` 查詢導向 TUN 的 DNS 伺服器。其他 DNS 設定不變;無 systemd-resolved 時需手動設定。
+- **IPv6 overlay(Phase 9)**:節點取得穩定的 ULA 位址,IPv6 封包與 IPv4 一樣透過加密 TUN 資料路徑傳送。UDP 直連及 coordinator relay 傳輸仍使用 IPv4;IPv6 子網路由與公網 IPv6 出口尚未啟用。
 
 ```bash
 # 只做 overlay:兩台機器開完整資料面(root),直接用 overlay IP:
 sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name a --tun
 sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name b --tun
 ping 100.64.0.3      # a → b 走 overlay;mesh log 顯示 [direct] 或 [derp]
+ping6 fdab:cdef:1234::3  # 請換成 mesh log 顯示的 b 節點 IPv6 位址
 
 # 子網路由:在 gw 執行 `sudo python3 mesh.py key` 取得完整公鑰:
 sudo python3 mesh.py up coord…:21200 --token … --name gw     --tun --advertise-routes 192.168.1.0/24
@@ -458,7 +460,7 @@ ssh user@gw.mesh              # 解析成 gw 的 overlay IP;example.com 照常
 > **Full-tunnel 注意事項**:它會改寫預設路由 —— 請在有 console/SSH 備援下測試。程序崩潰時兩條 `/1` 會隨 TUN 消失,預設路由自動恢復。DNS 走出口(公用 resolver 可用;LAN resolver 不行)。**直接連接的本地區網仍可達**(其 connected 路由比 `0.0.0.0/1`+`128.0.0.0/1` 更明確);只有原本要走預設閘道的流量才走隧道。若要讓**其他**經由 LAN 路由器才到的本地網段也保持可達,用 `--lan-routes 10.0.0.0/8,172.16.0.0/12` 列出。
 > IPv6 不走此出口。啟動時若已有 IPv6 預設路由,程式會拒絕啟動;只有明確指定 `--allow-ipv6-bypass` 才會讓 IPv6 直連。啟動後新增的 IPv6 路由不在此檢查範圍內。
 
-**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。Phase 3 加上 TUN overlay。Phase 4 加上子網路由。Phase 5 加上 opt-in full-tunnel 出口節點。Phase 6 加上 `--lan-routes` 並修正 LAN 可達性文件。Phase 7 加上 iptables 後援做 NAT egress。**Phase 8(本版)** 加上 opt-in 的 split-DNS(`--dns`)。後續:IPv6、macOS exit(pf)。純 Python 資料面吞吐中等,一般用途足夠。
+**狀態 / 藍圖**:Phase 1 交付控制平面、每節點身份、host 池 + 選擇,以及經 coordinator 轉發的加密資料路徑。Phase 2 加上 UDP P2P NAT 打洞與透明的 direct↔DERP 切換。Phase 3 加上 TUN overlay。Phase 4 加上子網路由。Phase 5 加上 opt-in full-tunnel 出口節點。Phase 6 加上 `--lan-routes` 並修正 LAN 可達性文件。Phase 7 加上 iptables 後援做 NAT egress。Phase 8 加上 opt-in 的 split-DNS(`--dns`)。**Phase 9** 加上 IPv6 overlay 位址、TUN 封包及 AAAA DNS。後續:IPv6 子網與出口、macOS exit(pf)。純 Python 資料面吞吐中等,一般用途足夠。
 
 ---
 

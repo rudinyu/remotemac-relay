@@ -10,7 +10,7 @@ encrypted, token-authenticated control channel. The coordinator:
     SecureChannel handshake used by remote_desktop.py), then challenges it to
     **prove possession** of the X25519 private key for the pubkey it registers
     (so a token holder can't claim another node's identity),
-  • assigns each node a stable overlay IP from 100.64.0.0/10 (persisted),
+  • assigns each node stable overlay IPv4 and IPv6 addresses (persisted),
   • distributes the network map (peers: pubkey, overlay IP, hostname, exit flag,
     UDP endpoints, advertised subnet routes) and pushes updates as nodes join/leave,
   • runs a UDP STUN responder on the same port for endpoint discovery,
@@ -49,7 +49,7 @@ try:
 except ImportError:
     sys.exit("coordinator requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 
 OVERLAY_NET = ipaddress.ip_network("100.64.0.0/10")
 MAX_NODES = 1024
@@ -79,12 +79,22 @@ class IPAllocator:
         self._path = state_path
         self._lock = threading.Lock()
         self._map = {}            # pubkey (b64) -> overlay ip str
+        self._net6 = None         # a persistent, per-mesh ULA /64
         self._load()
 
     def _load(self):
         try:
             with open(self._path) as f:
-                self._map = json.load(f).get("overlay_ips", {})
+                state = json.load(f)
+                self._map = state.get("overlay_ips", {})
+                if state.get("ipv6_prefix"):
+                    try:
+                        net = ipaddress.ip_network(state["ipv6_prefix"])
+                        if (net.version == 6 and net.prefixlen == 64
+                                and net.network_address.packed[0] == 0xfd):
+                            self._net6 = net
+                    except ValueError:
+                        pass  # keep existing IPv4 assignments if only the v6 prefix is bad
         except (FileNotFoundError, ValueError):
             self._map = {}
 
@@ -92,7 +102,8 @@ class IPAllocator:
         tmp = self._path + ".tmp"
         try:
             with open(tmp, "w") as f:
-                json.dump({"overlay_ips": self._map}, f, indent=2)
+                json.dump({"overlay_ips": self._map,
+                           "ipv6_prefix": str(self._net6) if self._net6 else None}, f, indent=2)
             os.replace(tmp, self._path)
         except OSError as exc:
             print(f"[coord] warning: could not persist state: {exc}", flush=True)
@@ -112,6 +123,23 @@ class IPAllocator:
                     self._save()
                     return ip
             raise RuntimeError("overlay address space exhausted")
+
+    def get6(self, pubkey: str) -> str:
+        """Stable ULA address sharing the node's persisted IPv4 host number."""
+        ip4 = self.get(pubkey)
+        with self._lock:
+            if self._net6 is None:
+                # RFC 4193: fd + 40 random bits is a site-local /48; use its
+                # first /64. Persist it so upgrades and restarts keep addresses.
+                raw = b"\xfd" + os.urandom(5) + b"\x00" * 10
+                self._net6 = ipaddress.IPv6Network((int.from_bytes(raw, "big"), 64))
+                self._save()
+            host = int(ipaddress.IPv4Address(ip4)) - int(OVERLAY_NET.network_address)
+            return str(self._net6.network_address + host)
+
+    @property
+    def network6(self):
+        return str(self._net6) if self._net6 else None
 
 
 def _verify_pop(ce_priv, nonce: bytes, pubkey_b64: str, proof_b64) -> bool:
@@ -212,12 +240,13 @@ class Coordinator:
         with self._lock:
             me = self._nodes.get(pubkey)
             peers = [
-                {"pubkey": pk, "ip": n["ip"], "hostname": n["hostname"],
+                {"pubkey": pk, "ip": n["ip"], "ip6": n["ip6"], "hostname": n["hostname"],
                  "exit": n["exit"], "endpoints": n.get("endpoints", []),
                  "routes": n.get("routes", []), "online": True}
                 for pk, n in self._nodes.items() if pk != pubkey
             ]
-        self_info = {"pubkey": pubkey, "ip": me["ip"]} if me else {}
+        self_info = {"pubkey": pubkey, "ip": me["ip"], "ip6": me["ip6"]} if me else {}
+        self_info["cidr6"] = self._alloc.network6
         return {"t": "map", "self": self_info, "peers": peers}
 
     def _push_all(self):
@@ -320,10 +349,11 @@ class Coordinator:
                     pk = None   # not admitted; nothing to clean up
                     return
             ip = self._alloc.get(pk)
+            ip6 = self._alloc.get6(pk)
             endpoints = [str(e)[:64] for e in (reg.get("endpoints") or [])][:16]
             routes = [str(r)[:64] for r in (reg.get("routes") or [])][:32]
             record = {"ch": ch, "hostname": reg.get("hostname", "node")[:64],
-                      "exit": bool(reg.get("exit")), "ip": ip,
+                      "exit": bool(reg.get("exit")), "ip": ip, "ip6": ip6,
                       "endpoints": endpoints, "routes": routes,
                       "outbox": _Outbox(ch, conn, lambda: self._map_for(pk))}
             with self._lock:

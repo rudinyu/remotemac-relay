@@ -2,10 +2,10 @@
 """
 tun.py — a TUN virtual interface for the remotemac mesh overlay (Phase 3).
 
-Bridges the OS network stack to the mesh data plane: raw IPv4 packets read from
+Bridges the OS network stack to the mesh data plane: raw IP packets read from
 the TUN device are routed to peers by overlay IP (`mesh.send(pk, MESH_IP, pkt)`),
 and packets arriving from peers are written back to the device. This turns the
-`100.64.0.0/10` overlay into a usable network for real apps (ping / ssh / http),
+IPv4 and IPv6 overlays into usable networks for real apps (ping / ssh / http),
 rather than only the built-in `--ping`.
 
 Platforms
@@ -66,14 +66,54 @@ def parse_ipv4_src(pkt: bytes):
     return _ipv4_addr(pkt, 12)
 
 
+def _ipv6_addr(pkt: bytes, offset: int):
+    """Address from a complete IPv6 base header, or None for invalid packets."""
+    if pkt is None or len(pkt) < 40 or (pkt[0] >> 4) != 6:
+        return None
+    payload_len = struct.unpack_from(">H", pkt, 4)[0]
+    if payload_len and len(pkt) < 40 + payload_len:
+        return None
+    return socket.inet_ntop(socket.AF_INET6, pkt[offset:offset + 16])
+
+
+def parse_ip_dst(pkt: bytes):
+    """Destination of an IPv4 or IPv6 packet; None for malformed packets."""
+    if not pkt:
+        return None
+    if (pkt[0] >> 4) == 4:
+        return parse_ipv4_dst(pkt)
+    if (pkt[0] >> 4) == 6:
+        return _ipv6_addr(pkt, 24)
+    return None
+
+
+def parse_ip_src(pkt: bytes):
+    """Source of an IPv4 or IPv6 packet; None for malformed packets."""
+    if not pkt:
+        return None
+    if (pkt[0] >> 4) == 4:
+        return parse_ipv4_src(pkt)
+    if (pkt[0] >> 4) == 6:
+        return _ipv6_addr(pkt, 8)
+    return None
+
+
 def mac_encap(pkt: bytes) -> bytes:
-    """Prepend the macOS utun 4-byte address-family header (AF_INET, big-endian)."""
-    return struct.pack(">I", socket.AF_INET) + pkt
+    """Prepend the macOS utun address-family header for the IP packet."""
+    if parse_ip_dst(pkt) is None:
+        raise ValueError("invalid IP packet")
+    family = socket.AF_INET6 if (pkt[0] >> 4) == 6 else socket.AF_INET
+    return struct.pack(">I", family) + pkt
 
 
 def mac_decap(data: bytes) -> bytes:
-    """Strip the macOS utun 4-byte address-family header."""
-    return data[4:]
+    """Strip a matching macOS utun address-family header."""
+    if len(data) < 5:
+        return b""
+    family = struct.unpack(">I", data[:4])[0]
+    pkt = data[4:]
+    expected = socket.AF_INET6 if (pkt[0] >> 4) == 6 else socket.AF_INET
+    return pkt if family == expected and parse_ip_dst(pkt) is not None else b""
 
 
 def _run(cmd):
@@ -81,7 +121,7 @@ def _run(cmd):
 
 
 class TunDevice:
-    """A TUN interface presenting raw IPv4 packets via read()/write()."""
+    """A TUN interface presenting raw IPv4 and IPv6 packets via read()/write()."""
 
     def __init__(self, name: str = None, mtu: int = 1280):
         self._name_req = name
@@ -90,6 +130,7 @@ class TunDevice:
         self._fd = None        # Linux file descriptor
         self._sock = None      # macOS utun control socket
         self._is_mac = (sys.platform == "darwin")
+        self._cidr6 = None     # macOS IPv6 route installed by configure()
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -132,21 +173,38 @@ class TunDevice:
 
     # -- addressing + route (root) ---------------------------------------------
 
-    def configure(self, overlay_ip: str, cidr: str = OVERLAY_CIDR):
-        """Assign the overlay IP to the interface and route the overlay net to it."""
+    def configure(self, overlay_ip: str, cidr: str = OVERLAY_CIDR,
+                  overlay_ip6: str = None, cidr6: str = None):
+        """Assign overlay addresses and route their networks to this interface."""
         if self._is_mac:
             # utun is point-to-point: address == destination is the usual idiom.
             _run(["ifconfig", self.name, "inet", overlay_ip, overlay_ip, "up"])
             _run(["ifconfig", self.name, "mtu", str(self.mtu)])
             _run(["route", "-n", "add", "-net", cidr, "-interface", self.name])
+            if overlay_ip6 and cidr6:
+                # A /128 address avoids an implicit connected /64 route; install
+                # the explicit route below, as for the IPv4 point-to-point utun.
+                _run(["ifconfig", self.name, "inet6", overlay_ip6, "prefixlen", "128"])
+                _run(["route", "-n", "add", "-inet6", "-net", cidr6,
+                      "-interface", self.name])
+                self._cidr6 = cidr6
         else:
             prefix = cidr.split("/")[1]
             _run(["ip", "addr", "add", f"{overlay_ip}/{prefix}", "dev", self.name])
             _run(["ip", "link", "set", "dev", self.name, "up", "mtu", str(self.mtu)])
+            if overlay_ip6 and cidr6:
+                prefix6 = cidr6.split("/")[1]
+                _run(["ip", "-6", "addr", "add", f"{overlay_ip6}/{prefix6}",
+                      "dev", self.name])
 
     def teardown(self, cidr: str = OVERLAY_CIDR):
         """Best-effort route cleanup. On close the interface itself disappears."""
         if self.name and self._is_mac:
+            if self._cidr6:
+                subprocess.run(["route", "-n", "delete", "-inet6", "-net", self._cidr6,
+                                "-interface", self.name], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._cidr6 = None
             subprocess.run(["route", "-n", "delete", "-net", cidr, "-interface", self.name],
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -166,10 +224,10 @@ class TunDevice:
             cmd = ["ip", "route", "del", cidr, "dev", self.name]
         subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # -- I/O (raw IPv4) ---------------------------------------------------------
+    # -- I/O (raw IP) -----------------------------------------------------------
 
     def read(self, timeout: float = 0.5) -> bytes:
-        """Return one raw IPv4 packet, or b"" if none arrives within `timeout`.
+        """Return one raw IP packet, or b"" if none arrives within `timeout`.
 
         The bounded wait lets a pump loop poll a shutdown flag instead of blocking
         forever in the kernel — so the fd/socket is never closed out from under a

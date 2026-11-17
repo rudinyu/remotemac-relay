@@ -31,6 +31,7 @@ def _rcode(resp):
 
 
 _LOOKUP = lambda h: {"gw": "100.64.0.9", "laptop": "100.64.0.2"}.get(h)
+_LOOKUP_V6 = lambda h: {"gw": "fd12:3456:789a::9"}.get(h)
 
 
 class TestParseQuery(unittest.TestCase):
@@ -53,13 +54,19 @@ class TestParseQuery(unittest.TestCase):
 class TestAnswerFor(unittest.TestCase):
     def _ans(self, name, qtype=meshdns.QTYPE_A):
         qid, qname, qt = meshdns.parse_query(_query(name, qtype))
-        return meshdns.answer_for(qid, qname, qt, "mesh", _LOOKUP)
+        return meshdns.answer_for(qid, qname, qt, "mesh", _LOOKUP, _LOOKUP_V6)
 
     def test_a_hit(self):
         self.assertEqual(_answer_ip(self._ans("gw.mesh")), "100.64.0.9")
 
-    def test_aaaa_is_nodata_not_nxdomain(self):
+    def test_aaaa_hit(self):
         resp = self._ans("gw.mesh", meshdns.QTYPE_AAAA)
+        self.assertEqual(struct.unpack(">H", resp[6:8])[0], 1)
+        self.assertEqual(struct.unpack(">H", resp[-26:-24])[0], meshdns.QTYPE_AAAA)
+        self.assertEqual(socket.inet_ntop(socket.AF_INET6, resp[-16:]), "fd12:3456:789a::9")
+
+    def test_aaaa_is_nodata_when_only_ipv4_exists(self):
+        resp = self._ans("laptop.mesh", meshdns.QTYPE_AAAA)
         self.assertIsNone(_answer_ip(resp))
         self.assertEqual(_rcode(resp), 0)            # NOERROR / NODATA
 
@@ -146,6 +153,12 @@ class TestServerIntegration(unittest.TestCase):
 
     def test_mesh_name_answered_locally(self):
         self.assertEqual(_answer_ip(self._ask("gw.mesh")), "100.64.0.9")
+
+    def test_mesh_aaaa_answered_locally(self):
+        self.server.lookup_v6 = _LOOKUP_V6
+        resp = self._ask("gw.mesh", meshdns.QTYPE_AAAA)
+        self.assertEqual(socket.inet_ntop(socket.AF_INET6, resp[-16:]),
+                         "fd12:3456:789a::9")
 
     def test_other_name_forwarded_to_upstream(self):
         self.assertEqual(_answer_ip(self._ask("example.com")), "9.9.9.9")

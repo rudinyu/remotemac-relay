@@ -5,6 +5,16 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-11-17
+
+### Added
+- **Mesh IPv6 overlay (Phase 9).** The coordinator persists a per-mesh ULA
+  prefix and gives every node a stable IPv6 address alongside its IPv4 address.
+  Linux TUN and macOS utun carry IPv6 peer packets over the existing encrypted
+  data path, with peer-source checks. Split-DNS answers AAAA queries for mesh
+  names. IPv6 subnets, public IPv6 exit routing, and IPv6 underlay transport
+  remain outside this phase.
+
 ## [4.0.0] - 2026-11-17
 
 **Breaking mesh CLI release.** `relay.py` is version 2.1.0.

@@ -422,7 +422,7 @@ Point a browser at SOCKS5 host `127.0.0.1`, port `1080` to route everything thro
 
 ---
 
-## 4. Mesh overlay (experimental — Phase 8)
+## 4. Mesh overlay (experimental — Phase 9)
 
 Beyond the 1:1 remote-desktop model, `coordinator.py` + `mesh.py` grow the system
 into a **mesh** (a self-hosted, Tailscale-lite network): many nodes join one
@@ -443,8 +443,9 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
 ```
 
 - Each node has a persistent X25519 identity (`~/.config/remotemac/mesh/key`,
-  overridable with `$REMOTEMAC_MESH_KEY`); the coordinator assigns overlay IPs
-  from `100.64.0.0/10`.
+  overridable with `$REMOTEMAC_MESH_KEY`); the coordinator assigns stable IPv4
+  overlay addresses from `100.64.0.0/10` and IPv6 addresses from a per-mesh ULA
+  `/64`. The IPv6 prefix is stored with the coordinator's address assignments.
 - Node↔node handshake is mutually authenticated and forward-secret (X25519
   triple-DH → HKDF-SHA256 → ChaCha20-Poly1305). The INIT is itself authenticated
   and timestamped (forged or replayed handshakes are dropped), the RESP is
@@ -459,8 +460,9 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   holds the NAT mapping open; a silent direct path fails over to DERP and is
   periodically re-punched so it can upgrade back to direct once reachable.
 - **TUN overlay (Phase 3).** With `--tun` (needs root), the node brings up a
-  virtual interface, assigns its overlay IP, and routes `100.64.0.0/10` to it —
-  so **real apps reach peers by overlay IP** (`ping 100.64.0.x`, `ssh`, http),
+  virtual interface, assigns its overlay IPs, and routes the IPv4 and IPv6
+  overlay networks to it — so **real apps reach peers by overlay IP**
+  (`ping 100.64.0.x`, `ssh`, http),
   not just the built-in `--ping`. Kernel IP packets are carried over the same
   encrypted P2P/DERP data path. macOS uses `utun` (no kext); Linux uses
   `/dev/net/tun`. A peer may only inject packets sourced from its own overlay IP
@@ -484,18 +486,23 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   errors abort startup; peer endpoint IPs do not get destination-wide bypass routes. This
   is **off by default**; without `--exit-node` the default route is untouched.
 - **split-DNS (Phase 8, opt-in).** With `--dns`, a node runs a tiny resolver that
-  answers `<name>.mesh` with the peer's overlay IP and forwards everything else to
-  your existing upstream — so `ssh laptop.mesh` works instead of memorizing overlay
-  IPs. It binds `127.0.0.1:53` (local-only) and routes only `.mesh` queries to
+  answers `<name>.mesh` with the peer's overlay A and AAAA records and forwards
+  everything else to your existing upstream — so `ssh laptop.mesh` works instead
+  of memorizing overlay IPs. It binds `127.0.0.1:53` (local-only) and routes only `.mesh` queries to
   itself: macOS uses `/etc/resolver/mesh`; Linux uses `resolvectl` on the TUN
   interface when systemd-resolved is available. Other DNS settings stay intact.
   On other Linux resolver setups, the server runs but OS DNS must be configured manually.
+- **IPv6 overlay (Phase 9).** Peers receive stable ULA addresses and exchange
+  IPv6 packets through the same encrypted TUN data path. Direct UDP and
+  coordinator relay transport still use IPv4. IPv6 subnet routing and public
+  IPv6 exit traffic are not enabled.
 
 ```bash
 # Overlay only: full data plane on two machines (root); use overlay IPs directly:
 sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name a --tun
 sudo python3 mesh.py up coord.example.com:21200 --token "network-secret" --name b --tun
 ping 100.64.0.3      # a → b over the overlay; the mesh log shows [direct] or [derp]
+ping6 fdab:cdef:1234::3  # replace with b's IPv6 overlay address from the mesh log
 
 # Subnet router: on gw, run `sudo python3 mesh.py key` and copy its full public key:
 sudo python3 mesh.py up coord…:21200 --token … --name gw     --tun --advertise-routes 192.168.1.0/24
@@ -548,9 +555,10 @@ pool + selection, and a relayed encrypted data path. Phase 2 added UDP P2P with 
 hole punching and transparent direct↔DERP failover. Phase 3 added the TUN overlay.
 Phase 4 added subnet routing. Phase 5 added the opt-in full-tunnel exit node.
 Phase 6 added `--lan-routes` and corrected the LAN-reachability docs. Phase 7 added
-an iptables fallback for NAT egress. **Phase 8 (this release)** adds opt-in split-DNS
-(`--dns`). Still to come: IPv6, macOS exit (pf). Data-plane throughput is modest
-(pure-Python), fine for typical use.
+an iptables fallback for NAT egress. Phase 8 added opt-in split-DNS (`--dns`).
+**Phase 9** adds IPv6 overlay addresses, TUN packet transport, and AAAA DNS.
+Still to come: IPv6 subnets and exit, macOS exit (pf). Data-plane throughput is
+modest (pure-Python), fine for typical use.
 
 ---
 
