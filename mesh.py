@@ -17,7 +17,7 @@ hole punching, Phase 2) and transparently falls back to a coordinator relay
 IP; **subnet routing** (Phase 4, `--advertise-routes`/`--accept-route`) to reach
 LANs behind a trusted peer; an opt-in **IPv4/IPv6 exit node** (`--exit` /
 `--exit-ipv6` / `--exit-node`, with `--lan-routes`); opt-in **split-DNS** (`--dns`)
-resolving `<name>.mesh` to overlay IPs; and IPv6 peer/subnet packets over the
+resolving pinned or key-derived `<name>.mesh` names to overlay IPs; and IPv6 peer/subnet packets over the
 TUN. TUN and routing need root or Windows Administrator; everything else runs
 unprivileged. Windows currently supports overlay and accepted-subnet clients.
 
@@ -30,7 +30,7 @@ Usage
     sudo python3 mesh.py up <coord:port> --token <token> --tun   # VPN data plane
     sudo python3 mesh.py up <coord:port> --token <token> --tun --advertise-routes 192.168.1.0/24
     sudo python3 mesh.py up <coord:port> --token <token> --tun --exit-node <peer-pubkey>
-    sudo python3 mesh.py up <coord:port> --token <token> --tun --dns   # resolve <name>.mesh
+    sudo python3 mesh.py up <coord:port> --token <token> --tun --dns --dns-pin gw=<peer-pubkey>
 """
 import argparse
 import base64
@@ -40,6 +40,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -59,7 +60,7 @@ try:
 except ImportError:
     sys.exit("mesh mode requires the 'cryptography' package:\n  pip install cryptography")
 
-__version__ = "4.3.0"
+__version__ = "5.0.0"
 
 _HS_INFO   = b"remotemac-mesh-v1"
 _KEY_PATH  = os.path.expanduser("~/.config/remotemac/mesh/key")
@@ -134,6 +135,45 @@ def _has_tun_privilege():
         except (AttributeError, OSError):
             return False
     return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def dns_key_label(pubkey_b64):
+    """A DNS-safe label containing a peer's complete 32-byte public key."""
+    try:
+        raw = base64.b64decode(pubkey_b64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("invalid peer public key") from exc
+    if len(raw) != 32 or _b64(raw) != pubkey_b64:
+        raise ValueError("peer public key must be 32 bytes")
+    return "k-" + base64.b32encode(raw).decode("ascii").rstrip("=").lower()
+
+
+def _key_for_dns_label(label):
+    if not re.fullmatch(r"k-[a-z2-7]{52}", label):
+        return None
+    try:
+        raw = base64.b32decode(label[2:].upper() + "====")
+    except (ValueError, binascii.Error):
+        return None
+    key = _b64(raw)
+    return key if dns_key_label(key) == label else None
+
+
+def parse_dns_pins(specs):
+    """Parse repeatable NAME=PUBKEY aliases; reject conflicting or malformed pins."""
+    pins = {}
+    for spec in specs or []:
+        name, sep, key = spec.partition("=")
+        name = name.lower()
+        if not sep or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", name):
+            raise ValueError(f"invalid DNS pin name in {spec!r}")
+        if _key_for_dns_label(name) is not None:
+            raise ValueError("DNS key labels cannot be overridden")
+        dns_key_label(key)  # validate the complete key and canonical base64
+        if name in pins and pins[name] != key:
+            raise ValueError(f"conflicting DNS pins for {name}")
+        pins[name] = key
+    return pins
 
 # ─── subnet routing (Phase 4) ────────────────────────────────────────────────────
 
@@ -445,7 +485,10 @@ class MeshNode:
         self.allow_ipv6_bypass = False
         self.dns_enabled = False          # run the split-DNS resolver (--dns)
         self.dns_suffix = "mesh"          # names under this suffix resolve to peers
-        self.dns_upstream = None          # forward non-mesh queries here (auto if None)
+        self.dns_upstream = None          # explicit global fallback upstream (auto if None)
+        self.dns_global_fallback = False  # explicit opt-in for static resolv.conf
+        self.dns_pins = {}                # trusted DNS alias -> full peer public key
+        self.dns_allow_unpinned = False   # legacy hostname lookup is opt-in
         self.ch       = None
         self.udp      = None
         self._coord_udp = None       # (host, port) for STUN probes
@@ -862,12 +905,17 @@ class MeshNode:
         if not name:
             return None
         with self._lock:
-            matches = [info.get(field) for info in self.peers.values()
-                       if (info.get("hostname") or "").lower() == name]
+            peers = dict(self.peers)
+        key = self.dns_pins.get(name) or _key_for_dns_label(name)
+        if key:
+            if key == self.pubkey_b64:
+                return self.overlay_ip6 if field == "ip6" else self.overlay_ip
+            return (peers.get(key) or {}).get(field)
+        matches = [info.get(field) for info in peers.values()
+                   if (info.get("hostname") or "").lower() == name]
         if name == (self.hostname or "").lower():
-            own_ip = self.overlay_ip6 if field == "ip6" else self.overlay_ip
-            return own_ip if not matches else None
-        return matches[0] if len(matches) == 1 else None
+            return None if matches else (self.overlay_ip6 if field == "ip6" else self.overlay_ip)
+        return matches[0] if self.dns_allow_unpinned and len(matches) == 1 else None
 
     def _peer_static(self, pk_b64: str) -> bytes:
         return _unb64(pk_b64)
@@ -1422,29 +1470,36 @@ def _run_tun(node, mtu, name, egress=None):
             _log(f"full-tunnel: {families} default route → exit {node.exit_node_key[:16]}… via {dev.name} "
                  f"(mesh transport bound to {node.transport_iface})")
 
-        # split-DNS: resolve <name>.<suffix> to overlay IPs, forward the rest.
+        # split-DNS: only route the mesh suffix to the local resolver.
         # Bind loopback (not the overlay IP) so it's local-only — a peer can't use
         # us as an open DNS forwarder through the TUN.
         if node.dns_enabled:
             import meshdns
             dns_ip = "127.0.0.1"
-            upstream = node.dns_upstream or meshdns.detect_upstream()
+            upstream = None
+            if node.dns_global_fallback:
+                upstream = node.dns_upstream or meshdns.detect_upstream()
             try:
                 dns_server = meshdns.MeshDNSServer(dns_ip, 53, node.dns_suffix,
-                                                   node.dns_lookup, upstream,
+                                                   node.dns_lookup,
                                                    lookup_v6=node.dns_lookup_v6).start()
-            except OSError as exc:                 # opt-in — keep the tunnel up on failure
-                _log(f"warning: could not start split-DNS on {dns_ip}:53: {exc}")
+            except OSError as exc:
+                sys.exit(f"error: could not start split-DNS on {dns_ip}:53: {exc}")
             else:
                 # Point the OS resolver at us only once the server is listening.
                 try:
                     resolver_cfg = meshdns.ResolverConfig(node.dns_suffix, dns_ip, upstream,
-                                                          interface=dev.name).apply()
+                                                          interface=dev.name,
+                                                          allow_global_fallback=node.dns_global_fallback).apply()
+                    if resolver_cfg.uses_global_fallback:
+                        dns_server.upstream = upstream
                 except (meshdns.ResolverError, OSError) as exc:
-                    _log(f"warning: split-DNS running but could not configure the OS resolver: {exc} "
-                         f"(query it directly with dig @{dns_ip})")
-                _log(f"split-DNS: resolving *.{node.dns_suffix} on {dns_ip}:53 "
-                     f"(upstream {upstream or 'none'})")
+                    sys.exit(f"error: could not configure scoped DNS: {exc}")
+                if resolver_cfg.uses_global_fallback:
+                    mode = f"global fallback via {upstream}"
+                else:
+                    mode = "scoped"
+                _log(f"split-DNS: resolving *.{node.dns_suffix} on {dns_ip}:53 ({mode})")
 
         _log("running — Ctrl-C to leave the mesh")
         while not node._done.is_set():
@@ -1496,6 +1551,22 @@ def _cmd_up(args):
     dns_enabled = getattr(args, "dns", False)
     if dns_enabled and not getattr(args, "tun", False):
         sys.exit("error: --dns requires --tun")
+    if (getattr(args, "dns_pin", None) or getattr(args, "dns_allow_unpinned", False) or
+            getattr(args, "dns_global_fallback", False)) and not dns_enabled:
+        sys.exit("error: DNS pin/fallback options require --dns")
+    if getattr(args, "dns_global_fallback", False) and not sys.platform.startswith("linux"):
+        sys.exit("error: --dns-global-fallback is only available on Linux")
+    if getattr(args, "dns_upstream", None) and not getattr(args, "dns_global_fallback", False):
+        sys.exit("error: --dns-upstream requires --dns-global-fallback")
+    try:
+        dns_pins = parse_dns_pins(getattr(args, "dns_pin", None))
+        if dns_enabled:
+            import meshdns
+            meshdns.validate_suffix(getattr(args, "dns_suffix", None) or "mesh")
+        if getattr(args, "dns_upstream", None):
+            ipaddress.ip_address(args.dns_upstream)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
     if getattr(args, "tun", False):
         if args.ping:
             sys.exit("error: --tun and --ping are mutually exclusive")
@@ -1545,6 +1616,9 @@ def _cmd_up(args):
     node.dns_enabled = dns_enabled
     node.dns_suffix = (getattr(args, "dns_suffix", None) or "mesh").strip(".").lower()
     node.dns_upstream = getattr(args, "dns_upstream", None)
+    node.dns_global_fallback = getattr(args, "dns_global_fallback", False)
+    node.dns_pins = dns_pins
+    node.dns_allow_unpinned = getattr(args, "dns_allow_unpinned", False)
 
     pong_event = threading.Event()
     pong_at = {}
@@ -1617,7 +1691,11 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     key_cmd = sub.add_parser("key", help="print this node's full public key")
-    key_cmd.set_defaults(func=lambda args: print(_b64(pub_bytes(load_or_create_identity()))))
+    key_cmd.add_argument("--dns-label", action="store_true",
+                         help="print the key-bound DNS label instead")
+    key_cmd.set_defaults(func=lambda args: print(
+        dns_key_label(_b64(pub_bytes(load_or_create_identity()))) if args.dns_label else
+        _b64(pub_bytes(load_or_create_identity()))))
 
     up = sub.add_parser("up", help="join the mesh")
     up.add_argument("coord_addr", metavar="coord:port")
@@ -1647,9 +1725,15 @@ def main():
     up.add_argument("--lan-routes", metavar="CIDR[,CIDR…]",
                     help="full-tunnel: keep these extra local subnets on the physical gateway (needs --exit-node)")
     up.add_argument("--dns", action="store_true",
-                    help="run split-DNS: resolve <name>.<suffix> to peers, forward the rest (needs --tun)")
+                    help="route only <name>.<suffix> lookups to the local resolver (needs --tun)")
     up.add_argument("--dns-suffix", default="mesh", help="DNS suffix for mesh names (default: mesh)")
-    up.add_argument("--dns-upstream", metavar="IP", help="upstream resolver for non-mesh queries (auto-detected if omitted)")
+    up.add_argument("--dns-upstream", metavar="IP", help="upstream for explicit global fallback (auto-detected if omitted)")
+    up.add_argument("--dns-pin", action="append", metavar="NAME=PUBKEY",
+                    help="resolve this DNS alias only to the pinned peer key (repeatable)")
+    up.add_argument("--dns-allow-unpinned", action="store_true",
+                    help="allow legacy DNS lookup by untrusted advertised hostnames")
+    up.add_argument("--dns-global-fallback", action="store_true",
+                    help="Linux: explicitly allow temporary global resolv.conf rewrite")
     up.add_argument("--egress", metavar="IFACE",
                     help="egress interface for gateway NAT (default: the system default route's device)")
     up.set_defaults(func=_cmd_up)

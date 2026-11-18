@@ -42,7 +42,7 @@ cd remotemac-relay
 
 Keep the checkout on mesh nodes, or copy its Python modules together: `mesh.py`
 imports `remote_desktop.py` and loads `tun.py`, `wintun.py` (Windows),
-`netroute.py`, `nat.py`, `macnat.py`, and `meshdns.py` for optional features. The coordinator needs
+`netroute.py`, `nat.py`, `macnat.py`, `meshdns.py`, and `windns.py` for optional features. The coordinator needs
 `coordinator.py` and `remote_desktop.py`; `relay.py` runs on its own.
 
 ---
@@ -181,24 +181,28 @@ default route unless `--allow-ipv6-bypass` explicitly permits direct IPv6.
 Upgrade the coordinator before enabling a macOS gateway with this node version;
 macOS gateway status is published after forwarding and NAT setup succeeds.
 
-**split-DNS** — reach peers by name (`ssh laptop.mesh`):
+**split-DNS** — reach a peer through a public-key-bound alias (`ssh gw.mesh`):
 
 ```bash
-sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --dns
+sudo python3 mesh.py key             # on gw: use the same account that runs its node
+sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --dns --dns-pin gw=GW_PUBKEY
+ssh user@gw.mesh
 ```
 
-Linux prefers systemd-resolved (`resolvectl`) for only the `.mesh` domain. If
-unavailable and `/etc/resolv.conf` is a plain unmanaged file, the tool saves it,
-temporarily sends DNS through the local resolver, forwards non-mesh queries to
-the saved upstream, and restores the file on exit or on the next run after a
-crash. Managed resolver files are left to their manager.
+The gateway's `sudo python3 mesh.py key --dns-label` also gives a full-key DNS
+label usable as `<key-label>.mesh` without an alias. A peer's advertised `--name`
+is not resolved by default. macOS, Linux with systemd-resolved, and Windows
+route only `.mesh` to the local resolver. Other domains keep their normal DNS.
+On Linux without systemd-resolved, `--dns` fails and leaves DNS unchanged;
+`--dns-global-fallback` explicitly allows a reversible rewrite of a plain,
+unmanaged `/etc/resolv.conf`. `--dns-upstream IP` applies only in that mode.
 
 **Windows client:** install `cryptography`, download the architecture-matched
 official [Wintun DLL](https://www.wintun.net/), and place `wintun.dll` beside
 `wintun.py` (or set `REMOTEMAC_WINTUN_DLL` to its absolute path). In an
 Administrator terminal run `py -3 mesh.py up coord.example.com:21200 --token "…" --tun`.
-Windows supports overlay peers and accepted subnet routes;
-gateway NAT, full-tunnel exit, and automatic OS DNS setup remain macOS/Linux.
+Windows supports overlay peers, accepted subnet routes, and scoped `.mesh` DNS
+using NRPT. Gateway NAT and full-tunnel exit remain macOS/Linux.
 
 > `--tun` and the routing/DNS features need **root** on macOS/Linux or an
 > **Administrator** terminal on Windows. On Linux a subnet/exit node

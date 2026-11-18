@@ -103,11 +103,46 @@ class TestResolverConfigHelpers(unittest.TestCase):
         self.assertEqual(commands, [
             ["resolvectl", "dns", "remotemac0", "127.0.0.1"],
             ["resolvectl", "domain", "remotemac0", "~mesh"],
+            ["resolvectl", "default-route", "remotemac0", "no"],
             ["resolvectl", "revert", "remotemac0"],
         ])
 
+    def test_suffix_validation(self):
+        self.assertEqual(meshdns.validate_suffix("Mesh."), "mesh")
+        for bad in ("", "-mesh", "mesh;exit", "mesh..local", "mesh\nfoo"):
+            with self.assertRaises(ValueError):
+                meshdns.validate_suffix(bad)
+
     def test_macos_resolver_path(self):
         self.assertEqual(meshdns.macos_resolver_file("mesh"), "/etc/resolver/mesh")
+
+    def test_macos_restore_preserves_a_changed_resolver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mesh")
+            with mock.patch.object(meshdns.sys, "platform", "darwin"), \
+                 mock.patch.object(meshdns.os, "makedirs"), \
+                 mock.patch.object(meshdns, "macos_resolver_file", return_value=path):
+                cfg = meshdns.ResolverConfig("mesh", "127.0.0.1").apply()
+                with open(path, "w") as f:
+                    f.write("nameserver 1.1.1.1\n")
+                with self.assertRaisesRegex(meshdns.ResolverError, "changed"):
+                    cfg.restore()
+                with open(path) as f:
+                    self.assertEqual(f.read(), "nameserver 1.1.1.1\n")
+                with open(path, "w") as f:
+                    f.write("nameserver 127.0.0.1\n")
+                cfg.restore()
+                self.assertFalse(os.path.exists(path))
+
+    def test_windows_uses_nrpt_rule(self):
+        with mock.patch.object(meshdns.sys, "platform", "win32"), \
+             mock.patch("windns.NrptConfig") as nrpt:
+            cfg = meshdns.ResolverConfig("mesh", "127.0.0.1")
+            cfg.apply()
+            self.assertFalse(cfg.uses_global_fallback)
+            cfg.restore()
+        nrpt.assert_called_once_with("mesh", "127.0.0.1")
+        nrpt.return_value.apply.return_value.restore.assert_called_once_with()
 
     def test_restore_is_a_noop_when_never_applied(self):
         meshdns.ResolverConfig("mesh", "100.64.0.2", "1.1.1.1").restore()   # must not raise
@@ -128,7 +163,33 @@ class TestStaticResolverFallback(unittest.TestCase):
     def _config(self):
         return meshdns.ResolverConfig("mesh", "127.0.0.1", "9.9.9.9",
                                       interface="remotemac0", resolv_path=self.resolv,
-                                      state_path=self.state)
+                                      state_path=self.state, allow_global_fallback=True)
+
+    def test_default_never_rewrites_global_resolver(self):
+        with mock.patch.object(meshdns.sys, "platform", "linux"), \
+             mock.patch.object(meshdns.subprocess, "run", side_effect=FileNotFoundError):
+            cfg = meshdns.ResolverConfig("mesh", "127.0.0.1", "9.9.9.9",
+                                         interface="remotemac0", resolv_path=self.resolv,
+                                         state_path=self.state)
+            with self.assertRaisesRegex(meshdns.ResolverError, "system DNS unchanged"):
+                cfg.apply()
+        with open(self.resolv) as f:
+            self.assertEqual(f.read(), self.original)
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_failed_resolved_revert_blocks_global_fallback(self):
+        def run(command, **_kwargs):
+            if command[1] == "dns":
+                return None
+            raise meshdns.subprocess.CalledProcessError(1, command)
+
+        with mock.patch.object(meshdns.sys, "platform", "linux"), \
+             mock.patch.object(meshdns.subprocess, "run", side_effect=run):
+            cfg = self._config()
+            with self.assertRaisesRegex(meshdns.ResolverError, "could not be reverted"):
+                cfg.apply()
+        with open(self.resolv) as f:
+            self.assertEqual(f.read(), self.original)
 
     def test_fallback_rewrites_static_file_then_restores_it(self):
         with mock.patch.object(meshdns.sys, "platform", "linux"), \
@@ -178,7 +239,7 @@ class TestStaticResolverFallback(unittest.TestCase):
         os.symlink(self.resolv, link)
         cfg = meshdns.ResolverConfig("mesh", "127.0.0.1", "9.9.9.9",
                                      interface="remotemac0", resolv_path=link,
-                                     state_path=self.state)
+                                     state_path=self.state, allow_global_fallback=True)
         with self.assertRaisesRegex(meshdns.ResolverError, "symlink"):
             cfg._apply_file()
         with open(self.resolv) as f:
@@ -186,7 +247,8 @@ class TestStaticResolverFallback(unittest.TestCase):
 
     def test_upstream_cannot_point_at_mesh_resolver(self):
         cfg = meshdns.ResolverConfig("mesh", "127.0.0.1", "127.0.0.1",
-                                     resolv_path=self.resolv, state_path=self.state)
+                                     resolv_path=self.resolv, state_path=self.state,
+                                     allow_global_fallback=True)
         with self.assertRaisesRegex(meshdns.ResolverError, "upstream DNS"):
             cfg._apply_file()
 
@@ -242,6 +304,29 @@ class TestServerIntegration(unittest.TestCase):
 
     def test_other_name_forwarded_to_upstream(self):
         self.assertEqual(_answer_ip(self._ask("example.com")), "9.9.9.9")
+
+    def test_other_name_refused_without_explicit_upstream(self):
+        self.server.upstream = None
+        self.assertEqual(_rcode(self._ask("example.com")), 5)
+
+    def test_upstream_response_with_wrong_transaction_id_is_dropped(self):
+        class FakeUDP:
+            def __init__(self): self.sent = []
+            def sendto(self, *args): self.sent.append(args)
+        class FakeUpstream:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def settimeout(self, _): pass
+            def connect(self, _): pass
+            def send(self, _): pass
+            def recv(self, _):
+                return meshdns.build_response(b"\x00\x00", "example.com", 1, "9.9.9.9")
+        srv = meshdns.MeshDNSServer("127.0.0.1", 53, "mesh", _LOOKUP,
+                                    upstream="9.9.9.9")
+        srv.udp = FakeUDP()
+        with mock.patch.object(meshdns.socket, "socket", return_value=FakeUpstream()):
+            srv._forward(_query("example.com"), ("127.0.0.1", 5555))
+        self.assertEqual(srv.udp.sent, [])
 
     def test_slow_query_does_not_block_other_queries(self):
         entered = threading.Event()

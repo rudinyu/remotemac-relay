@@ -802,7 +802,43 @@ class TestMeshEndToEnd(unittest.TestCase):
         self.assertTrue(a.src_permitted(b.pubkey_b64, bob6))
         self.assertFalse(a.src_permitted(b.pubkey_b64, a.overlay_ip6))
         self.assertIsNone(a.route_for("2001:db8::1234"))
-        self.assertEqual(a.dns_lookup_v6("v6-bob"), bob6)
+        self.assertEqual(a.dns_lookup_v6(mesh.dns_key_label(b.pubkey_b64)), bob6)
+
+    def test_dns_names_are_bound_to_peer_keys(self):
+        client = mesh.MeshNode(X25519PrivateKey.generate(), "client")
+        peer_key = mesh._b64(mesh.pub_bytes(X25519PrivateKey.generate()))
+        other_key = mesh._b64(mesh.pub_bytes(X25519PrivateKey.generate()))
+        client.peers = {peer_key: {"hostname": "gw", "ip": "100.64.0.2"}}
+        label = mesh.dns_key_label(peer_key)
+        self.assertEqual(mesh._key_for_dns_label(label), peer_key)
+        self.assertEqual(client.dns_lookup(label), "100.64.0.2")
+        self.assertIsNone(client.dns_lookup("gw"))
+        client.dns_pins = {"gw": peer_key}
+        self.assertEqual(client.dns_lookup("gw"), "100.64.0.2")
+        client.peers = {other_key: {"hostname": "gw", "ip": "100.64.0.3"}}
+        self.assertIsNone(client.dns_lookup("gw"))
+        self.assertIsNone(client.dns_lookup(label))
+        client.dns_allow_unpinned = True
+        self.assertIsNone(client.dns_lookup("gw"))
+        client.dns_pins = {}
+        self.assertEqual(client.dns_lookup("gw"), "100.64.0.3")
+
+    def test_dns_pins_reject_bad_keys_and_conflicts(self):
+        key1 = mesh._b64(mesh.pub_bytes(X25519PrivateKey.generate()))
+        key2 = mesh._b64(mesh.pub_bytes(X25519PrivateKey.generate()))
+        self.assertEqual(mesh.parse_dns_pins(["GW=" + key1]), {"gw": key1})
+        for pins in (["bad.name=" + key1], ["gw=short"],
+                     ["gw=" + key1, "gw=" + key2],
+                     [mesh.dns_key_label(key1) + "=" + key2]):
+            with self.assertRaises(ValueError):
+                mesh.parse_dns_pins(pins)
+
+    def test_own_dns_name_with_remote_collision_fails_closed(self):
+        client = mesh.MeshNode(X25519PrivateKey.generate(), "client")
+        client.overlay_ip = "100.64.0.1"
+        client.dns_allow_unpinned = True
+        client.peers = {"other": {"hostname": "client", "ip": "100.64.0.2"}}
+        self.assertIsNone(client.dns_lookup("client"))
 
     def test_duplicate_hostnames_fail_closed(self):
         n = mesh.MeshNode(X25519PrivateKey.generate(), "client")

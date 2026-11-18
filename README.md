@@ -507,15 +507,17 @@ python3 mesh.py up coord.example.com:21200 --token "network-secret" --ping mac
   Route setup errors abort startup. Without `--exit-node`, default routes stay
   untouched. Windows full-tunnel exit clients and Windows gateways are not yet
   supported.
-- **split-DNS (Phase 8, opt-in).** With `--dns`, a node runs a tiny resolver that
-  answers `<name>.mesh` with the peer's overlay A and AAAA records and forwards
-  everything else to your existing upstream — so `ssh laptop.mesh` works instead
-  of memorizing overlay IPs. It binds `127.0.0.1:53` (local-only) and routes only `.mesh` queries to
-  itself: macOS uses `/etc/resolver/mesh`; Linux uses `resolvectl` on the TUN
-  interface when systemd-resolved is available. For a plain, unmanaged Linux
-  `/etc/resolv.conf`, it temporarily points all DNS to the local resolver, which
-  forwards non-mesh names to the saved upstream. It restores the file on exit or
-  the next run after a crash. Managed resolver files are left to their manager.
+- **split-DNS (Phase 8, opt-in).** With `--dns`, a node runs a local resolver at
+  `127.0.0.1:53` for `.mesh` A and AAAA records. By default, peers resolve by a
+  label derived from their full public key (`mesh.py key --dns-label`), or by an
+  alias explicitly bound to a public key (`--dns-pin gw=PUBKEY`). An advertised
+  `--name` alone is not a trusted DNS name. macOS uses `/etc/resolver/mesh`, Linux
+  uses a systemd-resolved route-only domain with DNS default routing disabled,
+  and Windows uses an NRPT suffix rule. Other domains keep using the OS resolver.
+  On Linux without systemd-resolved, `--dns` fails and leaves the system
+  resolver unchanged. `--dns-global-fallback` explicitly opts in to a
+  reversible rewrite of a plain, unmanaged `/etc/resolv.conf`; non-mesh queries
+  then go to the saved or `--dns-upstream` resolver.
 - **IPv6 overlay and routes (Phases 9–11).** Peers receive stable ULA addresses
   and exchange IPv6 packets through the same encrypted TUN data path. IPv6
   subnets use the same explicit `--advertise-routes` / `--accept-route` grants
@@ -556,17 +558,21 @@ curl https://ifconfig.me      # shows the exit node's public IP, not the client'
 sudo python3 mesh.py up coord…:21200 --token … --name exit --tun --exit --exit-ipv6
 sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --exit-node EXIT_PUBKEY
 
-# split-DNS: reach peers by name
-sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --dns
-ssh user@gw.mesh              # resolves gw's overlay IP; example.com still works normally
+# On the gateway, print its public key using the same account that runs the node:
+sudo python3 mesh.py key
+# On the client, bind a friendly name to that key:
+sudo python3 mesh.py up coord…:21200 --token … --name laptop --tun --dns --dns-pin gw=GW_PUBKEY
+ssh user@gw.mesh              # example.com still uses the normal OS resolver
+# Alternatively, use the gateway's `sudo python3 mesh.py key --dns-label` output
+# directly as <key-label>.mesh, without configuring an alias.
 ```
 
 On Windows, use an Administrator terminal, install `cryptography`, and put the
 architecture-matched official `wintun.dll` beside `wintun.py` (or set
 `REMOTEMAC_WINTUN_DLL` to its absolute path). Then run
 `py -3 mesh.py up coord.example.com:21200 --token "…" --tun`. Windows currently
-supports overlay peers and explicitly accepted subnet routes; `--exit`,
-`--exit-node`, and automatic OS DNS configuration need macOS or Linux.
+supports overlay peers, explicitly accepted subnet routes, and scoped `.mesh`
+DNS via NRPT; `--exit` and `--exit-node` need macOS or Linux.
 
 **Flags.** `--bind` sets the UDP data-plane bind address (default `0.0.0.0`);
 `--udp-port` pins the data-plane port (default: random) — handy behind a manually
@@ -584,7 +590,11 @@ meanwhile. `--tun` enables the VPN interface; `--tun-mtu`
 advertises an IPv4 exit node (`--exit-ipv6` adds IPv6) and `--exit-node PUBKEY` routes default traffic through
 one (all need `--tun`); `--lan-routes CIDR,…` keeps extra local subnets off the tunnel
 (see below); `--allow-ipv6-bypass` explicitly permits direct IPv6 when an IPv6
-default route exists; `--dns` runs split-DNS (`--dns-suffix`, `--dns-upstream` to tune);
+default route exists; `--dns` runs split-DNS (`--dns-pin` for trusted aliases,
+`--dns-suffix` to change the suffix). `--dns-allow-unpinned` restores legacy
+advertised-name lookup with the risk that another peer can claim an offline
+peer's name. Linux `--dns-global-fallback` permits a global resolver rewrite;
+`--dns-upstream IP` applies only with that fallback;
 `--egress IFACE` overrides the NAT egress interface. (A host with a restrictive
 FORWARD firewall policy needs a manual allow rule for the overlay net.)
 
@@ -608,8 +618,9 @@ Phase 6 added `--lan-routes` and corrected the LAN-reachability docs. Phase 7 ad
 an iptables fallback for NAT egress. Phase 8 added opt-in split-DNS (`--dns`).
 **Phase 9** adds IPv6 overlay addresses, TUN packet transport, and AAAA DNS.
 **Phase 10** adds macOS PF gateway NAT and delayed gateway advertisement.
-The current development version adds IPv6 subnets and exit, native clipboard,
-Linux static DNS fallback, and a Windows Wintun client. Data-plane throughput is
+The current release includes IPv6 subnets and exit, native clipboard, a Windows
+Wintun client, and public-key-bound split-DNS with scoped Windows DNS and an
+opt-in Linux static DNS fallback. Data-plane throughput is
 modest (pure-Python), fine for typical use.
 
 ---
@@ -660,6 +671,6 @@ Encryption overhead is far below the actual streaming bandwidth — the bottlene
 | `nat.py` | Linux NAT egress for a subnet router / exit node (`--advertise-routes` / `--exit`) — IP forwarding + masquerade (nftables, or iptables fallback). Needs root |
 | `macnat.py` | macOS PF NAT egress for a subnet router / exit node — scoped anchor, IP forwarding, and crash recovery. Needs root |
 | `netroute.py` | IPv4/IPv6 exit route manager (`--exit-node`) — checked default-route redirect + per-socket transport binding, macOS + Linux. Needs root |
-| `meshdns.py` | split-DNS resolver (`--dns`) — answers `<name>.mesh`, forwards the rest; configures macOS `/etc/resolver`, Linux `resolvectl` or an unmanaged static `resolv.conf`. Needs root |
+| `meshdns.py`, `windns.py` | Key-bound split-DNS (`--dns`) — macOS `/etc/resolver`, Linux `resolvectl`, Windows NRPT; optional Linux static `resolv.conf` fallback. Needs root or Administrator |
 | `mac-native/` | Swift macOS viewer app and headless interoperability client; connects to a Python `remote_desktop.py host` |
 | `remotemac-relay.service` | systemd unit that auto-starts relay.py on boot |

@@ -5,6 +5,24 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-11-18
+
+### Breaking
+- `--dns` no longer resolves peers by their unpinned advertised `--name`.
+  Use `--dns-pin NAME=PUBKEY` or a full-key label from `mesh.py key --dns-label`;
+  `--dns-allow-unpinned` explicitly restores legacy name lookup.
+- `--dns-upstream` now requires `--dns-global-fallback` on Linux.
+
+### Security
+- Scoped DNS is the default on macOS, Linux with systemd-resolved, and Windows
+  NRPT. Linux no longer rewrites static `/etc/resolv.conf` automatically; the
+  reversible global fallback requires `--dns-global-fallback`.
+- Mesh DNS aliases require explicit peer public-key pins. Full-key DNS labels
+  work without alias configuration; legacy advertised-name lookup requires
+  `--dns-allow-unpinned`.
+- Non-mesh queries are refused by the local DNS server unless global fallback
+  is explicitly enabled. Forwarded replies must match the query ID and question.
+
 ## [4.3.0] - 2026-11-17
 
 ### Added

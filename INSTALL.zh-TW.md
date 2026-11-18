@@ -33,7 +33,7 @@ cd remotemac-relay
 
 Mesh 節點建議保留整份 checkout；若手動複製，`mesh.py` 需要同目錄的
 `remote_desktop.py`，選用功能還會載入 `tun.py`、`wintun.py`(Windows)、`netroute.py`、`nat.py`、
-`macnat.py` 與 `meshdns.py`。coordinator 需 `coordinator.py` 和
+`macnat.py`、`meshdns.py` 與 `windns.py`。coordinator 需 `coordinator.py` 和
 `remote_desktop.py`；`relay.py` 可獨立執行。
 
 ---
@@ -152,15 +152,17 @@ curl https://ifconfig.me   # 顯示出口的公網 IP
 出口指令可加入 `--exit-ipv6`，同時啟用 IPv6 轉送與 NAT66；出口的實體介面需有可用 IPv6。client 隨即將 IPv4/IPv6 都導向出口。若出口只有 IPv4，client 已有 IPv6 預設路由時會拒絕啟動；接受 IPv6 直連才明確加入 `--allow-ipv6-bypass`。
 新版 macOS gateway 節點需先升級 coordinator;節點會等 TUN 與 NAT 就緒後才宣告出口。
 
-**split-DNS** —— 用名字連 peer(`ssh laptop.mesh`):
+**split-DNS** —— 透過公鑰綁定的別名連 peer(`ssh gw.mesh`):
 
 ```bash
-sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --dns
+sudo python3 mesh.py key             # 在 gw 上,用執行該節點的帳號
+sudo python3 mesh.py up coord…:21200 --token "…" --name laptop --tun --dns --dns-pin gw=GW_PUBKEY
+ssh user@gw.mesh
 ```
 
-Linux 優先用 systemd-resolved(`resolvectl`)只導向 `.mesh`。若不可用而 `/etc/resolv.conf` 是未受管理的普通檔案,會先保存原內容、暫時讓 DNS 經本機 resolver,把非 mesh 名稱轉送到原上游；結束或下次啟動時還原。其他服務管理的 resolver 檔案不會覆寫。
+gw 的 `sudo python3 mesh.py key --dns-label` 也會印出完整公鑰衍生的 DNS 名稱,可直接用 `<key-label>.mesh`,不用設定別名。peer 自行宣告的 `--name` 預設不解析。macOS、使用 systemd-resolved 的 Linux 及 Windows 都只將 `.mesh` 導向本機解析器,其他網域沿用原 DNS。Linux 若無 systemd-resolved,`--dns` 會啟動失敗並保留原 DNS；明確加入 `--dns-global-fallback` 才會暫時改寫未受管理的普通 `/etc/resolv.conf` 並在結束或下次啟動時還原。只有這個模式可用 `--dns-upstream IP`。
 
-**Windows client**：安裝 `cryptography`,下載對應架構的官方 [Wintun DLL](https://www.wintun.net/),把 `wintun.dll` 放在 `wintun.py` 旁(或將 `REMOTEMAC_WINTUN_DLL` 設成絕對路徑)。在系統管理員終端機執行 `py -3 mesh.py up coord.example.com:21200 --token "…" --tun`。Windows 目前支援 overlay 與已授權子網路由；gateway NAT、全流量出口與自動 OS DNS 設定仍需 macOS/Linux。
+**Windows client**：安裝 `cryptography`,下載對應架構的官方 [Wintun DLL](https://www.wintun.net/),把 `wintun.dll` 放在 `wintun.py` 旁(或將 `REMOTEMAC_WINTUN_DLL` 設成絕對路徑)。在系統管理員終端機執行 `py -3 mesh.py up coord.example.com:21200 --token "…" --tun`。Windows 目前支援 overlay、已授權子網路由和 NRPT 分域 DNS；gateway NAT 與全流量出口仍需 macOS/Linux。
 
 > `--tun` 與路由/DNS 功能在 macOS/Linux 需要 **root**,Windows 需要**系統管理員**終端機。Linux 上的 subnet/exit 節點還需要 `nftables`(或 `iptables`)與 IP forwarding;macOS 使用 PF NAT。工具會幫你設定。在容器裡跑 mesh 節點另外需要 `--cap-add=NET_ADMIN --device /dev/net/tun`。細節見 [README](README.zh-TW.md) 的 mesh 章節。
 

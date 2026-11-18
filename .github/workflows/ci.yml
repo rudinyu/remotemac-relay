@@ -52,5 +52,5 @@ jobs:
           python-version: "3.12"
       - name: Install test dependency
         run: python -m pip install pytest
-      - name: Test Windows TUN helpers without installing a driver
-        run: python -m pytest tests/test_wintun.py tests/test_tun.py -v
+      - name: Test Windows TUN and DNS helpers without changing OS settings
+        run: python -m pytest tests/test_wintun.py tests/test_tun.py tests/test_windns.py -v
